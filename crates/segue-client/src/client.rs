@@ -7,15 +7,22 @@
 
 use std::collections::VecDeque;
 
+use crate::account::{AccountError, AccountFailure, AccountSession, Device};
+use crate::catalog::{self, CatalogError, CatalogInstall};
 use crate::fsm::{Effect, Event, EventKind, Fsm, Step};
+use crate::keys::TrustedKey;
+use crate::persist::{self, PersistError, SequenceFloor};
 use crate::plan::{self, KernelPlan, PrepareInput};
+use crate::policy::{self, PolicyForward};
 use crate::ports::{
-    ArmEvidence, ArmIntent, ArmRequest, Clock, CredentialStore, DataPlane, DisarmIntent,
-    DisarmRequest, Egress, HttpTransport, ProbeResult, Protector,
+    ArmEvidence, ArmIntent, ArmRequest, Clock, CredentialError, CredentialKey, CredentialStore,
+    DataPlane, DisarmIntent, DisarmRequest, Egress, HttpTransport, ProbeResult, Protector, Secret,
+    StateKey, StateStore, StoreError,
 };
 use crate::status::{
     ClientEvent, ClientStatus, ExitChoice, ExitView, Phase, PolicyView, ProtectionMode,
 };
+use crate::ticket::{self, TicketError, TicketView};
 use crate::PrepareError;
 
 /// What the shell knows before the first catalog is loaded.
@@ -26,6 +33,11 @@ pub struct ClientConfig {
     pub exit_ifaces: Vec<String>,
     pub egress: Vec<Egress>,
     pub policy_version: u64,
+    pub catalog_keys: Vec<TrustedKey>,
+    pub policy_keys: Vec<TrustedKey>,
+    pub ticket_keys: Vec<TrustedKey>,
+    /// Renewal margin subtracted from a ticket's `not_after`.
+    pub ticket_refresh_margin_secs: u64,
 }
 
 impl Default for ClientConfig {
@@ -36,16 +48,22 @@ impl Default for ClientConfig {
             exit_ifaces: Vec::new(),
             egress: Vec::new(),
             policy_version: 0,
+            catalog_keys: Vec::new(),
+            policy_keys: Vec::new(),
+            ticket_keys: Vec::new(),
+            ticket_refresh_margin_secs: crate::DEFAULT_TICKET_REFRESH_MARGIN_SECS,
         }
     }
 }
 
-pub struct Ports<H, S, D, P, C> {
+pub struct Ports<H, S, D, P, C, B> {
     pub http: H,
     pub credentials: S,
     pub data_plane: D,
     pub protector: P,
     pub clock: C,
+    /// Catalog, policy, and ticket cache. `put` is atomic; ticket bytes are a secret.
+    pub state: B,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -54,11 +72,31 @@ pub enum ClientError {
     Rejected,
     #[error(transparent)]
     Prepare(#[from] PrepareError),
+    #[error(transparent)]
+    Catalog(#[from] CatalogError),
+    #[error(transparent)]
+    Policy(#[from] crate::PolicyError),
+    #[error(transparent)]
+    Ticket(#[from] TicketError),
+    #[error(transparent)]
+    Account(#[from] AccountError),
+    #[error(transparent)]
+    Credential(#[from] CredentialError),
+    #[error(transparent)]
+    State(#[from] StoreError),
+    #[error("stored state could not be read")]
+    Floor,
 }
 
-pub struct Client<H, S, D, P, C> {
+struct HeldPolicy {
+    version: u64,
+    expires_at: u64,
+    bytes: Vec<u8>,
+}
+
+pub struct Client<H, S, D, P, C, B> {
     fsm: Fsm,
-    ports: Ports<H, S, D, P, C>,
+    ports: Ports<H, S, D, P, C, B>,
     config: ClientConfig,
     plan: Option<KernelPlan>,
     events: VecDeque<ClientEvent>,
@@ -68,17 +106,25 @@ pub struct Client<H, S, D, P, C> {
     current_exit: Option<String>,
     exits: Vec<ExitView>,
     policy: PolicyView,
+    catalog: Option<CatalogInstall>,
+    policy_held: Option<HeldPolicy>,
+    ticket: Option<Secret>,
+    ticket_view: Option<TicketView>,
+    server_time: u64,
+    session: Option<AccountSession>,
+    device: Option<Device>,
 }
 
-impl<H, S, D, P, C> Client<H, S, D, P, C>
+impl<H, S, D, P, C, B> Client<H, S, D, P, C, B>
 where
     H: HttpTransport,
     S: CredentialStore,
     D: DataPlane,
     P: Protector,
     C: Clock,
+    B: StateStore,
 {
-    pub fn new(config: ClientConfig, ports: Ports<H, S, D, P, C>) -> Result<Self, ClientError> {
+    pub fn new(config: ClientConfig, ports: Ports<H, S, D, P, C, B>) -> Result<Self, ClientError> {
         let now_ms = ports.clock.monotonic_ms();
         let mode = config.protection;
         Ok(Self {
@@ -93,7 +139,199 @@ where
             current_exit: None,
             exits: Vec::new(),
             policy: PolicyView::default(),
+            catalog: None,
+            policy_held: None,
+            ticket: None,
+            ticket_view: None,
+            server_time: 0,
+            session: None,
+            device: None,
         })
+    }
+
+    /// Admit a signed catalog, cache it, and return the nodes [`prepare`](Self::prepare)
+    /// takes. An absent egress group stays absent.
+    pub fn install_catalog(&mut self, bytes: &[u8]) -> Result<CatalogInstall, ClientError> {
+        let now = self.ports.clock.now_unix();
+        let floor = self.floor(StateKey::CatalogFloor)?;
+        match catalog::admit_catalog(bytes, now, &self.config.catalog_keys, floor.as_ref()) {
+            Ok(install) => {
+                self.persist_wire(
+                    StateKey::CatalogWire,
+                    StateKey::CatalogFloor,
+                    bytes,
+                    install.revision,
+                    &install.digest,
+                    install.idempotent,
+                )?;
+                self.config.anchor_revision = install.revision;
+                self.exits = install.exits.clone();
+                self.catalog = Some(install.clone());
+                Ok(install)
+            }
+            Err(error) => {
+                self.note_content_failure(EventKind::CatalogFailure);
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Check the policy envelope and cache the original bytes for the data plane.
+    /// The rule table is not parsed.
+    pub fn install_policy(&mut self, bytes: &[u8]) -> Result<PolicyForward, ClientError> {
+        let now = self.ports.clock.now_unix();
+        let server_time = self.observed_server_time()?;
+        let floor = self.floor(StateKey::PolicyFloor)?;
+        match policy::admit_policy(
+            bytes,
+            now,
+            server_time,
+            &self.config.policy_keys,
+            floor.as_ref(),
+        ) {
+            Ok(forward) => {
+                self.persist_wire(
+                    StateKey::PolicyWire,
+                    StateKey::PolicyFloor,
+                    bytes,
+                    forward.version,
+                    &forward.digest,
+                    forward.idempotent,
+                )?;
+                self.remember_policy(&forward);
+                Ok(forward)
+            }
+            Err(error) => {
+                self.note_content_failure(EventKind::PrepareInvalid);
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Store a ticket as a secret. The returned view does not contain the bytes.
+    pub fn install_ticket(&mut self, bytes: &[u8]) -> Result<TicketView, ClientError> {
+        let now = self.ports.clock.now_unix();
+        let floor = self.floor(StateKey::TicketFloor)?;
+        let device = self.device.as_ref().map(|device| device.device_id);
+        match ticket::admit_ticket(
+            bytes,
+            now,
+            self.config.ticket_refresh_margin_secs,
+            &self.config.ticket_keys,
+            floor.as_ref(),
+            device,
+        ) {
+            Ok(admitted) => {
+                self.persist_wire(
+                    StateKey::TicketWire,
+                    StateKey::TicketFloor,
+                    bytes,
+                    admitted.view.not_after,
+                    &admitted.digest,
+                    admitted.view.idempotent,
+                )?;
+                self.ticket = Some(Secret::new(bytes));
+                self.ticket_view = Some(admitted.view.clone());
+                Ok(admitted.view)
+            }
+            Err(error) => {
+                self.note_content_failure(EventKind::PrepareInvalid);
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Reload the cache and re-check signatures. Missing keys are fine.
+    /// An expired catalog is dropped from memory; its revision floor stays.
+    pub fn load_cached(&mut self) -> Result<(), ClientError> {
+        self.server_time = self.observed_server_time()?;
+        self.load_catalog_cache()?;
+        self.load_policy_cache()?;
+        self.load_ticket_cache()?;
+        Ok(())
+    }
+
+    /// Record a control-plane `Date`. The value only moves forward.
+    pub fn note_server_date(&mut self, unix: u64) -> Result<(), ClientError> {
+        let current = self.observed_server_time()?;
+        if unix <= current {
+            return Ok(());
+        }
+        persist::write_unix(&self.ports.state, StateKey::ServerTime, unix).map_err(persist_err)?;
+        self.server_time = unix;
+        Ok(())
+    }
+
+    /// Keep the access token in memory and the refresh token in the credential store.
+    pub fn set_session(&mut self, session: AccountSession) -> Result<(), ClientError> {
+        session.persist_refresh_token(&self.ports.credentials)?;
+        self.session = Some(session);
+        Ok(())
+    }
+
+    pub fn set_device(&mut self, device: Device) -> Result<(), ClientError> {
+        let checked = Device::new(
+            device.device_id,
+            device.name,
+            device.platform,
+            device.install_id,
+        )?;
+        let secret = Secret::new(checked.device_id.to_string().as_bytes());
+        self.ports
+            .credentials
+            .set(CredentialKey::DeviceId, &secret)?;
+        self.device = Some(checked);
+        Ok(())
+    }
+
+    /// Apply an account response. Holds keep tokens and do not disarm.
+    /// A session end deletes the refresh token and still does not disarm.
+    pub fn note_account_failure(&mut self, failure: AccountFailure) -> Result<(), ClientError> {
+        match failure {
+            AccountFailure::SessionEnded => {
+                self.session = None;
+                self.ports.credentials.delete(CredentialKey::RefreshToken)?;
+                self.note_content_failure(EventKind::CredentialRevoked);
+            }
+            AccountFailure::PlanExpired | AccountFailure::QuotaExhausted => {
+                if let Some(session) = &mut self.session {
+                    if let Some(entitlement) = failure.entitlement() {
+                        session.set_entitlement(entitlement);
+                    }
+                }
+                self.note_content_failure(EventKind::AccountHold);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn installed_catalog(&self) -> Option<&CatalogInstall> {
+        self.catalog.as_ref()
+    }
+
+    /// Exact policy envelope for the data plane. `None` until one is installed
+    /// or loaded. Not a parsed rule table.
+    pub fn policy_forward_bytes(&self) -> Option<&[u8]> {
+        self.policy_held.as_ref().map(|held| held.bytes.as_slice())
+    }
+
+    /// Ticket bytes for the kernel's `ticket_file`. The binding writes them
+    /// mode `0600`. Do not log the slice.
+    pub fn ticket_file_bytes(&self) -> Option<&[u8]> {
+        self.ticket.as_ref().map(Secret::expose)
+    }
+
+    pub fn ticket_view(&self) -> Option<TicketView> {
+        self.ticket_view.clone().map(|view| {
+            view.at(
+                self.ports.clock.now_unix(),
+                self.config.ticket_refresh_margin_secs,
+            )
+        })
+    }
+
+    pub fn session(&self) -> Option<&AccountSession> {
+        self.session.as_ref()
     }
 
     pub fn http(&self) -> &H {
@@ -175,7 +413,7 @@ where
         status.exit_choice = self.exit_choice.clone();
         status.current_exit = self.current_exit.clone();
         status.exits = self.exits.clone();
-        status.policy = self.policy.clone();
+        status.policy = self.live_policy_view();
         status
     }
 
@@ -185,6 +423,173 @@ where
 
     pub fn take_effects(&mut self) -> Vec<Effect> {
         std::mem::take(&mut self.effects)
+    }
+
+    fn note_content_failure(&mut self, kind: EventKind) {
+        let phase = self.fsm.phase();
+        let account = matches!(kind, EventKind::AccountHold | EventKind::CredentialRevoked);
+        if phase == Phase::Off && !account {
+            return;
+        }
+        if kind == EventKind::PrepareInvalid && phase != Phase::Preparing {
+            return;
+        }
+        let _ = self.dispatch(Event::bare(kind));
+    }
+
+    fn persist_wire(
+        &self,
+        wire: StateKey,
+        floor_key: StateKey,
+        bytes: &[u8],
+        sequence: u64,
+        digest: &str,
+        idempotent: bool,
+    ) -> Result<(), ClientError> {
+        let missing = self.ports.state.get(wire)?.is_none();
+        if !idempotent || missing {
+            self.ports.state.put(wire, bytes)?;
+        }
+        if !idempotent {
+            persist::write_floor(
+                &self.ports.state,
+                floor_key,
+                &SequenceFloor {
+                    sequence,
+                    digest: digest.to_owned(),
+                },
+            )
+            .map_err(persist_err)?;
+        }
+        Ok(())
+    }
+
+    fn floor(&self, key: StateKey) -> Result<Option<SequenceFloor>, ClientError> {
+        persist::read_floor(&self.ports.state, key).map_err(persist_err)
+    }
+
+    fn observed_server_time(&mut self) -> Result<u64, ClientError> {
+        let stored =
+            persist::read_unix(&self.ports.state, StateKey::ServerTime).map_err(persist_err)?;
+        if stored > self.server_time {
+            self.server_time = stored;
+        }
+        Ok(self.server_time)
+    }
+
+    fn remember_policy(&mut self, forward: &PolicyForward) {
+        self.config.policy_version = forward.version;
+        self.policy_held = Some(HeldPolicy {
+            version: forward.version,
+            expires_at: forward.expires_at,
+            bytes: forward.bytes.clone(),
+        });
+        self.policy = self.live_policy_view();
+    }
+
+    fn live_policy_view(&self) -> PolicyView {
+        let Some(held) = &self.policy_held else {
+            return PolicyView::default();
+        };
+        let now = self.ports.clock.now_unix();
+        let basis = policy::expiry_basis(now, self.server_time);
+        PolicyView {
+            valid: basis < held.expires_at,
+            version: Some(held.version),
+            expires_at: Some(held.expires_at),
+        }
+    }
+
+    fn load_catalog_cache(&mut self) -> Result<(), ClientError> {
+        let Some(wire) = self.ports.state.get(StateKey::CatalogWire)? else {
+            return Ok(());
+        };
+        let now = self.ports.clock.now_unix();
+        let floor = self.floor(StateKey::CatalogFloor)?;
+        match catalog::admit_catalog(&wire, now, &self.config.catalog_keys, floor.as_ref()) {
+            Ok(install) => {
+                if !install.idempotent {
+                    persist::write_floor(
+                        &self.ports.state,
+                        StateKey::CatalogFloor,
+                        &SequenceFloor {
+                            sequence: install.revision,
+                            digest: install.digest.clone(),
+                        },
+                    )
+                    .map_err(persist_err)?;
+                }
+                self.config.anchor_revision = install.revision;
+                self.exits = install.exits.clone();
+                self.catalog = Some(install);
+                Ok(())
+            }
+            Err(CatalogError::Expired) => {
+                self.catalog = None;
+                self.exits.clear();
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn load_policy_cache(&mut self) -> Result<(), ClientError> {
+        let Some(wire) = self.ports.state.get(StateKey::PolicyWire)? else {
+            return Ok(());
+        };
+        let now = self.ports.clock.now_unix();
+        let server_time = self.server_time;
+        let floor = self.floor(StateKey::PolicyFloor)?;
+        let inspected = policy::inspect_policy(&wire, now, server_time, &self.config.policy_keys)?;
+        if let Some(known) = &floor {
+            if inspected.version < known.sequence {
+                return Ok(());
+            }
+            if inspected.version == known.sequence && inspected.digest != known.digest {
+                return Err(ClientError::Floor);
+            }
+        }
+        if floor.as_ref().map(|known| known.sequence).unwrap_or(0) < inspected.version {
+            persist::write_floor(
+                &self.ports.state,
+                StateKey::PolicyFloor,
+                &SequenceFloor {
+                    sequence: inspected.version,
+                    digest: inspected.digest.clone(),
+                },
+            )
+            .map_err(persist_err)?;
+        }
+        self.remember_policy(&inspected);
+        Ok(())
+    }
+
+    fn load_ticket_cache(&mut self) -> Result<(), ClientError> {
+        let Some(wire) = self.ports.state.get(StateKey::TicketWire)? else {
+            return Ok(());
+        };
+        let now = self.ports.clock.now_unix();
+        let view = ticket::inspect_ticket(
+            &wire,
+            now,
+            self.config.ticket_refresh_margin_secs,
+            &self.config.ticket_keys,
+        )?;
+        let floor = self.floor(StateKey::TicketFloor)?;
+        if let Some(known) = &floor {
+            if view.not_after < known.sequence {
+                return Ok(());
+            }
+            if view.not_after == known.sequence {
+                let digest = crate::envelope::hex_sha256(&wire);
+                if digest != known.digest {
+                    return Err(ClientError::Floor);
+                }
+            }
+        }
+        self.ticket = Some(Secret::new(&wire));
+        self.ticket_view = Some(view);
+        Ok(())
     }
 
     fn dispatch(&mut self, event: Event) -> Result<(), ClientError> {
@@ -361,15 +766,27 @@ where
     }
 }
 
+fn persist_err(error: PersistError) -> ClientError {
+    match error {
+        PersistError::Store(store) => ClientError::State(store),
+        PersistError::Corrupt => ClientError::Floor,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::{AccountSession, Device, Entitlement, Platform};
+    use crate::keys::TrustedKey;
     use crate::plan::{CatalogNode, PolicyKeyRef};
     use crate::ports::{
         Ack, ApiRequest, ApiResponse, ArmAck, CredentialError, CredentialKey, DataPlaneError,
-        ProtectorError, ProtectorEvidence, ProtectorStatus, Secret, TransportError,
+        ProtectorError, ProtectorEvidence, ProtectorStatus, Secret, StateKey, StateStore,
+        StoreError, TransportError,
     };
+    use crate::seal;
     use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
     use std::rc::Rc;
 
     struct Inner {
@@ -382,6 +799,8 @@ mod tests {
         probe: Cell<ProbeResult>,
         unix: Cell<u64>,
         mono: Cell<u64>,
+        state: RefCell<BTreeMap<StateKey, Vec<u8>>>,
+        refresh: RefCell<Option<Vec<u8>>>,
     }
 
     #[derive(Clone)]
@@ -399,6 +818,8 @@ mod tests {
                 probe: Cell::new(ProbeResult::Ready),
                 unix: Cell::new(1_700_000_000),
                 mono: Cell::new(0),
+                state: RefCell::new(BTreeMap::new()),
+                refresh: RefCell::new(None),
             }))
         }
     }
@@ -410,13 +831,38 @@ mod tests {
     }
 
     impl CredentialStore for Fake {
-        fn get(&self, _key: CredentialKey) -> Result<Option<Secret>, CredentialError> {
-            Ok(None)
+        fn get(&self, key: CredentialKey) -> Result<Option<Secret>, CredentialError> {
+            match key {
+                CredentialKey::RefreshToken => {
+                    Ok(self.0.refresh.borrow().as_ref().map(Secret::new))
+                }
+                CredentialKey::DeviceId => Ok(None),
+            }
         }
-        fn set(&self, _key: CredentialKey, _value: &Secret) -> Result<(), CredentialError> {
+        fn set(&self, key: CredentialKey, value: &Secret) -> Result<(), CredentialError> {
+            if key == CredentialKey::RefreshToken {
+                *self.0.refresh.borrow_mut() = Some(value.expose().to_vec());
+            }
             Ok(())
         }
-        fn delete(&self, _key: CredentialKey) -> Result<(), CredentialError> {
+        fn delete(&self, key: CredentialKey) -> Result<(), CredentialError> {
+            if key == CredentialKey::RefreshToken {
+                *self.0.refresh.borrow_mut() = None;
+            }
+            Ok(())
+        }
+    }
+
+    impl StateStore for Fake {
+        fn get(&self, key: StateKey) -> Result<Option<Vec<u8>>, StoreError> {
+            Ok(self.0.state.borrow().get(&key).cloned())
+        }
+        fn put(&self, key: StateKey, bytes: &[u8]) -> Result<(), StoreError> {
+            self.0.state.borrow_mut().insert(key, bytes.to_vec());
+            Ok(())
+        }
+        fn delete(&self, key: StateKey) -> Result<(), StoreError> {
+            self.0.state.borrow_mut().remove(&key);
             Ok(())
         }
     }
@@ -488,7 +934,7 @@ mod tests {
         }
     }
 
-    fn client(fake: &Fake) -> Client<Fake, Fake, Fake, Fake, Fake> {
+    fn client(fake: &Fake) -> Client<Fake, Fake, Fake, Fake, Fake, Fake> {
         Client::new(
             ClientConfig::default(),
             Ports {
@@ -497,6 +943,7 @@ mod tests {
                 data_plane: fake.clone(),
                 protector: fake.clone(),
                 clock: fake.clone(),
+                state: fake.clone(),
             },
         )
         .unwrap()
@@ -612,5 +1059,182 @@ mod tests {
         let pushed = client.push(Event::bare(EventKind::PostureError));
         assert_eq!(pushed, Err(ClientError::Rejected));
         assert_eq!(client.status().phase, Phase::Disarming);
+    }
+
+    fn trusted(fake: &Fake) -> Client<Fake, Fake, Fake, Fake, Fake, Fake> {
+        let catalog_seed = seal::seed_from_label("client-catalog");
+        let policy_seed = seal::seed_from_label("client-policy");
+        let ticket_seed = seal::seed_from_label("client-ticket");
+        let mut client = client(fake);
+        client.config.catalog_keys = vec![TrustedKey {
+            key_id: 1,
+            public_key: seal::public_key(&catalog_seed),
+        }];
+        client.config.policy_keys = vec![TrustedKey {
+            key_id: 1,
+            public_key: seal::public_key(&policy_seed),
+        }];
+        client.config.ticket_keys = vec![TrustedKey {
+            key_id: 1,
+            public_key: seal::public_key(&ticket_seed),
+        }];
+        client.config.ticket_refresh_margin_secs = 60;
+        client
+    }
+
+    fn catalog_doc(revision: u64, egress: bool) -> serde_json::Value {
+        let mut node = serde_json::json!({
+            "id": 12,
+            "name": "la-1",
+            "region": "us",
+            "outbound": {"protocol": "vless", "settings": {"address": "203.0.113.10", "port": 443}},
+            "relay": "198.51.100.4:7443",
+            "node_id": 12,
+            "roles": ["overseas"]
+        });
+        if egress {
+            node["egress_group"] = serde_json::json!("us-west");
+        }
+        serde_json::json!({
+            "schemaVersion": 1,
+            "revision": revision,
+            "issued_at": 1_700_000_000_u64,
+            "expires_at": 1_800_000_000_u64,
+            "ai_route": "ai",
+            "nodes": [node]
+        })
+    }
+
+    #[test]
+    fn install_catalog_feeds_prepare_and_the_cache_rejects_rollback() {
+        let fake = Fake::new();
+        let mut client = trusted(&fake);
+        let seed = seal::seed_from_label("client-catalog");
+        let bytes = seal::catalog_document(&seed, 1, &catalog_doc(2, false));
+        let installed = client.install_catalog(&bytes).unwrap();
+        assert!(installed.nodes[0].egress_group.is_none());
+        assert!(installed.exits[0].egress_group.is_none());
+        let mut input = sample_input();
+        input.nodes = installed.nodes.clone();
+        input.ai_route = installed.ai_route.clone();
+        let plan = client.prepare(&input).unwrap();
+        assert!(!plan.config_json.contains("egress_group"));
+        assert_eq!(client.status().exits[0].name, "la-1");
+
+        let again = Client::new(
+            ClientConfig {
+                catalog_keys: client.config.catalog_keys.clone(),
+                ..ClientConfig::default()
+            },
+            Ports {
+                http: fake.clone(),
+                credentials: fake.clone(),
+                data_plane: fake.clone(),
+                protector: fake.clone(),
+                clock: fake.clone(),
+                state: fake.clone(),
+            },
+        )
+        .unwrap();
+        let mut reloaded = again;
+        reloaded.load_cached().unwrap();
+        assert_eq!(
+            reloaded.installed_catalog().unwrap().digest,
+            installed.digest
+        );
+
+        let older = seal::catalog_document(&seed, 1, &catalog_doc(1, true));
+        let error = client.install_catalog(&older).unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::Catalog(crate::CatalogError::Rollback)
+        ));
+        assert_eq!(client.installed_catalog().unwrap().revision, 2);
+        assert!(fake.0.disarms.borrow().is_empty());
+    }
+
+    #[test]
+    fn policy_bytes_are_forwarded_and_server_time_blocks_a_stale_bundle() {
+        let fake = Fake::new();
+        let mut client = trusted(&fake);
+        let seed = seal::seed_from_label("client-policy");
+        let body = serde_json::json!({
+            "version": 7,
+            "expires_at": 1_800_000_000_u64,
+            "rules": [{"note": "not parsed"}]
+        });
+        let bytes = seal::policy_document(&seed, 1, &body);
+        let forward = client.install_policy(&bytes).unwrap();
+        assert_eq!(client.policy_forward_bytes(), Some(bytes.as_slice()));
+        assert_eq!(forward.bytes, bytes);
+        assert!(client.status().policy.valid);
+        assert_eq!(client.status().policy.version, Some(7));
+
+        client.note_server_date(1_800_000_000).unwrap();
+        let mut newer = body;
+        newer["version"] = serde_json::json!(8);
+        let rejected = client.install_policy(&seal::policy_document(&seed, 1, &newer));
+        assert!(matches!(
+            rejected.unwrap_err(),
+            ClientError::Policy(crate::PolicyError::ServerTime)
+        ));
+        assert_eq!(client.policy_forward_bytes().unwrap(), bytes.as_slice());
+        assert!(!client.status().policy.valid);
+    }
+
+    #[test]
+    fn a_ticket_stays_out_of_status_and_an_account_hold_does_not_disarm() {
+        let fake = Fake::new();
+        let mut client = trusted(&fake);
+        client
+            .set_device(Device::new(9, "laptop", Platform::Macos, "install-1").unwrap())
+            .unwrap();
+        let seed = seal::seed_from_label("client-ticket");
+        let claims = crate::canonical_json(&serde_json::json!({
+            "v": 1,
+            "key_id": 1,
+            "device_id": 9,
+            "account_id": 4,
+            "plan": "plus",
+            "exit_classes": ["overseas", "ai"],
+            "ai_anchor_node_id": 12,
+            "not_before": 1_700_000_000_u64,
+            "not_after": 1_700_010_000_u64
+        }));
+        let bytes = seal::ticket(&seed, claims.as_bytes());
+        let view = client.install_ticket(&bytes).unwrap();
+        assert_eq!(view.device_id, 9);
+        assert!(!view.expired);
+        assert_eq!(client.ticket_file_bytes(), Some(bytes.as_slice()));
+        let status = serde_json::to_string(&client.status()).unwrap();
+        assert!(!status.contains("SGT1."));
+        assert!(!format!("{view:?}").contains("SGT1."));
+
+        let session = AccountSession::new(
+            4,
+            "plus",
+            Entitlement::Active,
+            b"access-secret",
+            b"refresh-secret",
+            1_800_000_000,
+        )
+        .unwrap();
+        client.set_session(session).unwrap();
+        client.prepare(&sample_input()).unwrap();
+        client.connect().unwrap();
+        client
+            .note_account_failure(crate::AccountFailure::QuotaExhausted)
+            .unwrap();
+        assert_eq!(client.status().phase, Phase::Connecting);
+        assert!(client.status().protection.armed);
+        assert!(fake.0.disarms.borrow().is_empty());
+        assert!(fake.0.refresh.borrow().is_some());
+        client
+            .note_account_failure(crate::AccountFailure::SessionEnded)
+            .unwrap();
+        assert!(client.session().is_none());
+        assert!(fake.0.refresh.borrow().is_none());
+        assert!(client.status().protection.armed);
+        assert!(fake.0.disarms.borrow().is_empty());
     }
 }

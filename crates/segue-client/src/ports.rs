@@ -1,5 +1,6 @@
-//! The five ports a shell injects. Production bindings talk to the OS; tests
-//! use in-memory fakes. Nothing in this crate opens a socket of its own.
+//! The ports a shell injects. Production bindings talk to the OS; tests use
+//! in-memory fakes. Nothing in this crate opens a socket or a file of its own.
+//! The state store is the cache: catalog, policy, and ticket bytes live there.
 //!
 //! The traits are synchronous on purpose. The state machine is sans-IO: the
 //! shell calls the ports while it applies effects. An async HTTP stack lives
@@ -235,6 +236,53 @@ pub trait Protector {
 pub trait Clock {
     fn now_unix(&self) -> u64;
     fn monotonic_ms(&self) -> u64;
+}
+
+/// One persisted blob. The binding chooses the path. This crate never opens a
+/// file itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StateKey {
+    /// Exact admitted catalog envelope.
+    CatalogWire,
+    /// `{revision} {digest}` high-water. Moves forward only.
+    CatalogFloor,
+    /// Exact policy envelope forwarded to the data plane.
+    PolicyWire,
+    /// `{version} {digest}` rollback floor.
+    PolicyFloor,
+    /// Newest observed server `Date`, decimal unix seconds.
+    ServerTime,
+    /// Ticket bytes. A secret: the binding writes them mode `0600` and does
+    /// not log them.
+    TicketWire,
+    /// `{not_after} {digest}` so an older ticket cannot replace a newer one.
+    TicketFloor,
+}
+
+impl StateKey {
+    /// Ticket bytes must not be logged or left world-readable.
+    pub fn is_secret(self) -> bool {
+        matches!(self, StateKey::TicketWire)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StoreError {
+    #[error("state store unavailable")]
+    Unavailable,
+    #[error("state store refused the operation")]
+    Refused,
+}
+
+/// On-disk cache for catalog, policy, and ticket bytes.
+///
+/// `put` replaces one key atomically: a crash leaves the previous value or the
+/// new one, never a torn write. `put` of [`StateKey::TicketWire`] is a bearer
+/// secret and the binding stores it with mode `0600`.
+pub trait StateStore {
+    fn get(&self, key: StateKey) -> Result<Option<Vec<u8>>, StoreError>;
+    fn put(&self, key: StateKey, bytes: &[u8]) -> Result<(), StoreError>;
+    fn delete(&self, key: StateKey) -> Result<(), StoreError>;
 }
 
 #[cfg(test)]

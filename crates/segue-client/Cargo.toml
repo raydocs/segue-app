@@ -7,9 +7,11 @@ rust-version.workspace = true
 license = "LicenseRef-Segue-Proprietary"
 repository.workspace = true
 publish = false
-description = "Segue app client: connect state machine, user intent, and kernel plan preparation"
+description = "Segue app client: catalog admission, policy and ticket lifecycle, connect state machine"
 
 [dependencies]
+base64 = "0.22"
+ed25519-dalek = "2"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2.workspace = true
@@ -17,5 +19,8 @@ thiserror.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+base64 = "0.22"
+ed25519-dalek = "2"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2.workspace = true

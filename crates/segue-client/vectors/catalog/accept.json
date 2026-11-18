@@ -1,0 +1,85 @@
+{
+  "fixtureVersion": 1,
+  "seedLabel": "segue-client-catalog-v1",
+  "keyId": 1,
+  "now": 1700001000,
+  "document": {
+    "schemaVersion": 1,
+    "revision": 2,
+    "issued_at": 1700000000,
+    "expires_at": 1800000000,
+    "ai_route": "ai",
+    "nodes": [
+      {
+        "id": 12,
+        "name": "la-1",
+        "region": "us",
+        "outbound": {
+          "protocol": "vless",
+          "settings": { "address": "203.0.113.10", "port": 443 }
+        },
+        "relay": "198.51.100.4:7443",
+        "node_id": 12,
+        "egress_group": "us-west",
+        "roles": ["overseas"]
+      }
+    ]
+  },
+  "cases": [
+    {
+      "id": "accept",
+      "steps": [{ "expect": "accept" }]
+    },
+    {
+      "id": "idempotent",
+      "steps": [{ "expect": "accept" }, { "expect": "idempotent" }]
+    },
+    {
+      "id": "newer-revision",
+      "steps": [
+        { "expect": "accept" },
+        {
+          "mutations": [{ "find": "\"revision\":2", "replace": "\"revision\":3" }],
+          "expect": "accept"
+        }
+      ]
+    },
+    {
+      "id": "absent-egress-group",
+      "steps": [
+        {
+          "mutations": [{ "op": "drop_node_field", "field": "egress_group" }],
+          "expect": "accept"
+        }
+      ]
+    },
+    {
+      "id": "private-relay",
+      "steps": [
+        {
+          "mutations": [
+            {
+              "find": "\"relay\":\"198.51.100.4:7443\"",
+              "replace": "\"relay\":\"10.0.0.4:7443\""
+            }
+          ],
+          "expect": "accept"
+        }
+      ]
+    },
+    {
+      "id": "documentation-ipv6",
+      "steps": [
+        {
+          "mutations": [
+            {
+              "find": "\"address\":\"203.0.113.10\"",
+              "replace": "\"address\":\"2001:db8::10\""
+            }
+          ],
+          "expect": "accept"
+        }
+      ]
+    }
+  ]
+}
