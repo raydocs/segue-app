@@ -1,0 +1,618 @@
+{
+  "fixtureVersion": 1,
+  "description": "User-intent rule. Only an explicit disconnect, sign-out, or quit disarms. Shell enforcement is todo until that shell runs the same file; todo is not a pass.",
+  "scenarios": [
+    {
+      "id": "user-disconnect",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "user_disconnect",
+        "posture_error"
+      ],
+      "expect": {
+        "phase": "disarming",
+        "intent": "user_disconnect",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "tunnel_held": true,
+        "failure_written": false,
+        "disarm_steps": 1
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    },
+    {
+      "id": "sign-out",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "sign_out",
+        "carrier_lost"
+      ],
+      "expect": {
+        "phase": "disarming",
+        "intent": "sign_out",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "tunnel_held": true,
+        "failure_written": false,
+        "disarm_steps": 1
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    },
+    {
+      "id": "quit",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "quit",
+        "posture_error"
+      ],
+      "expect": {
+        "phase": "disarming",
+        "intent": "quit",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "tunnel_held": true,
+        "failure_written": false,
+        "disarm_steps": 1
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    },
+    {
+      "id": "core-crash",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "crash"
+      ],
+      "expect": {
+        "phase": "off",
+        "intent": "connect",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "tunnel_held": false,
+        "failure_written": true,
+        "disarm_steps": 0
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    },
+    {
+      "id": "network-lost",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "network_change"
+      ],
+      "expect": {
+        "phase": "protected_offline",
+        "intent": "connect",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "tunnel_held": true,
+        "failure_written": true,
+        "disarm_steps": 0
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    },
+    {
+      "id": "arm-reply-lost",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_error"
+      ],
+      "expect": {
+        "phase": "arming",
+        "intent": "connect",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "tunnel_held": true,
+        "failure_written": true,
+        "disarm_steps": 0
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    },
+    {
+      "id": "disarm-reply-lost",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "user_disconnect",
+        "disarm_no_ack"
+      ],
+      "expect": {
+        "phase": "disarming",
+        "intent": "user_disconnect",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "tunnel_held": true,
+        "failure_written": false,
+        "disarm_steps": 1
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    },
+    {
+      "id": "initial-failure-keeps-the-lock",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_error"
+      ],
+      "expect": {
+        "phase": "failed",
+        "intent": "connect",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "tunnel_held": false,
+        "failure_written": true,
+        "disarm_steps": 0
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    },
+    {
+      "id": "verified-failure-holds",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "carrier_lost",
+        "probe_ok",
+        "posture_error"
+      ],
+      "expect": {
+        "phase": "protected_offline",
+        "intent": "connect",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "tunnel_held": true,
+        "failure_written": true,
+        "disarm_steps": 0
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    },
+    {
+      "id": "exhaustion-ai-only",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "carrier_lost",
+        "budget_exhausted"
+      ],
+      "expect": {
+        "phase": "protected_offline",
+        "intent": "connect",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "tunnel_held": false,
+        "failure_written": true,
+        "disarm_steps": 0
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    },
+    {
+      "id": "exhaustion-strict",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "carrier_lost",
+        "budget_exhausted"
+      ],
+      "expect": {
+        "phase": "protected_offline",
+        "intent": "connect",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "tunnel_held": true,
+        "failure_written": true,
+        "disarm_steps": 0
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      },
+      "mode": "strict"
+    },
+    {
+      "id": "catalog-failure-while-connected",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "catalog_failure"
+      ],
+      "expect": {
+        "phase": "connected",
+        "intent": "connect",
+        "armed": true,
+        "held": true,
+        "shows_connected": true,
+        "tunnel_held": true,
+        "failure_written": true,
+        "disarm_steps": 0
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    },
+    {
+      "id": "account-hold",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "account_hold"
+      ],
+      "expect": {
+        "phase": "connected",
+        "intent": "connect",
+        "armed": true,
+        "held": true,
+        "shows_connected": true,
+        "tunnel_held": true,
+        "failure_written": true,
+        "disarm_steps": 0
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    },
+    {
+      "id": "revoked-credential",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "credential_revoked"
+      ],
+      "expect": {
+        "phase": "connected",
+        "intent": "connect",
+        "armed": true,
+        "held": true,
+        "shows_connected": true,
+        "tunnel_held": true,
+        "failure_written": true,
+        "disarm_steps": 0
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    },
+    {
+      "id": "update-failure",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "update_failed"
+      ],
+      "expect": {
+        "phase": "connected",
+        "intent": "connect",
+        "armed": true,
+        "held": true,
+        "shows_connected": true,
+        "tunnel_held": true,
+        "failure_written": true,
+        "disarm_steps": 0
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    },
+    {
+      "id": "timeout",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "timeout"
+      ],
+      "expect": {
+        "phase": "connected",
+        "intent": "connect",
+        "armed": true,
+        "held": true,
+        "shows_connected": true,
+        "tunnel_held": true,
+        "failure_written": false,
+        "disarm_steps": 0
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    },
+    {
+      "id": "late-tunnel-after-disconnect",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "user_disconnect",
+        "posture_error",
+        "carrier_lost"
+      ],
+      "expect": {
+        "phase": "disarming",
+        "intent": "user_disconnect",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "tunnel_held": true,
+        "failure_written": false,
+        "disarm_steps": 1
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    },
+    {
+      "id": "generation-fence",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        {
+          "name": "posture_error",
+          "generation": 0
+        }
+      ],
+      "expect": {
+        "phase": "connecting",
+        "intent": "connect",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "tunnel_held": true,
+        "failure_written": false,
+        "disarm_steps": 0
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    },
+    {
+      "id": "user-stop-writes-no-failure",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "carrier_lost",
+        "user_disconnect"
+      ],
+      "expect": {
+        "phase": "disarming",
+        "intent": "user_disconnect",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "tunnel_held": true,
+        "failure_written": false,
+        "disarm_steps": 1
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    },
+    {
+      "id": "failures-then-one-disarm",
+      "steps": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "timeout",
+        "catalog_failure",
+        "account_hold",
+        "credential_revoked",
+        "update_failed",
+        "carrier_lost",
+        "budget_exhausted",
+        "user_disconnect"
+      ],
+      "expect": {
+        "phase": "disarming",
+        "intent": "user_disconnect",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "tunnel_held": false,
+        "failure_written": false,
+        "disarm_steps": 1
+      },
+      "enforcement": {
+        "segue-client": "enabled",
+        "macos": "todo",
+        "ios": "todo",
+        "android": "todo",
+        "windows": "todo",
+        "linux": "todo"
+      }
+    }
+  ]
+}

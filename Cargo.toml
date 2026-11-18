@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/segue-client"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.96"
+repository = "https://github.com/raydocs/segue-app"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+zeroize = "1"

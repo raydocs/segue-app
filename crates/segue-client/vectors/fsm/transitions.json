@@ -1,0 +1,948 @@
+{
+  "fixtureVersion": 1,
+  "description": "Connect FSM. Each case is one event after an optional setup. disarm is true only when that event emits Disarm or DisconnectDataPlane. A failure does not disarm. strict is off unless mode is strict; spending the reconnect budget then releases ordinary traffic and keeps the AI lock.",
+  "cases": [
+    {
+      "id": "off-user-connect",
+      "setup": [],
+      "event": "user_connect",
+      "expect": {
+        "phase": "preparing",
+        "armed": false,
+        "held": false,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": false,
+        "accepted": true,
+        "failure_written": false,
+        "generation": 1
+      }
+    },
+    {
+      "id": "failed-user-connect",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_error"
+      ],
+      "event": "user_connect",
+      "expect": {
+        "phase": "preparing",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": false,
+        "accepted": true,
+        "failure_written": false,
+        "generation": 2
+      }
+    },
+    {
+      "id": "protected-offline-user-connect",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "carrier_lost"
+      ],
+      "event": "user_connect",
+      "expect": {
+        "phase": "preparing",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": false,
+        "generation": 2
+      }
+    },
+    {
+      "id": "reconnect-after-disconnect",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "user_disconnect",
+        "disarm_ack"
+      ],
+      "event": "user_connect",
+      "expect": {
+        "phase": "preparing",
+        "armed": false,
+        "held": false,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": false,
+        "accepted": true,
+        "failure_written": false,
+        "generation": 2
+      }
+    },
+    {
+      "id": "preparing-invalid-never-verified",
+      "setup": [
+        "user_connect"
+      ],
+      "event": "prepare_invalid",
+      "expect": {
+        "phase": "off",
+        "armed": false,
+        "held": false,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": false,
+        "accepted": true,
+        "failure_written": true,
+        "generation": 1
+      }
+    },
+    {
+      "id": "preparing-invalid-after-verified",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "carrier_lost",
+        "user_connect"
+      ],
+      "event": "prepare_invalid",
+      "expect": {
+        "phase": "failed",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": false,
+        "accepted": true,
+        "failure_written": true,
+        "generation": 2
+      }
+    },
+    {
+      "id": "preparing-cancel",
+      "setup": [
+        "user_connect"
+      ],
+      "event": "user_disconnect",
+      "expect": {
+        "phase": "off",
+        "armed": false,
+        "held": false,
+        "shows_connected": false,
+        "intent": "user_disconnect",
+        "disarm": false,
+        "tunnel_held": false,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "preparing-ok",
+      "setup": [
+        "user_connect"
+      ],
+      "event": "prepare_ok",
+      "expect": {
+        "phase": "arming",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "preparing-catalog-failure",
+      "setup": [
+        "user_connect"
+      ],
+      "event": "catalog_failure",
+      "expect": {
+        "phase": "off",
+        "armed": false,
+        "held": false,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": false,
+        "accepted": true,
+        "failure_written": true
+      }
+    },
+    {
+      "id": "arming-ack",
+      "setup": [
+        "user_connect",
+        "prepare_ok"
+      ],
+      "event": "arm_ack",
+      "expect": {
+        "phase": "connecting",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "arming-error",
+      "setup": [
+        "user_connect",
+        "prepare_ok"
+      ],
+      "event": "arm_error",
+      "expect": {
+        "phase": "arming",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": true
+      }
+    },
+    {
+      "id": "arming-user-disconnect",
+      "setup": [
+        "user_connect",
+        "prepare_ok"
+      ],
+      "event": "user_disconnect",
+      "expect": {
+        "phase": "disarming",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "user_disconnect",
+        "disarm": true,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "connecting-posture-connected",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack"
+      ],
+      "event": "posture_connected",
+      "expect": {
+        "phase": "verifying",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "connecting-error-never-verified",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack"
+      ],
+      "event": "posture_error",
+      "expect": {
+        "phase": "failed",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": false,
+        "accepted": true,
+        "failure_written": true
+      }
+    },
+    {
+      "id": "connecting-error-verified",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "carrier_lost",
+        "probe_ok"
+      ],
+      "event": "posture_error",
+      "expect": {
+        "phase": "protected_offline",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": true
+      }
+    },
+    {
+      "id": "verifying-exit-only",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected"
+      ],
+      "event": "exit_evidence",
+      "expect": {
+        "phase": "verifying",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "verifying-ai-only",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected"
+      ],
+      "event": "ai_route_evidence",
+      "expect": {
+        "phase": "verifying",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "verifying-becomes-connected",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence"
+      ],
+      "event": "ai_route_evidence",
+      "expect": {
+        "phase": "connected",
+        "armed": true,
+        "held": true,
+        "shows_connected": true,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "verifying-ai-then-exit",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "ai_route_evidence"
+      ],
+      "event": "exit_evidence",
+      "expect": {
+        "phase": "connected",
+        "armed": true,
+        "held": true,
+        "shows_connected": true,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "connected-carrier-lost",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence"
+      ],
+      "event": "carrier_lost",
+      "expect": {
+        "phase": "protected_offline",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": true
+      }
+    },
+    {
+      "id": "connected-network-change",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence"
+      ],
+      "event": "network_change",
+      "expect": {
+        "phase": "protected_offline",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": true
+      }
+    },
+    {
+      "id": "protected-offline-probe-ok",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "carrier_lost"
+      ],
+      "event": "probe_ok",
+      "expect": {
+        "phase": "connecting",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": true
+      }
+    },
+    {
+      "id": "protected-offline-probe-fail",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "carrier_lost"
+      ],
+      "event": "probe_fail",
+      "expect": {
+        "phase": "protected_offline",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": true
+      }
+    },
+    {
+      "id": "connected-user-disconnect",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence"
+      ],
+      "event": "user_disconnect",
+      "expect": {
+        "phase": "disarming",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "user_disconnect",
+        "disarm": true,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "protected-offline-user-disconnect",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "carrier_lost"
+      ],
+      "event": "user_disconnect",
+      "expect": {
+        "phase": "disarming",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "user_disconnect",
+        "disarm": true,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "connected-sign-out",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence"
+      ],
+      "event": "sign_out",
+      "expect": {
+        "phase": "disarming",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "sign_out",
+        "disarm": true,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "connected-quit",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence"
+      ],
+      "event": "quit",
+      "expect": {
+        "phase": "disarming",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "quit",
+        "disarm": true,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "connecting-quit",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack"
+      ],
+      "event": "quit",
+      "expect": {
+        "phase": "disarming",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "quit",
+        "disarm": true,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "disarming-ack",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "user_disconnect"
+      ],
+      "event": "disarm_ack",
+      "expect": {
+        "phase": "off",
+        "armed": false,
+        "held": false,
+        "shows_connected": false,
+        "intent": "user_disconnect",
+        "disarm": false,
+        "tunnel_held": false,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "disarming-no-ack",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "user_disconnect"
+      ],
+      "event": "disarm_no_ack",
+      "expect": {
+        "phase": "disarming",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "user_disconnect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "crash-from-connected",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence"
+      ],
+      "event": "crash",
+      "expect": {
+        "phase": "off",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": false,
+        "accepted": true,
+        "failure_written": true
+      }
+    },
+    {
+      "id": "crash-from-disarming",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "user_disconnect"
+      ],
+      "event": "process_restart",
+      "expect": {
+        "phase": "off",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "user_disconnect",
+        "disarm": false,
+        "tunnel_held": false,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "crash-from-off",
+      "setup": [],
+      "event": "process_restart",
+      "expect": {
+        "phase": "off",
+        "armed": false,
+        "held": false,
+        "shows_connected": false,
+        "intent": null,
+        "disarm": false,
+        "tunnel_held": false,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "budget-exhausted-ai-only",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "carrier_lost"
+      ],
+      "event": "budget_exhausted",
+      "expect": {
+        "phase": "protected_offline",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": false,
+        "accepted": true,
+        "failure_written": true
+      }
+    },
+    {
+      "id": "budget-exhausted-strict",
+      "mode": "strict",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "carrier_lost"
+      ],
+      "event": "budget_exhausted",
+      "expect": {
+        "phase": "protected_offline",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": true
+      }
+    },
+    {
+      "id": "connected-timeout",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence"
+      ],
+      "event": "timeout",
+      "expect": {
+        "phase": "connected",
+        "armed": true,
+        "held": true,
+        "shows_connected": true,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "connected-catalog-failure",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence"
+      ],
+      "event": "catalog_failure",
+      "expect": {
+        "phase": "connected",
+        "armed": true,
+        "held": true,
+        "shows_connected": true,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": true
+      }
+    },
+    {
+      "id": "connected-update-failed",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence"
+      ],
+      "event": "update_failed",
+      "expect": {
+        "phase": "connected",
+        "armed": true,
+        "held": true,
+        "shows_connected": true,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": true
+      }
+    },
+    {
+      "id": "connected-account-hold",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence"
+      ],
+      "event": "account_hold",
+      "expect": {
+        "phase": "connected",
+        "armed": true,
+        "held": true,
+        "shows_connected": true,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": true
+      }
+    },
+    {
+      "id": "connected-credential-revoked",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence"
+      ],
+      "event": "credential_revoked",
+      "expect": {
+        "phase": "connected",
+        "armed": true,
+        "held": true,
+        "shows_connected": true,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": true,
+        "failure_written": true
+      }
+    },
+    {
+      "id": "late-posture-after-disconnect",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack",
+        "posture_connected",
+        "exit_evidence",
+        "ai_route_evidence",
+        "user_disconnect"
+      ],
+      "event": "posture_error",
+      "expect": {
+        "phase": "disarming",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "user_disconnect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": false,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "stale-generation-ignored",
+      "setup": [
+        "user_connect",
+        "prepare_ok",
+        "arm_ack"
+      ],
+      "event": {
+        "name": "posture_error",
+        "generation": 99
+      },
+      "expect": {
+        "phase": "connecting",
+        "armed": true,
+        "held": true,
+        "shows_connected": false,
+        "intent": "connect",
+        "disarm": false,
+        "tunnel_held": true,
+        "accepted": false,
+        "failure_written": false
+      }
+    },
+    {
+      "id": "off-arm-ack-rejected",
+      "setup": [],
+      "event": "arm_ack",
+      "expect": {
+        "phase": "off",
+        "armed": false,
+        "held": false,
+        "shows_connected": false,
+        "intent": null,
+        "disarm": false,
+        "tunnel_held": false,
+        "accepted": false,
+        "failure_written": false
+      }
+    }
+  ]
+}
