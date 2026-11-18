@@ -191,63 +191,195 @@ def cmd_helper(argv):
     return 0
 
 
-def established_to(port):
+def http_exchange(host, port, method, path, extra_headers, timeout):
+    """One HTTP/1.1 request. Returns (status, body). Host is the loopback name."""
+    sock = socket.create_connection((host, int(port)), timeout)
     try:
-        output = subprocess.run(
-            ["/usr/sbin/netstat", "-n", "-p", "tcp"],
-            check=False,
-            capture_output=True,
-            text=True,
-        ).stdout
+        lines = [
+            "%s %s HTTP/1.1" % (method, path),
+            "Host: %s" % host,
+            "Connection: close",
+        ]
+        for key, value in extra_headers:
+            lines.append("%s: %s" % (key, value))
+        sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
+        chunks = []
+        while True:
+            block = sock.recv(8192)
+            if not block:
+                break
+            chunks.append(block)
+    finally:
+        sock.close()
+    raw = b"".join(chunks)
+    head, _, body = raw.partition(b"\r\n\r\n")
+    status = 0
+    first = head.split(b"\r\n", 1)[0].split(b" ")
+    if len(first) >= 2 and first[1].isdigit():
+        status = int(first[1])
+    return status, body
+
+
+def metric_value(port, name):
+    """segue_relay_<name> from the relay's metrics port, or None."""
+    try:
+        status, body = http_exchange("127.0.0.1", port, "GET", "/", [], 1.0)
     except OSError:
-        return -1
-    # BSD netstat prints 127.0.0.1.18081; some builds use a colon.
-    needles = ("127.0.0.1.%s" % port, "127.0.0.1:%s" % port)
-    count = 0
-    for line in output.splitlines():
-        if "ESTABLISHED" not in line:
-            continue
-        if any(needle in line for needle in needles):
-            count += 1
-    return count
+        return None
+    if status != 200:
+        return None
+    prefix = ("segue_relay_%s " % name).encode("ascii")
+    for line in body.splitlines():
+        if line.startswith(prefix):
+            rest = line[len(prefix) :].strip()
+            if rest.isdigit():
+                return int(rest)
+    return None
 
 
-def held_connect(host, port, hold, socks_port):
-    result = {"connect": "fail"}
+def cmd_kernel_status(argv):
+    """GET /v1/status using control.json. Prints the JSON body, never the token."""
+    path = argv[0]
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            token = json.load(handle)
+        addr = token["addr"]
+        secret = token["token"]
+    except (OSError, ValueError, KeyError, TypeError):
+        print("error=no-control-token")
+        return 1
+    host, sep, port = addr.rpartition(":")
+    if not sep or not port.isdigit():
+        print("error=bad-control-addr")
+        return 1
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    try:
+        status, body = http_exchange(
+            host,
+            port,
+            "GET",
+            "/v1/status",
+            [("Authorization", "Bearer " + secret)],
+            1.0,
+        )
+    except OSError as exc:
+        print("error=%s" % exc.__class__.__name__)
+        return 1
+    text = body.decode("utf-8", "replace")
+    sys.stdout.write(text)
+    if not text.endswith("\n"):
+        sys.stdout.write("\n")
+    return 0 if status == 200 else 1
 
-    def run():
-        try:
-            sock = socket.create_connection((host, port), 2.0)
-        except OSError as exc:
-            result["connect"] = exc.__class__.__name__
-            return
-        result["connect"] = "ok"
+
+def cmd_relay_metrics(argv):
+    port = argv[0]
+    try:
+        status, body = http_exchange("127.0.0.1", port, "GET", "/", [], 1.0)
+    except OSError as exc:
+        print("error=%s" % exc.__class__.__name__)
+        return 1
+    text = body.decode("utf-8", "replace")
+    sys.stdout.write(text)
+    if not text.endswith("\n"):
+        sys.stdout.write("\n")
+    return 0 if status == 200 else 1
+
+
+def _pump(src, dst):
+    try:
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    try:
+        dst.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+
+
+def _splice(client, host, port):
+    try:
+        upstream = socket.create_connection((host, port), 5.0)
+    except OSError:
+        client.close()
+        return
+    thread = threading.Thread(target=_pump, args=(client, upstream))
+    thread.daemon = True
+    thread.start()
+    _pump(upstream, client)
+    client.close()
+    upstream.close()
+
+
+def cmd_forward(argv):
+    """Splice TCP from listen_host:listen_port to dest_host:dest_port.
+
+    The kernel pins carrier sockets to the physical NIC, which cannot
+    connect to 127.0.0.1. The relay still listens on loopback; this
+    forwarder is the address the kernel dials.
+    """
+    listen_host, listen_port, dest_host, dest_port = argv[:4]
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((listen_host, int(listen_port)))
+    server.listen(64)
+    print(
+        "forward %s:%s -> %s:%s" % (listen_host, listen_port, dest_host, dest_port),
+        flush=True,
+    )
+    while True:
+        client, _addr = server.accept()
+        thread = threading.Thread(
+            target=_splice, args=(client, dest_host, int(dest_port))
+        )
+        thread.daemon = True
+        thread.start()
+
+
+def held_connect(host, port, hold, timeout):
+    try:
+        sock = socket.create_connection((host, int(port)), timeout)
+    except OSError as exc:
+        return exc.__class__.__name__
+    try:
         time.sleep(hold)
+    finally:
         try:
             sock.close()
         except OSError:
             pass
+    return "ok"
 
-    baseline = established_to(socks_port)
-    thread = threading.Thread(target=run)
-    thread.start()
-    peak = baseline
-    for _ in range(20):
-        peak = max(peak, established_to(socks_port))
-        time.sleep(0.1)
-    thread.join(timeout=3.0)
-    if baseline < 0 or peak < 0:
-        delta = -1
-    else:
-        delta = peak - baseline
-    return result["connect"], delta
+
+def _delta(before, after):
+    if before is None or after is None:
+        return "missing"
+    return str(after - before)
 
 
 def cmd_egress(argv):
-    fake_ip, fake_port, socks_port, other_host, other_port, loopback_port = argv
-    ai_connect, ai_delta = held_connect(fake_ip, int(fake_port), 1.2, int(socks_port))
-    other_connect, other_delta = held_connect(
-        other_host, int(other_port), 0.4, int(socks_port)
+    """AI flow should move segue_relay_connects_home; a non-AI flow should not."""
+    fake_ip, fake_port, metrics_port, other_host, other_port, loopback_port = argv[:6]
+    home_before = metric_value(metrics_port, "connects_home")
+    overseas_before = metric_value(metrics_port, "connects_overseas")
+    ai_connect = held_connect(fake_ip, fake_port, 1.5, 5.0)
+    ai_home = _delta(home_before, metric_value(metrics_port, "connects_home"))
+    ai_overseas = _delta(
+        overseas_before, metric_value(metrics_port, "connects_overseas")
+    )
+    other_home_before = metric_value(metrics_port, "connects_home")
+    other_overseas_before = metric_value(metrics_port, "connects_overseas")
+    other_connect = held_connect(other_host, other_port, 0.2, 1.5)
+    other_home = _delta(
+        other_home_before, metric_value(metrics_port, "connects_home")
+    )
+    other_overseas = _delta(
+        other_overseas_before, metric_value(metrics_port, "connects_overseas")
     )
     try:
         sock = socket.create_connection(("127.0.0.1", int(loopback_port)), 2.0)
@@ -256,9 +388,11 @@ def cmd_egress(argv):
     except OSError as exc:
         loopback = exc.__class__.__name__
     print("ai_connect=%s" % ai_connect)
-    print("ai_socks_delta=%s" % ai_delta)
+    print("ai_home_delta=%s" % ai_home)
+    print("ai_overseas_delta=%s" % ai_overseas)
     print("other_connect=%s" % other_connect)
-    print("other_socks_delta=%s" % other_delta)
+    print("other_home_delta=%s" % other_home)
+    print("other_overseas_delta=%s" % other_overseas)
     print("loopback=%s" % loopback)
     return 0
 
@@ -412,6 +546,9 @@ def main(argv):
         "udp-echo": (2, cmd_udp_echo),
         "serve": (3, cmd_serve),
         "helper": (2, cmd_helper),
+        "forward": (4, cmd_forward),
+        "kernel-status": (1, cmd_kernel_status),
+        "relay-metrics": (1, cmd_relay_metrics),
         "egress": (6, cmd_egress),
         "counter": (0, cmd_counter),
         "leak-rules": (0, cmd_leak_rules),

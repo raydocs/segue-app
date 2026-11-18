@@ -94,7 +94,7 @@ SEGUE_VM_MATRIX=throwaway bash apps/macos/scripts/vm-ailock-matrix.sh --dry-run
 ## How long
 
 First real run: about 20–40 minutes (clone, `cargo build --release` of
-`segue-kernel` and `segue-cli`, `swift build -c release`, then the rows).
+`segue-kernel`, `segue-cli` and `segue-relay`, `swift build -c release`, then the rows).
 A later run that only rebuilds is shorter. The rows themselves are a few
 minutes; several `dig` calls use a 2 second timeout on purpose.
 pre-reboot is most of that if it builds. post-reboot is under a minute,
@@ -104,7 +104,7 @@ plus the reboot the orchestrator performs. Armed and clear are two reboots.
 
 | Row | Pass |
 | --- | --- |
-| `connected` | Arm started the kernel (through the helper): kernel DNS (`dig @127.0.0.1 -p 15353`) returns a `198.18.0.0/15` fake-IP; connecting to it opens a TCP session to the fixture SOCKS exit; a non-AI address does not; loopback still works. System DNS stays on the guard — port 15353 is not a system-resolver port |
+| `connected` | Arm started the kernel (through the helper) and `GET /v1/status` is `state: connected`: the resolver file is `nameserver 127.0.0.1` port `15353`; kernel DNS returns a `198.18.0.0/15` fake-IP; connecting to it increments `segue_relay_connects_home`; a non-AI address increments neither `connects_home` nor `connects_overseas`; loopback still works |
 | `kill-kernel` | After SIGTERM (SIGKILL only if it is still alive): a clean shutdown is not restarted, so the utun is gone, the pid is dead, and the helper has converged the layer to the guard; the armed name is still empty NOERROR from `127.0.0.1`; example.com and loopback still work; the CIDR is still dropped |
 | `armed-kernel-not-running` | Runs after `kill-kernel`, with the kernel down: no `segue-kernel` process; system `dig www.ailock-fixture.example.com` is empty NOERROR from `127.0.0.1`, and `dig @127.0.0.1 -p 5354` is empty NOERROR; `dig example.com` has an answer; TCP to `198.51.100.10` is dropped; TCP to `127.0.0.1` works |
 | `kill-helper` | During launchd's restart the armed name times out or is empty NOERROR from `127.0.0.1`; an upstream NXDOMAIN is a leak. example.com works before and after. After restart the armed name is empty NOERROR from the guard again, and the helper has taken the kernel back over (the orphan's pid file named it) and restarted it |
@@ -122,22 +122,28 @@ The helper does not merge a bundle yet, so it is pointed at a generated
 `--ai-lock` file with those two lines only.
 
 A FAIL row also records `launchctl print` for the helper and the release daemon,
-the helper and kernel log tails, `ls -l /var/run/segue*`, `lsof` on the guard
+the helper and kernel log tails, the relay log and metrics, the full kernel
+`GET /v1/status` JSON, `ls -l /var/run/segue*`, `lsof` on the guard
 port, and the first 60 lines of `scutil --dns`.
 
-`segue run -config` has no VLESS inbound (socks, http, tun, tproxy). The
-fixture exit is the simplest server it can run: SOCKS on `127.0.0.1:18081`,
-freedom outbound. The kernel home outbound is that SOCKS server. A tiny TCP
-listener on `198.51.100.10` (lo0 alias) is the stand-in AI host. The drop
-probe removes the alias first, because the anchor passes `lo0` before the
-CIDR block. The expected-leak row adds a second alias, `203.0.113.10/32`,
-with a local TCP listener and a UDP echo on port 443, so that probe does
-not leave the machine.
+The fixture exit is `segue-relay` on `127.0.0.1:17443`, with a synthetic
+Ed25519 ticket generated under the work dir at run time (not committed).
+The kernel's AI route is that relay (`exit_class: ai`). The relay dials a
+confirmed AI target through a loopback Home line — `segue run` SOCKS on
+`127.0.0.1:18081` with a freedom outbound — never as a direct overseas
+connect. Carrier sockets are bound to the physical NIC, which cannot dial
+loopback, so `192.0.2.10` (an alias on that NIC) forwards the carrier to
+the relay. A tiny TCP listener on `198.51.100.10` (lo0 alias) is the
+stand-in AI host; `/etc/hosts` points the relay's resolver at it (`dig`
+does not read hosts). The drop probe removes the alias first, because the
+anchor passes `lo0` before the CIDR block. The expected-leak row adds a
+second alias, `203.0.113.10/32`, with a local TCP listener and a UDP echo
+on port 443, so that probe does not leave the machine.
 
-The helper does not publish a utun, and its supervisor argv passes `--config`,
-which `segue-kernel` rejects. The connected row starts
-`segue-kernel run --state-dir … --log … kernel.json` itself and queries the
-kernel's DNS port. System DNS stays on the guard.
+The helper starts `segue-kernel` and polls `GET /v1/status`. It keeps
+resolver files on the guard port until `state` is `connected`, then points
+them at the kernel DNS port. `--kernel-by-script` is the debug fallback
+that execs the kernel itself.
 
 ## Archive the thread right after
 
