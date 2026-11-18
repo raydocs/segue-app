@@ -557,6 +557,10 @@ arm_state_dump() {
   payload='{"version":1,"kind":"status_read"}'
   {
     printf 'arm_step=%s\n' "$step"
+    printf 'now=%s\n' "$(/bin/date -u +%H:%M:%S)"
+    printf 'socket_stat=%s\n' "$(/usr/bin/stat -f '%Sm type=%HT' -t %H:%M:%S /var/run/segue/service.sock 2>&1)"
+    printf 'helper_started=%s\n' "$(/bin/ps -o lstart= -p "$(/usr/bin/pgrep -x segue-core-helper | head -n 1)" 2>&1)"
+    printf 'arm_trace=%s\n' "${ARM_TRACE:-}"
     printf '%s\n' "--- status_read ---"
     /usr/bin/python3 "$PROBES" helper /var/run/segue/service.sock "$payload" 2>&1 || true
     printf '%s\n' "--- status_parsed ---"
@@ -611,6 +615,7 @@ arm_failed() {
 arm_wait() {
   local tries="$1" step="$2"
   shift 2
+  ARM_TRACE="${ARM_TRACE:-}${step}@$(/bin/date -u +%H:%M:%S) "
   if wait_until "$tries" "$@"; then
     return 0
   fi
@@ -676,7 +681,7 @@ arm_helper() {
   # No kickstart. The running helper polls the intent file and the socket
   # arm below installs the same generation. Restarting it would SIGTERM
   # the kernel the first arm had just started.
-  arm_wait 20 socket_present socket_present || return 1
+  arm_wait 60 socket_present socket_present || return 1
   socket_arm >/dev/null || { arm_failed socket_arm; return 1; }
   arm_wait 20 resolver_present resolver_present || return 1
   if ! main_has_anchor; then
