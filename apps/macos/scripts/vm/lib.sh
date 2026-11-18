@@ -5,9 +5,19 @@ FIXTURE_SUFFIX=ailock-fixture.example.com
 FIXTURE_CIDR=198.51.100.0/24
 FIXTURE_HOST=198.51.100.10
 FIXTURE_TCP_PORT=8080
+# Loopback SOCKS the relay uses as its Home line (freedom outbound). The
+# kernel does not dial this port; AI targets are Home on the relay, and the
+# relay never sends a confirmed AI target direct.
 SOCKS_PORT=18081
 KERNEL_DNS_PORT=15353
 KERNEL_SOCKS_PORT=18080
+# segue-relay listens here. The kernel cannot dial 127.0.0.1: its carrier
+# sockets are bound to the physical NIC (IP_BOUND_IF). CARRIER_HOST is an
+# alias on that NIC; a forwarder there splices the carrier to the relay.
+RELAY_PORT=17443
+RELAY_METRICS_PORT=17444
+CARRIER_HOST=192.0.2.10
+CARRIER_IFACE=
 GUARD_PORT=5354
 UNLISTED_HOST=203.0.113.50
 UNLISTED_PORT=443
@@ -22,6 +32,7 @@ SUPPORT="/Library/Application Support/Segue"
 HELPER_DST=/Library/PrivilegedHelperTools/segue-core-helper
 KERNEL_DST=/Library/PrivilegedHelperTools/segue-kernel
 SEGUE_DST=/Library/PrivilegedHelperTools/segue
+RELAY_DST=/Library/PrivilegedHelperTools/segue-relay
 RELEASE_DST=/Library/PrivilegedHelperTools/segue-release
 RELEASE_CTL_DST=/Library/PrivilegedHelperTools/segue-release-ctl
 RELEASE_SOCK=/var/run/segue-release.sock
@@ -289,6 +300,18 @@ capture_fail_context() {
     /usr/sbin/lsof -nP -iUDP:"${GUARD_PORT}" 2>&1 | /usr/bin/head -n 40 || true
     printf '%s\n' "--- scutil dns ---"
     /usr/sbin/scutil --dns 2>&1 | /usr/bin/head -n 60 || true
+    printf '%s\n' "--- kernel /v1/status ---"
+    kernel_status_text
+    printf '%s\n' "--- relay metrics ---"
+    /usr/bin/python3 "$PROBES" relay-metrics "$RELAY_METRICS_PORT" 2>&1 || true
+    printf '%s\n' "--- relay log ---"
+    log_tail "${WORK}/logs/relay.pid.log"
+    printf '%s\n' "--- carrier route ---"
+    if [[ -f "${WORK}/state/carrier.route" ]]; then
+      /bin/cat "${WORK}/state/carrier.route" 2>&1 || true
+    else
+      printf 'no carrier route\n'
+    fi
   } 2>&1 || true
 }
 
@@ -301,7 +324,9 @@ plan_fail_probes() {
   plan /bin/ls -l /var/run/segue /var/run/segue/service.sock /var/run/segue-release.sock
   plan /usr/sbin/lsof -nP -iUDP:"${GUARD_PORT}"
   plan /usr/sbin/scutil --dns
-  note "FAIL rows also include the tails of helper.err, kernel.log and kernel.stdout"
+  plan /usr/bin/python3 "$PROBES" kernel-status "${SUPPORT}/kernel/control.json"
+  plan /usr/bin/python3 "$PROBES" relay-metrics "$RELAY_METRICS_PORT"
+  note "FAIL rows also include the tails of helper.err, kernel.log, kernel.stdout and relay.pid.log, plus the full kernel /v1/status JSON"
 }
 
 toolchain() {
@@ -345,10 +370,11 @@ prepare_tree() {
   if dry; then
     sync_repo "$CORE_REPO" "$CORE_SRC" "$core_rev"
     sync_repo "$APP_REPO" "$APP_SRC" "$app_rev"
-    plan cargo build --release --manifest-path "${CORE_SRC}/Cargo.toml" -p segue-kernel -p segue-cli
+    plan cargo build --release --manifest-path "${CORE_SRC}/Cargo.toml" -p segue-kernel -p segue-cli -p segue-relay
     plan swift build -c release --package-path "${APP_SRC}/apps/macos"
     KERNEL_BUILT="${CARGO_TARGET_DIR}/release/segue-kernel"
     SEGUE_BUILT="${CARGO_TARGET_DIR}/release/segue"
+    RELAY_BUILT="${CARGO_TARGET_DIR}/release/segue-relay"
     HELPER_BIN="${APP_SRC}/apps/macos/.build/release/segue-core-helper"
     return 0
   fi
@@ -362,7 +388,7 @@ prepare_tree() {
     sync_repo "$CORE_REPO" "$CORE_SRC" "$CORE_REV" || return 1
     sync_repo "$APP_REPO" "$APP_SRC" "$APP_REV" || return 1
     mkdir -p "${WORK}/logs"
-    if ! cargo build --release --manifest-path "${CORE_SRC}/Cargo.toml" -p segue-kernel -p segue-cli >"${WORK}/logs/cargo.log" 2>&1; then
+    if ! cargo build --release --manifest-path "${CORE_SRC}/Cargo.toml" -p segue-kernel -p segue-cli -p segue-relay >"${WORK}/logs/cargo.log" 2>&1; then
       echo "cargo build failed; see ${WORK}/logs/cargo.log" >&2
       return 1
     fi
@@ -373,9 +399,10 @@ prepare_tree() {
   fi
   KERNEL_BUILT="${CARGO_TARGET_DIR}/release/segue-kernel"
   SEGUE_BUILT="${CARGO_TARGET_DIR}/release/segue"
+  RELAY_BUILT="${CARGO_TARGET_DIR}/release/segue-relay"
   HELPER_BIN="${APP_SRC}/apps/macos/.build/release/segue-core-helper"
-  if [[ ! -x "$KERNEL_BUILT" || ! -x "$SEGUE_BUILT" || ! -x "$HELPER_BIN" ]]; then
-    echo "missing segue-kernel, segue, or segue-core-helper" >&2
+  if [[ ! -x "$KERNEL_BUILT" || ! -x "$SEGUE_BUILT" || ! -x "$RELAY_BUILT" || ! -x "$HELPER_BIN" ]]; then
+    echo "missing segue-kernel, segue, segue-relay, or segue-core-helper" >&2
     return 1
   fi
 }
@@ -448,7 +475,7 @@ EOF
 }
 
 install_daemons() {
-  note "segue has no VLESS inbound (socks, http, tun, tproxy). The fixture exit is a loopback SOCKS server."
+  note "the fixture exit is segue-relay on 127.0.0.1:${RELAY_PORT}. The kernel's AI route is that relay (segue exit_class ai). A forwarder on ${CARRIER_HOST}:${RELAY_PORT} (alias of the physical NIC) splices the carrier, because IP_BOUND_IF cannot dial loopback."
   note "fixture AI suffix and CIDR are added by a signed policy bundle. The product ai-lock.txt is not edited."
   note "arm starts segue-kernel via the helper: it supervises the child, restarts it on crash, and polls /v1/status (control section in kernel.json, token under ${SUPPORT}/kernel) for the utun. --kernel-by-script execs the kernel here instead, for debugging."
   note "helper --requirement admits ${HELPER_PROBE_REQUIREMENT} so the python probe can status_read and re-arm. Production plists omit --requirement."
@@ -461,6 +488,8 @@ install_daemons() {
   priv /bin/chmod 755 "$KERNEL_DST" || return 1
   priv /bin/cp "$SEGUE_BUILT" "$SEGUE_DST" || return 1
   priv /bin/chmod 755 "$SEGUE_DST" || return 1
+  priv /bin/cp "$RELAY_BUILT" "$RELAY_DST" || return 1
+  priv /bin/chmod 755 "$RELAY_DST" || return 1
   priv /bin/cp "${WORK}/state/allowed-uid" "$UID_DST" || return 1
   priv /bin/chmod 644 "$UID_DST" || return 1
   priv /bin/cp "${WORK}/state/helper.plist" "$HELPER_PLIST" || return 1
@@ -522,7 +551,7 @@ enable_pf() {
 
 try_socket_arm() {
   local payload
-  payload='{"version":1,"kind":"arm","arm":{"schemaVersion":1,"generation":1,"intent":"user_connect","anchor_revision":1,"manifest_digest":"vm-matrix","egress":[{"ip":"127.0.0.1","port":18081}],"exit_ifaces":["lo0"],"strict":false,"evidence":{"policy_version":1,"posture":"vm-matrix"}}}'
+  payload="{\"version\":1,\"kind\":\"arm\",\"arm\":{\"schemaVersion\":1,\"generation\":1,\"intent\":\"user_connect\",\"anchor_revision\":1,\"manifest_digest\":\"vm-matrix\",\"egress\":[{\"ip\":\"${CARRIER_HOST}\",\"port\":${RELAY_PORT}}],\"exit_ifaces\":[\"${CARRIER_IFACE:-lo0}\"],\"strict\":false,\"evidence\":{\"policy_version\":1,\"posture\":\"vm-matrix\"}}}"
   if dry; then
     plan /usr/bin/python3 "$PROBES" helper /var/run/segue/service.sock '<arm-json>'
     printf 'socket=dry-run\n'
@@ -577,6 +606,8 @@ arm_state_dump() {
     else
       printf 'missing %s\n' "$token"
     fi
+    printf '%s\n' "--- kernel /v1/status ---"
+    kernel_status_text
     printf '%s\n' "--- intent ---"
     if [[ -f "$INTENT" ]]; then
       /bin/cat "$INTENT" 2>&1 || true
@@ -625,9 +656,10 @@ arm_wait() {
 # Commands a dry-run lists for the step dump, so the plan shows the
 # evidence a failed arm row would carry.
 plan_arm_evidence() {
-  note "arm steps, in order: socket_present, socket_arm, resolver_present, pf_reload (only if the main ruleset does not reference the anchor), anchor_refill, anchor_has_fixture, guard_answers, helper_kernel_up, resolver_kernel_port (resolver_guard_port when the helper has no utun)"
-  note "a failed step records its name plus this evidence: status_read reply, parsed kernel_state/pid/tun, socket-arm reply, control.json, the intent file, resolver files (nameserver 127.0.0.1 and port ${KERNEL_DNS_PORT} when connected, otherwise port ${GUARD_PORT}), pfctl -a ${ANCHOR} -s rules, guard dig"
+  note "arm steps, in order: socket_present, socket_arm, resolver_present, pf_reload (only if the main ruleset does not reference the anchor), anchor_refill, anchor_has_fixture, guard_answers, helper_kernel_up, kernel_posture_connected (GET /v1/status state=connected), resolver_kernel_port (resolver_guard_port when the helper has no utun)"
+  note "a failed step records its name plus this evidence: status_read reply, parsed kernel_state/pid/tun, socket-arm reply, control.json, the full kernel /v1/status JSON, the intent file, resolver files (nameserver 127.0.0.1 and port ${KERNEL_DNS_PORT} when connected, otherwise port ${GUARD_PORT}), pfctl -a ${ANCHOR} -s rules, guard dig"
   plan /usr/bin/python3 "$PROBES" helper /var/run/segue/service.sock '<status_read>'
+  plan /usr/bin/python3 "$PROBES" kernel-status "${SUPPORT}/kernel/control.json"
   plan /bin/cat "${SUPPORT}/kernel/control.json"
   plan /bin/cat "$INTENT"
   plan /bin/ls -l /etc/resolver
@@ -653,7 +685,7 @@ arm_helper() {
   write_intent true user_connect 1 || { arm_failed write_intent; return 1; }
   note "same-boot PF: the helper writes the anchor line into /etc/pf.conf but does not reload it. The harness runs pfctl -f /etc/pf.conf so the anchor is referenced. That reload flushes anchor contents, so the harness sends arm again on the socket to refill them. It does not kickstart the helper: a kickstart SIGTERMs the kernel, and the new process binds a new control port."
   note "the helper polls the intent file, so the arm is noticed without a restart. The helper was started before this file existed."
-  note "arm steps: socket_present, socket_arm, resolver_present, anchor_has_fixture, guard_answers, helper_kernel_up, resolver_kernel_port. The resolver file is nameserver 127.0.0.1 and port ${KERNEL_DNS_PORT} once the helper reports a utun, otherwise port ${GUARD_PORT}. dig @127.0.0.1 -p ${GUARD_PORT} must be empty NOERROR. A resolver file is replaced in place, never unlinked, to change ports."
+  note "arm steps: socket_present, socket_arm, resolver_present, anchor_has_fixture, guard_answers, helper_kernel_up, kernel_posture_connected, resolver_kernel_port. The resolver file is nameserver 127.0.0.1 and port ${KERNEL_DNS_PORT} once GET /v1/status reports state=connected and a utun, otherwise port ${GUARD_PORT}. dig @127.0.0.1 -p ${GUARD_PORT} must be empty NOERROR. A resolver file is replaced in place, never unlinked, to change ports."
   if dry; then
     plan test -S /var/run/segue/service.sock
     socket_arm
@@ -669,7 +701,8 @@ arm_helper() {
     else
       note "the helper starts ${KERNEL_DST} run --state-dir ${SUPPORT}/kernel --log ${WORK}/logs/kernel.log ${SUPPORT}/kernel.json at arm and reports it over status_read (kernel_state=running, kernel_pid, tun=utun<N>)."
       plan /usr/bin/python3 "$PROBES" helper /var/run/segue/service.sock '<status_read: kernel_state=running kernel_pid=<pid> tun=utun<N>>'
-      note "arm success once that utun is up: ${RESOLVER_FILE} has nameserver 127.0.0.1 and port ${KERNEL_DNS_PORT} (dns_mode=kernel, ai_layer=tunnel). Before the carrier, the same file names port ${GUARD_PORT}."
+      note "arm success once that utun is up and GET /v1/status state is connected: ${RESOLVER_FILE} has nameserver 127.0.0.1 and port ${KERNEL_DNS_PORT} (dns_mode=kernel, ai_layer=tunnel). Before the carrier, the same file names port ${GUARD_PORT}."
+      plan /usr/bin/python3 "$PROBES" kernel-status "${SUPPORT}/kernel/control.json"
       plan grep -qx "nameserver 127.0.0.1" "$RESOLVER_FILE"
       plan grep -qx "port ${KERNEL_DNS_PORT}" "$RESOLVER_FILE"
     fi
@@ -700,6 +733,9 @@ arm_helper() {
     # then name the kernel DNS port; until the carrier is up they name the
     # guard port, and a suffix is never left without a file.
     arm_wait 30 helper_kernel_up helper_kernel_up || return 1
+    # The helper POSTs /v1/connect; state becomes connected only after the
+    # carrier to the relay accepts. DNS stays on the guard until then.
+    arm_wait 30 kernel_posture_connected kernel_posture_connected || return 1
     arm_wait 20 resolver_kernel_port resolver_kernel_port || return 1
   else
     arm_wait 15 resolver_guard_port resolver_guard_port || return 1
@@ -794,10 +830,17 @@ write_server_config() {
 EOF
 }
 
+# Signed policy, synthetic Ed25519 ticket, kernel.json and relay.json.
+# Keys stay under ${WORK}/state (mode 0600) and are never copied into the repo.
+# The AI route is the segue session to the relay (exit_class ai). The relay
+# classifies that suffix as AI and dials it through the loopback Home line,
+# whose outbound is freedom, so the lo0 alias is reached with no further proxy.
 sign_bundle() {
   local key="${WORK}/state/policy.key"
   local body="${WORK}/state/policy-body.json"
-  local pub="<public-key>"
+  local relay_key="${WORK}/state/relay.key"
+  local ticket="${WORK}/state/device.ticket"
+  local pub relay_pub ticket_text
   mkdir -p "${WORK}/state"
   cat > "$body" <<EOF
 {"version":1,"expires_at":4000000000,"ai_domains":["${FIXTURE_SUFFIX}"],"ai_cidrs":["${FIXTURE_CIDR}"],"default":{"type":"direct"}}
@@ -806,32 +849,58 @@ EOF
     plan "${KERNEL_DST}" policy-keygen "$key"
     plan "${KERNEL_DST}" sign-bundle --key "$key" --key-id 1 "$body"
     priv /bin/cp "${WORK}/state/policy.bundle" "${SUPPORT}/policy.bundle"
-    note "kernel.json home outbound is SOCKS 127.0.0.1:${SOCKS_PORT}; dns.listen is 127.0.0.1:${KERNEL_DNS_PORT}; tun ipv6 is false; domestic resolver is 192.0.2.53 (TEST-NET, not a real server)"
+    plan "${RELAY_DST}" keygen "$relay_key"
+    plan "${RELAY_DST}" issue-ticket --key "$relay_key" --key-id 1 --device 7 --classes ai,overseas --ttl 86400
+    note "synthetic Ed25519 ticket and key are written under ${WORK}/state at run time (mode 0600) and are not committed"
+    note "kernel.json: AI route is segue tag ai (exit_class ai, role home) via exit lab, carrier direct, relay ${CARRIER_HOST}:${RELAY_PORT}; tun ipv6 is false; dns.listen is 127.0.0.1:${KERNEL_DNS_PORT}; domestic resolver is 192.0.2.53 (TEST-NET, not a real server)"
+    note "relay.json: listen 127.0.0.1:${RELAY_PORT}, node_id 1, metrics 127.0.0.1:${RELAY_METRICS_PORT}, ticket key from keygen, same policy bundle, home line 127.0.0.1:${SOCKS_PORT}, dev_allow_cidrs ${FIXTURE_HOST}/32"
     return 0
   fi
-  rm -f "$key"
+  rm -f "$key" "$relay_key"
   pub=$("${KERNEL_DST}" policy-keygen "$key") || return 1
   pub=$(printf '%s' "$pub" | tr -d '[:space:]')
   printf '%s\n' "$pub" > "${WORK}/state/policy.pub"
   "${KERNEL_DST}" sign-bundle --key "$key" --key-id 1 "$body" > "${WORK}/state/policy.bundle" || return 1
   priv /bin/cp "${WORK}/state/policy.bundle" "${SUPPORT}/policy.bundle" || return 1
   priv /bin/chmod 644 "${SUPPORT}/policy.bundle" || return 1
+  relay_pub=$("${RELAY_DST}" keygen "$relay_key") || return 1
+  relay_pub=$(printf '%s' "$relay_pub" | tr -d '[:space:]')
+  ticket_text=$("${RELAY_DST}" issue-ticket --key "$relay_key" --key-id 1 --device 7 --classes ai,overseas --ttl 86400) || return 1
+  printf '%s\n' "$ticket_text" > "$ticket"
+  chmod 600 "$ticket" "$relay_key" "$key" || return 1
+  cat > "${WORK}/state/relay.json" <<EOF
+{
+  "listen": "127.0.0.1:${RELAY_PORT}",
+  "node_id": 1,
+  "metrics_listen": "127.0.0.1:${RELAY_METRICS_PORT}",
+  "ticket_keys": [{"key_id": 1, "public_key": "${relay_pub}"}],
+  "policy": {
+    "public_keys": [{"key_id": 1, "public_key": "${pub}"}],
+    "bundle": "${WORK}/state/policy.bundle"
+  },
+  "home_lines": [
+    {"id": "lab", "server": "127.0.0.1:${SOCKS_PORT}", "isp": "lab"}
+  ],
+  "dev_allow_cidrs": ["${FIXTURE_HOST}/32"]
+}
+EOF
   cat > "${WORK}/state/kernel.json" <<EOF
 {
   "listen": "127.0.0.1:${KERNEL_SOCKS_PORT}",
   "outbounds": {
-    "home": {
-      "role": "home",
-      "protocol": "socks",
-      "settings": {"servers": [{"address": "127.0.0.1", "port": ${SOCKS_PORT}}]}
-    },
     "direct": {"protocol": "freedom"}
   },
   "policy": {
     "public_keys": [{"key_id": 1, "public_key": "${pub}"}],
     "bundle": "policy.bundle",
     "installed": "policy.installed",
-    "ai_route": "home"
+    "ai_route": "ai"
+  },
+  "exits": [
+    {"name": "lab", "carrier": "direct", "relay": "${CARRIER_HOST}:${RELAY_PORT}", "node_id": 1}
+  ],
+  "segue": {
+    "ai": {"ticket_file": "${ticket}", "exit_class": "ai", "role": "home"}
   },
   "control": {
     "listen": "127.0.0.1:0",
@@ -846,11 +915,9 @@ EOF
   "sniff": {"timeout_ms": 300, "max_bytes": 16384}
 }
 EOF
-  # dns.listen is 127.0.0.1:15353. The helper does not rewrite per-service
-  # DNS (networksetup cannot carry a port). While the carrier is connected
-  # it writes /etc/resolver/<suffix> with nameserver 127.0.0.1 and this port;
-  # otherwise the same file names the guard port. The control section is
-  # what tells the helper the utun and the carrier.
+  # dns.listen is 127.0.0.1:15353. While the carrier is connected the helper
+  # writes /etc/resolver/<suffix> with nameserver 127.0.0.1 and this port;
+  # otherwise the same file names the guard port.
   if kernel_by_script; then
     note "kernel-by-script: kernel.json stays in ${WORK}/state; the helper own start settles config_rejected and leaves the script kernel alone."
     return 0
@@ -858,21 +925,135 @@ EOF
   priv /bin/cp "${WORK}/state/kernel.json" "${SUPPORT}/kernel.json" || return 1
 }
 
-# Everything the kernel needs except the kernel itself: the fixture SOCKS
-# exit, the signed policy bundle, kernel.json (control section included),
-# the lo0 aliases, and the AI fixture host. Runs before arm so the helper
-# finds a complete config the moment it starts the kernel.
+install_carrier_alias() {
+  local iface
+  iface=$(/sbin/route -n get 1.1.1.1 2>/dev/null | awk '/interface:/{print $2; exit}')
+  if [[ -z "$iface" ]]; then
+    if dry; then
+      iface="<physical-iface>"
+    else
+      echo "no physical interface (route -n get 1.1.1.1)" >&2
+      return 1
+    fi
+  fi
+  CARRIER_IFACE="$iface"
+  if ! dry; then
+    printf '%s\n' "$iface" > "${WORK}/state/carrier.iface"
+  fi
+  note "alias ${CARRIER_HOST}/32 on ${iface}: the kernel binds carrier sockets to the physical NIC, which cannot connect to 127.0.0.1. The on-link host route makes the probe treat ${CARRIER_HOST} as local on that NIC."
+  if dry; then
+    priv /sbin/ifconfig "$iface" alias "$CARRIER_HOST" netmask 255.255.255.255
+    priv /sbin/route -n delete -host "$CARRIER_HOST"
+    priv /sbin/route -n add -host "$CARRIER_HOST" -interface "$iface"
+    plan /sbin/route -n get "$CARRIER_HOST"
+    return 0
+  fi
+  if ! /sbin/ifconfig "$iface" | grep -F "$CARRIER_HOST" >/dev/null 2>&1; then
+    /sbin/ifconfig "$iface" alias "$CARRIER_HOST" netmask 255.255.255.255 || return 1
+  fi
+  /sbin/route -n delete -host "$CARRIER_HOST" >/dev/null 2>&1 || true
+  if ! /sbin/route -n add -host "$CARRIER_HOST" -interface "$iface"; then
+    # The alias's connected route may already be the on-link host route.
+    if ! /sbin/route -n get "$CARRIER_HOST" 2>/dev/null | grep -q "interface: ${iface}"; then
+      echo "could not install an on-link route for ${CARRIER_HOST} on ${iface}" >&2
+      return 1
+    fi
+  fi
+  /sbin/route -n get "$CARRIER_HOST" > "${WORK}/state/carrier.route" 2>&1 || true
+}
+
+remove_carrier_alias() {
+  local iface="${CARRIER_IFACE:-}"
+  if [[ -z "$iface" && -f "${WORK}/state/carrier.iface" ]]; then
+    iface=$(cat "${WORK}/state/carrier.iface" 2>/dev/null || true)
+  fi
+  /sbin/route -n delete -host "$CARRIER_HOST" >/dev/null 2>&1 || true
+  if [[ -n "$iface" && "$iface" != "<physical-iface>" ]]; then
+    /sbin/ifconfig "$iface" -alias "$CARRIER_HOST" >/dev/null 2>&1 || true
+  fi
+}
+
+hosts_install() {
+  local line="${FIXTURE_HOST} www.${FIXTURE_SUFFIX} # segue-vm-matrix"
+  if dry; then
+    note "hosts line so segue-relay resolves www.${FIXTURE_SUFFIX} to ${FIXTURE_HOST}; dig does not read /etc/hosts, so fake-IP checks stay on the kernel resolver"
+    priv /bin/sh -c "printf '%s\n' '${line}' >> /etc/hosts"
+    return 0
+  fi
+  if /usr/bin/grep -q 'segue-vm-matrix' /etc/hosts 2>/dev/null; then
+    return 0
+  fi
+  printf '%s\n' "$line" >> /etc/hosts || return 1
+  /usr/bin/dscacheutil -flushcache >/dev/null 2>&1 || true
+  /usr/bin/killall -HUP mDNSResponder >/dev/null 2>&1 || true
+}
+
+hosts_remove() {
+  local tmp="${WORK}/state/hosts.stripped"
+  if dry; then
+    note "remove the segue-vm-matrix line from /etc/hosts"
+    priv /usr/bin/grep -v segue-vm-matrix /etc/hosts
+    return 0
+  fi
+  if ! /usr/bin/grep -q 'segue-vm-matrix' /etc/hosts 2>/dev/null; then
+    return 0
+  fi
+  /usr/bin/grep -v 'segue-vm-matrix' /etc/hosts > "$tmp" || return 0
+  /bin/cp "$tmp" /etc/hosts || true
+  /bin/rm -f "$tmp"
+  /usr/bin/dscacheutil -flushcache >/dev/null 2>&1 || true
+  /usr/bin/killall -HUP mDNSResponder >/dev/null 2>&1 || true
+}
+
+wait_listen() {
+  local host="$1" port="$2" pidfile="$3" label="$4"
+  local i=0 pid
+  if dry; then
+    plan /usr/bin/python3 "$PROBES" tcp "$host" "$port" 1
+    return 0
+  fi
+  pid=$(cat "$pidfile" 2>/dev/null || true)
+  while [[ "$i" -lt 40 ]]; do
+    if /usr/bin/python3 "$PROBES" tcp "$host" "$port" 0.3 >/dev/null 2>&1; then
+      return 0
+    fi
+    if [[ -n "$pid" ]] && ! ps -p "$pid" >/dev/null 2>&1; then
+      echo "${label} exited before listening on ${host}:${port}" >&2
+      log_tail "${WORK}/logs/$(basename "$pidfile").log" >&2
+      return 1
+    fi
+    sleep 0.25
+    i=$((i + 1))
+  done
+  echo "${label} did not listen on ${host}:${port}" >&2
+  log_tail "${WORK}/logs/$(basename "$pidfile").log" >&2
+  return 1
+}
+
+# Relay, Home line, carrier forwarder, signed bundle, kernel.json, lo0 alias
+# and the AI fixture host. Runs before arm so the helper finds a complete
+# config the moment it starts the kernel.
 prepare_kernel_stack() {
   write_server_config
+  install_carrier_alias || return 1
   if dry; then
-    plan "${SEGUE_DST}" run -config "${WORK}/state/fixture-server.json"
     sign_bundle || return 1
+    hosts_install || return 1
+    plan "${SEGUE_DST}" run -config "${WORK}/state/fixture-server.json"
+    plan "${RELAY_DST}" run "${WORK}/state/relay.json"
+    plan /usr/bin/python3 "$PROBES" forward "$CARRIER_HOST" "$RELAY_PORT" 127.0.0.1 "$RELAY_PORT"
     priv /sbin/ifconfig lo0 alias "${FIXTURE_HOST}" netmask 255.255.255.0
     plan /usr/bin/python3 "$PROBES" serve "${FIXTURE_HOST}" "$FIXTURE_TCP_PORT" ai-host
     return 0
   fi
-  start_bg "${WORK}/state/fixture.pid" "${SEGUE_DST}" run -config "${WORK}/state/fixture-server.json" || return 1
   sign_bundle || return 1
+  hosts_install || return 1
+  start_bg "${WORK}/state/fixture.pid" "${SEGUE_DST}" run -config "${WORK}/state/fixture-server.json" || return 1
+  wait_listen 127.0.0.1 "$SOCKS_PORT" "${WORK}/state/fixture.pid" "home socks" || return 1
+  start_bg "${WORK}/state/relay.pid" "${RELAY_DST}" run "${WORK}/state/relay.json" || return 1
+  wait_listen 127.0.0.1 "$RELAY_PORT" "${WORK}/state/relay.pid" "segue-relay" || return 1
+  start_bg "${WORK}/state/carrier.pid" /usr/bin/python3 "$PROBES" forward "$CARRIER_HOST" "$RELAY_PORT" 127.0.0.1 "$RELAY_PORT" || return 1
+  wait_listen "$CARRIER_HOST" "$RELAY_PORT" "${WORK}/state/carrier.pid" "carrier" || return 1
   if ! /sbin/ifconfig lo0 | grep -q '198\.51\.100\.10'; then
     /sbin/ifconfig lo0 alias "${FIXTURE_HOST}" netmask 255.255.255.0 || return 1
   fi
@@ -946,6 +1127,23 @@ helper_kernel_up() {
   esac
   printf '%s\n' "$pid" > "${WORK}/state/kernel.pid"
   printf '%s\n' "$tun" > "${WORK}/state/utun.name"
+}
+
+# Full GET /v1/status body (or an error line). The token stays in control.json.
+kernel_status_text() {
+  /usr/bin/python3 "$PROBES" kernel-status "${SUPPORT}/kernel/control.json" 2>&1 || true
+}
+
+# True when the session dialer's coarse state is connected.
+kernel_posture_connected() {
+  local body
+  body=$(/usr/bin/python3 "$PROBES" kernel-status "${SUPPORT}/kernel/control.json" 2>/dev/null) || return 1
+  printf '%s\n' "$body" | /usr/bin/python3 -c 'import json,sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if doc.get("state") == "connected" else 1)'
 }
 
 saw_new_utun() {
@@ -1102,8 +1300,9 @@ row_connected() {
     plan /usr/bin/dig +time=2 +tries=1 "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/python3 "$PROBES" dns 127.0.0.1 "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}"
-    plan /usr/bin/python3 "$PROBES" egress 198.18.0.1 "$FIXTURE_TCP_PORT" "$SOCKS_PORT" "$UNLISTED_HOST" "$UNLISTED_PORT" "$LOOPBACK_PORT"
-    record "$name" DRY-RUN "the kernel arm started is up: resolver file is nameserver 127.0.0.1 port ${KERNEL_DNS_PORT}; system dig of www.${FIXTURE_SUFFIX} is a 198.18.0.0/15 fake-IP; dig @127.0.0.1 -p ${KERNEL_DNS_PORT} is the same fake-IP; a TCP connection to that address opens a session to the fixture SOCKS exit; a non-AI address does not; loopback still connects. Per-service DNS is not rewritten."
+    plan /usr/bin/python3 "$PROBES" egress 198.18.0.1 "$FIXTURE_TCP_PORT" "$RELAY_METRICS_PORT" "$UNLISTED_HOST" "$UNLISTED_PORT" "$LOOPBACK_PORT"
+    plan /usr/bin/python3 "$PROBES" relay-metrics "$RELAY_METRICS_PORT"
+    record "$name" DRY-RUN "the kernel arm started is up: resolver file is nameserver 127.0.0.1 port ${KERNEL_DNS_PORT}; system dig of www.${FIXTURE_SUFFIX} is a 198.18.0.0/15 fake-IP; dig @127.0.0.1 -p ${KERNEL_DNS_PORT} is the same fake-IP; a TCP connection to that address increments segue_relay_connects_home; a non-AI address does not increment connects_home or connects_overseas; loopback still connects."
     return 0
   fi
   if [[ ! -f "${WORK}/state/kernel.pid" ]] || ! pgrep -x segue-kernel >/dev/null 2>&1; then
@@ -1111,7 +1310,8 @@ row_connected() {
 $(helper_kernel_status)
 $(log_tail "${WORK}/logs/kernel.log")
 $(log_tail "${WORK}/logs/kernel.stdout")
-$(log_tail "${WORK}/logs/fixture.pid.log")"
+$(log_tail "${WORK}/logs/fixture.pid.log")
+$(log_tail "${WORK}/logs/relay.pid.log")"
     return 0
   fi
   local dns ip egress utun sys_dig kern_dig
@@ -1137,17 +1337,19 @@ ${kern_dig}
 dns:${dns}"
     return 0
   fi
-  egress=$(/usr/bin/python3 "$PROBES" egress "$ip" "$FIXTURE_TCP_PORT" "$SOCKS_PORT" "$UNLISTED_HOST" "$UNLISTED_PORT" "$LOOPBACK_PORT" 2>&1 || true)
-  local ai_delta other_delta loop
-  ai_delta=$(num "$(kv ai_socks_delta "$egress")")
-  other_delta=$(num "$(kv other_socks_delta "$egress")")
-  loop=$(kv loopback "$egress")
+  egress=$(/usr/bin/python3 "$PROBES" egress "$ip" "$FIXTURE_TCP_PORT" "$RELAY_METRICS_PORT" "$UNLISTED_HOST" "$UNLISTED_PORT" "$LOOPBACK_PORT" 2>&1 || true)
   local evidence="utun=${utun}
 dns:${dns}
 egress:
 ${egress}
-$(log_tail "${WORK}/logs/kernel.log")"
-  if [[ "$ai_delta" -ge 1 && "$other_delta" == 0 && "$loop" == "ok" ]]; then
+$(log_tail "${WORK}/logs/kernel.log")
+$(log_tail "${WORK}/logs/relay.pid.log")"
+  # Match whole lines. A missing key must not look like a zero delta.
+  if printf '%s\n' "$egress" | grep -qx 'ai_connect=ok' \
+    && printf '%s\n' "$egress" | grep -Eq '^ai_home_delta=[1-9][0-9]*$' \
+    && printf '%s\n' "$egress" | grep -qx 'other_home_delta=0' \
+    && printf '%s\n' "$egress" | grep -qx 'other_overseas_delta=0' \
+    && printf '%s\n' "$egress" | grep -qx 'loopback=ok'; then
     record "$name" PASS "$evidence"
   else
     record "$name" FAIL "$evidence"
@@ -1704,7 +1906,7 @@ print_cleanup() {
   printf '\nPLAN cleanup on exit (not run after a successful pre-reboot)\n'
   priv /bin/launchctl bootout system "$HELPER_PLIST"
   priv /bin/launchctl bootout system "$RELEASE_PLIST"
-  priv /bin/rm -f "$HELPER_PLIST" "$RELEASE_PLIST" "$HELPER_DST" "$KERNEL_DST" "$SEGUE_DST" "$RELEASE_DST" "$RELEASE_CTL_DST" "$UID_DST"
+  priv /bin/rm -f "$HELPER_PLIST" "$RELEASE_PLIST" "$HELPER_DST" "$KERNEL_DST" "$SEGUE_DST" "$RELAY_DST" "$RELEASE_DST" "$RELEASE_CTL_DST" "$UID_DST"
   priv /sbin/pfctl -a "$ANCHOR" -F all
   priv /bin/cp "${WORK}/state/pf.conf.bak" /etc/pf.conf
   priv /sbin/pfctl -f /etc/pf.conf
@@ -1712,10 +1914,15 @@ print_cleanup() {
   priv /bin/rm -rf "${SUPPORT}/kernel"
   priv /sbin/ifconfig lo0 -alias "$FIXTURE_HOST"
   priv /sbin/ifconfig lo0 -alias "$LEAK_HOST"
+  priv /sbin/ifconfig "${CARRIER_IFACE:-<physical-iface>}" -alias "$CARRIER_HOST"
+  priv /sbin/route -n delete -host "$CARRIER_HOST"
+  note "remove the segue-vm-matrix line from /etc/hosts"
   restore_dns
   priv /sbin/pfctl -X '<pf-token>'
   priv /bin/kill -TERM '<kernel-pid>'
   priv /bin/kill -TERM '<fixture-server-pid>'
+  priv /bin/kill -TERM '<relay-pid>'
+  priv /bin/kill -TERM '<carrier-pid>'
   priv /bin/kill -TERM '<ai-host-pid>'
   priv /bin/kill -TERM '<leak-tcp-pid>'
   priv /bin/kill -TERM '<leak-udp-pid>'
@@ -1734,13 +1941,15 @@ cleanup() {
   printf '\ncleanup: daemons, anchor, resolver file, DNS, alias\n'
   kill_pidfile "${WORK}/state/kernel.pid" segue-kernel
   kill_pidfile "${WORK}/state/fixture.pid" segue
+  kill_pidfile "${WORK}/state/relay.pid" segue-relay
+  kill_pidfile "${WORK}/state/carrier.pid" probes.py
   kill_pidfile "${WORK}/state/ai-host.pid" probes.py
   kill_pidfile "${WORK}/state/loopback.pid" probes.py
   kill_pidfile "${WORK}/state/leak-tcp.pid" probes.py
   kill_pidfile "${WORK}/state/leak-udp.pid" probes.py
   /bin/launchctl bootout system "$HELPER_PLIST" >/dev/null 2>&1 || true
   /bin/launchctl bootout system "$RELEASE_PLIST" >/dev/null 2>&1 || true
-  /bin/rm -f "$HELPER_PLIST" "$RELEASE_PLIST" "$HELPER_DST" "$KERNEL_DST" "$SEGUE_DST" "$RELEASE_DST" "$RELEASE_CTL_DST" "$UID_DST"
+  /bin/rm -f "$HELPER_PLIST" "$RELEASE_PLIST" "$HELPER_DST" "$KERNEL_DST" "$SEGUE_DST" "$RELAY_DST" "$RELEASE_DST" "$RELEASE_CTL_DST" "$UID_DST"
   /sbin/pfctl -a "$ANCHOR" -F all >/dev/null 2>&1 || true
   if [[ -f "${WORK}/state/pf.conf.bak" ]]; then
     /bin/cp "${WORK}/state/pf.conf.bak" /etc/pf.conf || true
@@ -1750,11 +1959,13 @@ cleanup() {
   /bin/rm -rf "${SUPPORT}/kernel"
   /sbin/ifconfig lo0 -alias "$FIXTURE_HOST" >/dev/null 2>&1 || true
   /sbin/ifconfig lo0 -alias "$LEAK_HOST" >/dev/null 2>&1 || true
+  remove_carrier_alias
+  hosts_remove
   restore_dns
   if [[ -f "${WORK}/state/pf.token" ]]; then
     /sbin/pfctl -X "$(cat "${WORK}/state/pf.token")" >/dev/null 2>&1 || true
   fi
-  /bin/rm -f "${WORK}/state/policy.key"
+  /bin/rm -f "${WORK}/state/policy.key" "${WORK}/state/relay.key" "${WORK}/state/device.ticket"
 }
 
 skip_reboot_rows() {
