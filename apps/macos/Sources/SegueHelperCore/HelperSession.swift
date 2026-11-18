@@ -5,14 +5,16 @@ import SegueHelperProtocol
 ///
 /// Arm persists intent, asks the AI layer to install the narrow guard,
 /// then starts `segue-kernel` (taking over an orphan left by a dead
-/// helper first). The layer moves to the kernel's DNS only once the
-/// kernel's control API reports a connected carrier with a utun; a poll
-/// loop does that without holding the arm reply. A failed install keeps
-/// the intent and reports `last_error`; it does not roll the bit back.
+/// helper first). Resolver files move to the kernel's DNS port only once
+/// the control API reports a connected carrier; a poll loop does that
+/// without holding the arm reply. A failed install keeps the intent and
+/// reports `last_error`; it does not roll the bit back. While armed the
+/// status is never `system`: a missed hold is `degraded`.
 ///
-/// Disarm persists the clear bit, releases the layer (DNS restored and
-/// read back before the anchor is flushed — the existing ordering), then
-/// stops the kernel: SIGTERM, `stopGrace`, SIGKILL.
+/// Disarm persists the clear bit, releases the layer (legacy per-service
+/// DNS restored while the resolver files still hold names, then the files
+/// removed, then the anchor flushed), then stops the kernel: SIGTERM,
+/// `stopGrace`, SIGKILL.
 ///
 /// A kernel crash restarts inside the supervisor's budget; whenever the
 /// kernel goes down while the intent is armed, the layer converges to the
@@ -118,8 +120,9 @@ public final class HelperSession {
                 generation: disarm.generation,
                 name: disarm.intent.rawValue
             ))
-            // Layer first: DNS restored and read back before the anchor
-            // flushes, then the tunnel it was protecting goes away.
+            // Layer first: resolver files removed (and any legacy DNS
+            // snapshot restored) before the anchor flushes, then the
+            // tunnel it was protecting goes away.
             converge { try layer.disarm() }
             kernel.stop()
         case .statusRead:
@@ -145,9 +148,9 @@ public final class HelperSession {
         scheduleTunnelConvergence()
     }
 
-    /// Converge the layer to what the kernel reports right now: the
-    /// kernel's DNS while a carrier is connected and the kernel's listen
-    /// address is a valid system resolver, the guard in every other state.
+    /// Converge the layer to what the kernel reports right now: resolver
+    /// files at the kernel's loopback DNS port while a carrier is connected
+    /// and that port is published, the guard port in every other state.
     /// Never called with a clear intent — a release only ever follows the
     /// disarm envelope.
     private func convergeTowardTunnel() {
@@ -285,6 +288,17 @@ public final class HelperSession {
         let observed = (try? layer.observe()) ?? .unknown
         let lastError = layerError ?? (kernelSnap.state == "kernel_failed" ? "kernel_failed" : nil)
         let held = intent.armed && (observed.anchorLoaded || observed.namesHeld)
+        // Armed and not actually held is degraded, never system. A write
+        // that never landed, or an observe that could not run, must not
+        // look like ordinary DNS.
+        var aiLayer = observed.aiLayer
+        var dnsMode = observed.dnsMode
+        if intent.armed && (aiLayer == AILayerState.system || dnsMode == AILayerState.system) {
+            aiLayer = AILayerState.degraded
+            if dnsMode == AILayerState.system {
+                dnsMode = AILayerState.guardMode
+            }
+        }
         return HelperStatus(
             armed: intent.armed,
             generation: intent.generation,
@@ -293,13 +307,13 @@ public final class HelperSession {
             rulesDigest: "",
             evidence: StatusEvidence(tcpProofMs: nil, dnsReadback: observed.dnsReadback),
             lastError: lastError,
-            aiLayer: observed.dnsMode,
+            aiLayer: aiLayer,
             helper: HelperProcessReport(state: "running"),
             kernel: KernelReport(state: kernelSnap.state, pid: kernelSnap.pid, lastExit: kernelSnap.lastExit),
             anchorLoaded: observed.anchorLoaded,
             resolverFilesPresent: observed.resolverFilesPresent,
             guardListening: observed.guardListening,
-            dnsMode: observed.dnsMode
+            dnsMode: dnsMode
         )
     }
 }

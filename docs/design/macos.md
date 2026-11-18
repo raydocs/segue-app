@@ -95,26 +95,45 @@ Two different layers, both owned by the helper, neither of them
    is behind a CDN). A bundle may add a prefix later; the renderer must not
    grow a second list.
 
-2. **DNS guard.** Not a machine-wide resolver at `127.0.0.1`. Tono points
-   every service there only while the core is alive, and refuses to leave it
-   there when the core is dead (`ProtectedDNSManager.swift:1-13`, decision
-   035): a dead listener is a dead network. Segue does the same split.
-   - Tunnel up: lift the snapshot/restore. System DNS points at the kernel's
-     DNS listen address. The kernel returns a fake IPv4 for AI names and an
-     empty NOERROR for AAAA (`docs/design/ai-lock.md`).
-   - Tunnel down, intent still armed: restore the snapshot **first**, then
-     write `/etc/resolver/<suffix>` for each armed suffix, `nameserver`
-     `127.0.0.1` port owned by the **helper**. The helper answers those
-     queries with empty NOERROR for A and AAAA and does not recurse. Other
-     names never see this listener. Suffixes are the built-in list in
-     `ai-lock.txt` (anthropic.com, claude.ai, claude.com, openai.com,
+2. **DNS guard.** Not a machine-wide resolver. `networksetup -setdnsservers`
+   cannot carry a port, and the kernel's DNS listens on `127.0.0.1:15353`
+   (not port 53). Pointing every service at `127.0.0.1` never reaches it, and
+   a failed read-back used to remove the resolver files and leave armed names
+   on system DNS. That is more open, so tunnel-up does not rewrite per-service
+   DNS at all. Other names keep whatever the system already uses.
+   - While intent is armed, every suffix has an `/etc/resolver/<suffix>` file
+     (`resolver(5)`): `nameserver 127.0.0.1` and `port <n>`. Armed names take
+     that listener; other names never see it. Suffixes are the built-in list
+     in `ai-lock.txt` (anthropic.com, claude.ai, claude.com, openai.com,
      chatgpt.com, oaistatic.com, oaiusercontent.com) plus bundle `ai_domains`.
      Not Tono's longer `SelectiveFailOpen.suffixes` (that file adds x.ai,
      grok, perplexity, Aliyun). Those are a product choice; the kernel list
      is the one the lock already promises.
+   - Tunnel up: the port is the kernel's DNS listen port, read from
+     `dns.listen` in the kernel.json the helper owns, and published on the
+     kernel snapshot only while `GET /v1/status` reports a connected carrier.
+     The kernel returns a fake IPv4 in `198.18.0.0/15` for AI names and an
+     empty NOERROR for AAAA (`docs/design/ai-lock.md`). The system resolver
+     follows the file, so `dig` of an armed name (no `@`) is that fake-IP,
+     and `dig @127.0.0.1 -p <kernel port>` is the same answer.
+   - Tunnel down, kernel dead, or the kernel DNS address unknown / not a
+     loopback `host:port`: the same files are replaced with the helper's
+     guard port. The helper answers those queries with empty NOERROR for A
+     and AAAA and does not recurse. Switching ports is an atomic rename of
+     each file (`write` then replace). A suffix is never unlinked to change
+     its port, so there is no instant with no file.
+   - A per-service DNS snapshot is not created on tunnel-up. If one is left
+     over from an older helper, it is restored only after the resolver files
+     are in place, so the cleanup cannot open armed names.
+   - A failed write does not report `system` while armed. Status stays
+     `ai_layer=degraded` (and `dns_mode` `kernel` or `guard`) and the helper
+     retries. `dns_mode` is `kernel` when every file names the live kernel
+     port, otherwise `guard` when the files name the guard port.
+     `ai_layer` is `tunnel`, `guard`, or `degraded`. `resolver_files` is true
+     while the suffix files are present.
    - Helper dead too: launchd `KeepAlive` restarts it. For the gap, the
      `/etc/resolver` files still point at a closed port, so those names fail
-     instead of leaking. Everything else uses the restored resolver.
+     instead of leaking. Everything else keeps system DNS.
 
 Tono's sinkhole is `192.0.2.1` with no process (`SelectiveFailOpen.swift:16-18`),
 which fails slowly (timeout) and is not empty NOERROR. A helper listener
@@ -128,11 +147,13 @@ path; `docs/research/apps/tono-and-segue-app-suite.md` §6 item 12). The
 kernel being down is not a reason to clear intent.
 
 **Disarm.** Only an explicit user action: Disconnect, or Restore network.
-The helper clears intent, deletes `/etc/resolver` files, restores DNS, then
-flushes the anchor. A lost disarm reply is not a release; the app shows the
-helper's read-back. Restore network is the release daemon (§3), so a stuck
-helper cannot trap the user. Order is Tono's: DNS restored and read back
-before the firewall opens (`docs/research/apps/kill-switch-survey.md` §8).
+The helper clears intent, restores any legacy per-service DNS snapshot while
+the resolver files still hold names, deletes those files, then flushes the
+anchor. A lost disarm reply is not a release; the app shows the helper's
+read-back. Restore network is the release daemon (§3), so a stuck helper
+cannot trap the user. Order is Tono's: names are released only after the
+saved servers are back, and the anchor is flushed only after that
+(`docs/research/apps/kill-switch-survey.md` §8).
 
 **Reboot.** `ai-lock.md` says do not re-arm a leftover block across reboot
 unless the user asked. Persisted intent **is** the user asking, and the
@@ -154,10 +175,10 @@ list (empty today).
 | | AI name | AI CIDR | AI literal IP, not in a CIDR; QUIC to it; hard-coded DoH | Other traffic |
 | --- | --- | --- | --- | --- |
 | Intent clear (user off, after Restore) | normal | normal | normal | normal |
-| Armed, tunnel not up (quit, crash, boot, reconnect not finished, sleep before the utun returns) | empty NOERROR from the helper, or a timeout if the helper is also down | PF drop, if any CIDR is armed | **not held.** This is the leak. | direct, works |
-| Connecting | helper still answers empty until the kernel DNS is the system resolver, then fake-IP | PF drop except on the utun | enters the utun only after the default route is installed; until then, not held | direct until the default route moves, then the kernel (`Wait` / direct per policy) |
-| Connected | kernel fake-IP, IDC exit | through the utun, IDC exit, not a different egress group | inside the utun: QUIC refused, SNI sniffed (`docs/design/ai-lock.md`). DoH to 1.1.1.1 is encrypted; the follow-up is AI only if SNI or a CIDR matches | kernel policy, direct or overseas. Works |
-| Reconnecting / Error, kernel still alive | kernel refuses AI (Strict) | PF still drops off-utun | kernel refuses; QUIC still dropped on the home route | kernel `Wait` then refuse; the utun still holds the default route so "works" means "held", not "direct" |
+| Armed, tunnel not up (quit, crash, boot, reconnect not finished, sleep before the utun returns) | empty NOERROR from the helper (resolver files on the guard port), or a timeout if the helper is also down | PF drop, if any CIDR is armed | **not held.** This is the leak. | direct, works |
+| Connecting | resolver files stay on the guard port (empty NOERROR) until the kernel publishes a loopback DNS port, then the same files name that port and the system resolver returns a fake-IP. Other names stay on system DNS | PF drop except on the utun | enters the utun only after the default route is installed; until then, not held | direct until the default route moves, then the kernel (`Wait` / direct per policy) |
+| Connected | kernel fake-IP via `/etc/resolver` (port on the kernel listener), IDC exit. System DNS for other names is unchanged | through the utun, IDC exit, not a different egress group | inside the utun: QUIC refused, SNI sniffed (`docs/design/ai-lock.md`). DoH to 1.1.1.1 is encrypted; the follow-up is AI only if SNI or a CIDR matches | kernel policy, direct or overseas. Works |
+| Reconnecting / Error, kernel still alive | resolver files go back to the guard port unless the control API still reports connected with a DNS port. AI names are empty NOERROR, not system DNS | PF still drops off-utun | kernel refuses; QUIC still dropped on the home route | kernel `Wait` then refuse; the utun still holds the default route so "works" means "held", not "direct" |
 | Reconnecting / Error, kernel dead | same as armed, tunnel not up | same | not held | utun is gone, so direct |
 | Update swap (stage 6) | AI layer stays | AI layer stays | not held | direct while the utun is down |
 | Safe Mode | resolver files still redirect AI names | anchor not loaded, so not dropped | not held | works |

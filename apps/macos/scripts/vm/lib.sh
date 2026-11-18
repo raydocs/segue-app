@@ -178,6 +178,30 @@ resolver_present() {
   [[ -f "$RESOLVER_FILE" ]]
 }
 
+# Port line of the armed suffix file. Empty when the file is missing.
+resolver_port() {
+  [[ -f "$RESOLVER_FILE" ]] || return 1
+  awk '$1 == "port" { print $2; exit }' "$RESOLVER_FILE"
+}
+
+# nameserver 127.0.0.1 and an exact port. resolver(5) is what carries the
+# kernel's non-53 port; networksetup cannot.
+resolver_points_at() {
+  local want="$1" got
+  [[ -f "$RESOLVER_FILE" ]] || return 1
+  grep -qx 'nameserver 127.0.0.1' "$RESOLVER_FILE" || return 1
+  got=$(resolver_port) || return 1
+  [[ "$got" == "$want" ]]
+}
+
+resolver_kernel_port() {
+  resolver_points_at "$KERNEL_DNS_PORT"
+}
+
+resolver_guard_port() {
+  resolver_points_at "$GUARD_PORT"
+}
+
 socket_present() {
   [[ -S /var/run/segue/service.sock ]]
 }
@@ -227,6 +251,11 @@ dig_at_guard() {
 
 dig_has_answer() {
   printf '%s\n' "$1" | grep -Eq 'ANSWER: [1-9]'
+}
+
+# An A answer in 198.18.0.0/15 (the kernel's fake-IP range).
+dig_fake_ip() {
+  printf '%s\n' "$1" | grep -Eq '198\.1[89]\.[0-9]+\.[0-9]+'
 }
 
 dig_timed_out() {
@@ -591,13 +620,15 @@ arm_wait() {
 # Commands a dry-run lists for the step dump, so the plan shows the
 # evidence a failed arm row would carry.
 plan_arm_evidence() {
-  note "arm steps, in order: socket_present, socket_arm, resolver_present, pf_reload (only if the main ruleset does not reference the anchor), anchor_refill, anchor_has_fixture, guard_answers, helper_kernel_up"
-  note "a failed step records its name plus this evidence: status_read reply, parsed kernel_state/pid/tun, socket-arm reply, control.json, the intent file, resolver files, pfctl -a ${ANCHOR} -s rules, guard dig"
+  note "arm steps, in order: socket_present, socket_arm, resolver_present, pf_reload (only if the main ruleset does not reference the anchor), anchor_refill, anchor_has_fixture, guard_answers, helper_kernel_up, resolver_kernel_port (resolver_guard_port when the helper has no utun)"
+  note "a failed step records its name plus this evidence: status_read reply, parsed kernel_state/pid/tun, socket-arm reply, control.json, the intent file, resolver files (nameserver 127.0.0.1 and port ${KERNEL_DNS_PORT} when connected, otherwise port ${GUARD_PORT}), pfctl -a ${ANCHOR} -s rules, guard dig"
   plan /usr/bin/python3 "$PROBES" helper /var/run/segue/service.sock '<status_read>'
   plan /bin/cat "${SUPPORT}/kernel/control.json"
   plan /bin/cat "$INTENT"
   plan /bin/ls -l /etc/resolver
   plan /bin/cat "$RESOLVER_FILE"
+  plan grep -qx "port ${KERNEL_DNS_PORT}" "$RESOLVER_FILE"
+  plan grep -qx "port ${GUARD_PORT}" "$RESOLVER_FILE"
   plan /sbin/pfctl -a "$ANCHOR" -s rules
   plan /usr/bin/dig +time=1 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A
 }
@@ -617,7 +648,7 @@ arm_helper() {
   write_intent true user_connect 1 || { arm_failed write_intent; return 1; }
   note "same-boot PF: the helper writes the anchor line into /etc/pf.conf but does not reload it. The harness runs pfctl -f /etc/pf.conf so the anchor is referenced. That reload flushes anchor contents, so the harness sends arm again on the socket to refill them. It does not kickstart the helper: a kickstart SIGTERMs the kernel, and the new process binds a new control port."
   note "the helper polls the intent file, so the arm is noticed without a restart. The helper was started before this file existed."
-  note "arm steps: socket_present, socket_arm, resolver_present, anchor_has_fixture, guard_answers, helper_kernel_up. dig @127.0.0.1 -p ${GUARD_PORT} must be empty NOERROR. A resolver file alone is written before the listener and survives a crash."
+  note "arm steps: socket_present, socket_arm, resolver_present, anchor_has_fixture, guard_answers, helper_kernel_up, resolver_kernel_port. The resolver file is nameserver 127.0.0.1 and port ${KERNEL_DNS_PORT} once the helper reports a utun, otherwise port ${GUARD_PORT}. dig @127.0.0.1 -p ${GUARD_PORT} must be empty NOERROR. A resolver file is replaced in place, never unlinked, to change ports."
   if dry; then
     plan test -S /var/run/segue/service.sock
     socket_arm
@@ -628,10 +659,14 @@ arm_helper() {
     plan /sbin/pfctl -a "$ANCHOR" -s rules
     plan /usr/bin/dig +time=1 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A
     if kernel_by_script; then
-      note "kernel-by-script: the kernel above was exec'd by this script, not the helper."
+      note "kernel-by-script: the kernel above was exec'd by this script, not the helper. Resolver file stays on the guard port."
+      plan grep -qx "port ${GUARD_PORT}" "$RESOLVER_FILE"
     else
       note "the helper starts ${KERNEL_DST} run --state-dir ${SUPPORT}/kernel --log ${WORK}/logs/kernel.log ${SUPPORT}/kernel.json at arm and reports it over status_read (kernel_state=running, kernel_pid, tun=utun<N>)."
       plan /usr/bin/python3 "$PROBES" helper /var/run/segue/service.sock '<status_read: kernel_state=running kernel_pid=<pid> tun=utun<N>>'
+      note "arm success once that utun is up: ${RESOLVER_FILE} has nameserver 127.0.0.1 and port ${KERNEL_DNS_PORT} (dns_mode=kernel, ai_layer=tunnel). Before the carrier, the same file names port ${GUARD_PORT}."
+      plan grep -qx "nameserver 127.0.0.1" "$RESOLVER_FILE"
+      plan grep -qx "port ${KERNEL_DNS_PORT}" "$RESOLVER_FILE"
     fi
     plan_arm_evidence
     priv /usr/bin/dscacheutil -flushcache
@@ -656,8 +691,13 @@ arm_helper() {
   arm_wait 15 guard_answers guard_answers || return 1
   if ! kernel_by_script; then
     # The kernel the helper started: running, with a utun its control API
-    # reports. Its pid lands in the file the kill rows use.
+    # reports. Its pid lands in the file the kill rows use. Resolver files
+    # then name the kernel DNS port; until the carrier is up they name the
+    # guard port, and a suffix is never left without a file.
     arm_wait 30 helper_kernel_up helper_kernel_up || return 1
+    arm_wait 20 resolver_kernel_port resolver_kernel_port || return 1
+  else
+    arm_wait 15 resolver_guard_port resolver_guard_port || return 1
   fi
   /usr/bin/dscacheutil -flushcache >/dev/null 2>&1 || true
   /usr/bin/killall -HUP mDNSResponder >/dev/null 2>&1 || true
@@ -801,9 +841,11 @@ EOF
   "sniff": {"timeout_ms": 300, "max_bytes": 16384}
 }
 EOF
-  # dns.listen is port 15353, not a resolver port, so the helper keeps the
-  # guard as the system hold even while the kernel is connected; the
-  # control section is what tells the helper the utun and the carrier.
+  # dns.listen is 127.0.0.1:15353. The helper does not rewrite per-service
+  # DNS (networksetup cannot carry a port). While the carrier is connected
+  # it writes /etc/resolver/<suffix> with nameserver 127.0.0.1 and this port;
+  # otherwise the same file names the guard port. The control section is
+  # what tells the helper the utun and the carrier.
   if kernel_by_script; then
     note "kernel-by-script: kernel.json stays in ${WORK}/state; the helper own start settles config_rejected and leaves the script kernel alone."
     return 0
@@ -872,6 +914,9 @@ print("kernel_pid=%s" % (kernel.get("pid") or ""))
 print("kernel_last_exit=%s" % (kernel.get("last_exit") or ""))
 print("tun=%s" % (body.get("tun_interface") or ""))
 print("armed=%s" % body.get("armed"))
+print("dns_mode=%s" % (body.get("dns_mode") or ""))
+print("ai_layer=%s" % (body.get("ai_layer") or ""))
+print("resolver_files=%s" % body.get("resolver_files"))
 if isinstance(err, dict) and err.get("code"):
     print("error=%s" % err.get("code"))
     print("error_message=%s" % err.get("message", ""))
@@ -959,14 +1004,16 @@ row_armed() {
   local name=armed-kernel-not-running
   if dry; then
     plan /usr/bin/pgrep -x segue-kernel
+    plan grep -qx "nameserver 127.0.0.1" "$RESOLVER_FILE"
+    plan grep -qx "port ${GUARD_PORT}" "$RESOLVER_FILE"
     plan /usr/bin/dig +time=2 +tries=1 "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/dig +time=2 +tries=1 example.com A
     plan /usr/bin/python3 "$PROBES" dns 127.0.0.1 "$GUARD_PORT" "www.${FIXTURE_SUFFIX}"
     plan /usr/bin/python3 "$PROBES" tcp 127.0.0.1 "$LOOPBACK_PORT" 2
     cidr_drop_probe || true
-    note "this row runs after kill-kernel: the SIGTERM was a clean shutdown, so the supervisor does not restart it, and the helper converged the layer to the guard"
-    record "$name" DRY-RUN "armed, kernel not running: no segue-kernel process; system dig of www.${FIXTURE_SUFFIX} is empty NOERROR from 127.0.0.1; dig @127.0.0.1 -p ${GUARD_PORT} is empty NOERROR; dig example.com is a real answer; TCP to ${FIXTURE_CIDR} is dropped; TCP to 127.0.0.1 works"
+    note "this row runs after kill-kernel: the SIGTERM was a clean shutdown, so the supervisor does not restart it, and the helper replaced the resolver file in place with the guard port"
+    record "$name" DRY-RUN "armed, kernel not running: no segue-kernel process; resolver file nameserver 127.0.0.1 port ${GUARD_PORT}; system dig of www.${FIXTURE_SUFFIX} is empty NOERROR from 127.0.0.1; dig @127.0.0.1 -p ${GUARD_PORT} is empty NOERROR; dig example.com is a real answer; TCP to ${FIXTURE_CIDR} is dropped; TCP to 127.0.0.1 works"
     return 0
   fi
   local dig_ai dig_ex guard loop rules leak guard_dig
@@ -983,6 +1030,10 @@ row_armed() {
     dropped=1
   fi
   local ok=1 why=""
+  if ! resolver_guard_port; then
+    ok=0
+    why="${why} resolver file is not nameserver 127.0.0.1 port ${GUARD_PORT}."
+  fi
   if ! dig_held_by_guard "$dig_ai"; then
     ok=0
     why="${why} armed dig was not empty NOERROR from 127.0.0.1."
@@ -1041,10 +1092,13 @@ ${rules}"
 row_connected() {
   local name=connected
   if dry; then
+    plan grep -qx "nameserver 127.0.0.1" "$RESOLVER_FILE"
+    plan grep -qx "port ${KERNEL_DNS_PORT}" "$RESOLVER_FILE"
+    plan /usr/bin/dig +time=2 +tries=1 "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/python3 "$PROBES" dns 127.0.0.1 "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}"
     plan /usr/bin/python3 "$PROBES" egress 198.18.0.1 "$FIXTURE_TCP_PORT" "$SOCKS_PORT" "$UNLISTED_HOST" "$UNLISTED_PORT" "$LOOPBACK_PORT"
-    record "$name" DRY-RUN "the kernel arm started is up: its DNS for www.${FIXTURE_SUFFIX} is a 198.18.0.0/15 fake-IP; a TCP connection to that address opens a session to the fixture SOCKS exit; a non-AI address does not; loopback still connects. System DNS stays on the guard: the kernel DNS listens on port ${KERNEL_DNS_PORT}, which is not a system-resolver port."
+    record "$name" DRY-RUN "the kernel arm started is up: resolver file is nameserver 127.0.0.1 port ${KERNEL_DNS_PORT}; system dig of www.${FIXTURE_SUFFIX} is a 198.18.0.0/15 fake-IP; dig @127.0.0.1 -p ${KERNEL_DNS_PORT} is the same fake-IP; a TCP connection to that address opens a session to the fixture SOCKS exit; a non-AI address does not; loopback still connects. Per-service DNS is not rewritten."
     return 0
   fi
   if [[ ! -f "${WORK}/state/kernel.pid" ]] || ! pgrep -x segue-kernel >/dev/null 2>&1; then
@@ -1055,14 +1109,27 @@ $(log_tail "${WORK}/logs/kernel.stdout")
 $(log_tail "${WORK}/logs/fixture.pid.log")"
     return 0
   fi
-  local dns ip egress utun
+  local dns ip egress utun sys_dig kern_dig
   dns=$(/usr/bin/python3 "$PROBES" dns 127.0.0.1 "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}" 2>&1 || true)
+  sys_dig=$(dig_query "www.${FIXTURE_SUFFIX}")
+  kern_dig=$(/usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}" A 2>&1 || true)
   ip="${dns#*answers=}"
   ip="${ip%%,*}"
   utun=$(cat "${WORK}/state/utun.name" 2>/dev/null || true)
   if ! printf '%s\n' "$ip" | grep -Eq '^198\.1[89]\.'; then
     record "$name" FAIL "fake-IP missing (${dns}) utun=${utun}
 $(log_tail "${WORK}/logs/kernel.log")"
+    return 0
+  fi
+  if ! resolver_kernel_port || ! dig_fake_ip "$sys_dig" || ! dig_fake_ip "$kern_dig"; then
+    record "$name" FAIL "resolver file or system dig was not a kernel fake-IP utun=${utun}
+resolver:
+$(cat "$RESOLVER_FILE" 2>&1 || true)
+--- system dig ---
+${sys_dig}
+--- dig @127.0.0.1 -p ${KERNEL_DNS_PORT} ---
+${kern_dig}
+dns:${dns}"
     return 0
   fi
   egress=$(/usr/bin/python3 "$PROBES" egress "$ip" "$FIXTURE_TCP_PORT" "$SOCKS_PORT" "$UNLISTED_HOST" "$UNLISTED_PORT" "$LOOPBACK_PORT" 2>&1 || true)
@@ -1087,11 +1154,12 @@ row_kill_kernel() {
   if dry; then
     priv /bin/kill -TERM '<kernel-pid>'
     plan /sbin/ifconfig -l
+    plan grep -qx "port ${GUARD_PORT}" "$RESOLVER_FILE"
     plan /usr/bin/dig +time=2 +tries=1 "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/dig +time=2 +tries=1 example.com A
     cidr_drop_probe || true
-    record "$name" DRY-RUN "after SIGTERM to segue-kernel only, waiting for it to exit before SIGKILL: a SIGTERM is a clean shutdown (exit 0), so the supervisor does not restart it and converges the layer to the guard; its utun is gone and the pid is dead; armed name is still empty NOERROR from 127.0.0.1; dig @127.0.0.1 -p ${GUARD_PORT} is empty NOERROR; example.com still answers; fixture CIDR still dropped; non-AI loopback still connects"
+    record "$name" DRY-RUN "after SIGTERM to segue-kernel only, waiting for it to exit before SIGKILL: a SIGTERM is a clean shutdown (exit 0), so the supervisor does not restart it and replaces the resolver file in place with port ${GUARD_PORT} (no gap without a file); its utun is gone and the pid is dead; armed name is still empty NOERROR from 127.0.0.1; dig @127.0.0.1 -p ${GUARD_PORT} is empty NOERROR; example.com still answers; fixture CIDR still dropped; non-AI loopback still connects"
     return 0
   fi
   if [[ ! -f "${WORK}/state/kernel.pid" ]]; then
@@ -1130,6 +1198,10 @@ row_kill_kernel() {
   if [[ "$still" != "no" ]]; then
     ok=0
     why="${why} utun ${utun} still present (${still})."
+  fi
+  if ! resolver_guard_port; then
+    ok=0
+    why="${why} resolver file is not nameserver 127.0.0.1 port ${GUARD_PORT}."
   fi
   if ! dig_held_by_guard "$dig_ai"; then
     ok=0
