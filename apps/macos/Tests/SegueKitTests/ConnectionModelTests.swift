@@ -12,19 +12,25 @@ final class ConnectionModelTests: XCTestCase {
         XCTAssertFalse(model.showsConnected)
         XCTAssertFalse(model.isBusy)
         XCTAssertNil(model.lastError)
+        XCTAssertEqual(model.helperAvailability, .unknown)
     }
 
     func testConnectAppliesReadback() async throws {
         let fake = FakeControlClient()
         let connected = try Fixtures.status("status-connected")
         fake.connectHandler = { connected }
-        let model = makeModel(client: fake)
+        let helper = FakeHelper()
+        let up = Self.helperStatus(armed: true, utun: true)
+        helper.armHandler = { _ in up }
+        let model = makeModel(client: fake, helper: helper)
         await model.connect()
         XCTAssertTrue(model.showsConnected)
         XCTAssertEqual(model.statusLine, "Connected. Reconnect or update.")
+        XCTAssertEqual(model.reasonText, "")
         XCTAssertNil(model.lastError)
         XCTAssertFalse(model.isBusy)
         XCTAssertEqual(fake.connectCalls, 1)
+        XCTAssertEqual(helper.armIntents.map(\.intent), [.userConnect])
     }
 
     func testReconnectingReadbackIsNotConnected() async throws {
@@ -53,16 +59,13 @@ final class ConnectionModelTests: XCTestCase {
     }
 
     func testFailureKeepsPreviousReadback() async throws {
-        let fake = FakeControlClient()
-        let connected = try Fixtures.status("status-connected")
-        fake.connectHandler = { connected }
-        fake.disconnectHandler = { throw KernelControlError.transport }
-        let model = makeModel(client: fake)
-        await model.connect()
-        await model.disconnect()
-        XCTAssertTrue(model.showsConnected)
-        XCTAssertEqual(model.statusLine, "Connected. Reconnect or update.")
-        XCTAssertEqual(model.lastError, "Couldn't reach the kernel on this Mac.")
+        let parts = try await connectFully()
+        parts.helper.disarmHandler = { _ in throw HelperClientError.transport }
+        await parts.model.disconnect()
+        XCTAssertTrue(parts.model.showsConnected)
+        XCTAssertEqual(parts.model.statusLine, "Connected. Reconnect or update.")
+        XCTAssertEqual(parts.model.lastError, "Couldn't reach the helper on this Mac.")
+        XCTAssertFalse(parts.model.isBusy)
     }
 
     func testDisconnectAppliesReadback() async throws {
@@ -74,6 +77,14 @@ final class ConnectionModelTests: XCTestCase {
         await model.disconnect()
         XCTAssertFalse(model.showsConnected)
         XCTAssertEqual(model.statusLine, "Not connected.")
+    }
+
+    func testDisconnectDisarmsWithUserDisconnect() async throws {
+        let parts = try await connectFully()
+        await parts.model.disconnect()
+        XCTAssertEqual(parts.helper.disarmIntents.map(\.intent), [.userDisconnect])
+        XCTAssertFalse(parts.helper.disarmIntents.contains { $0.intent == .quit })
+        XCTAssertFalse(parts.model.showsConnected)
     }
 
     func testPortMismatchMessageHidesTheAddress() async {
@@ -104,10 +115,223 @@ final class ConnectionModelTests: XCTestCase {
         XCTAssertTrue(isDirectory.boolValue)
     }
 
-    private func makeModel(client: FakeControlClient) -> ConnectionModel {
+    func testConnectedRequiresKernelUtunAndArmed() async throws {
+        let base = try Fixtures.status("status-connected")
+        let states: [KernelState] = [.connected, .reconnecting, .disconnected]
+        for state in states {
+            for utun in [true, false] {
+                for armed in [true, false] {
+                    var kernel = base
+                    kernel.state = state
+                    kernel.revoked = false
+                    let snapshot = kernel
+                    let helperSnapshot = Self.helperStatus(armed: armed, utun: utun)
+                    let fake = FakeControlClient()
+                    fake.statusHandler = { snapshot }
+                    let helper = FakeHelper()
+                    helper.statusHandler = { helperSnapshot }
+                    let model = makeModel(client: fake, helper: helper)
+                    await model.refresh()
+                    let expected = state == .connected && utun && armed
+                    XCTAssertEqual(
+                        model.showsConnected,
+                        expected,
+                        "state=\(state) utun=\(utun) armed=\(armed)"
+                    )
+                    if expected {
+                        XCTAssertEqual(model.statusLine, "Connected. Reconnect or update.")
+                    } else if state == .connected {
+                        XCTAssertEqual(model.statusLine, ConnectionModel.notFullyConnectedLine)
+                    }
+                }
+            }
+        }
+    }
+
+    func testRevokedDeviceIsNotConnected() async throws {
+        var kernel = try Fixtures.status("status-connected")
+        kernel.revoked = true
+        kernel.state = .connected
+        let snapshot = kernel
+        let fake = FakeControlClient()
+        fake.statusHandler = { snapshot }
+        let helper = FakeHelper()
+        let up = Self.helperStatus(armed: true, utun: true)
+        helper.statusHandler = { up }
+        let model = makeModel(client: fake, helper: helper)
+        await model.refresh()
+        XCTAssertFalse(model.showsConnected)
+        XCTAssertEqual(model.statusLine, "This device was revoked.")
+    }
+
+    func testQuitDoesNotDisarm() async throws {
+        let parts = try await connectFully()
+        let armed = parts.helper.armIntents.count
+        parts.model.applicationWillQuit()
+        XCTAssertEqual(parts.helper.armIntents.map(\.intent), [.userConnect])
+        XCTAssertEqual(parts.helper.armIntents.count, armed)
+        XCTAssertTrue(parts.helper.disarmIntents.isEmpty)
+        XCTAssertTrue(parts.model.showsConnected)
+    }
+
+    func testRestoreAsksThenDisarms() async throws {
+        let parts = try await connectFully()
+        parts.model.requestRestoreNetwork()
+        XCTAssertTrue(parts.model.restoreNeedsConfirmation)
+        XCTAssertTrue(parts.helper.disarmIntents.isEmpty)
+        XCTAssertTrue(parts.model.showsConnected)
+        await parts.model.confirmRestoreNetwork()
+        XCTAssertFalse(parts.model.restoreNeedsConfirmation)
+        XCTAssertEqual(parts.helper.disarmIntents.map(\.intent), [.userDisconnect])
+        XCTAssertFalse(parts.model.showsConnected)
+    }
+
+    func testRestoreCancelDoesNotDisarm() async throws {
+        let parts = try await connectFully()
+        parts.model.requestRestoreNetwork()
+        parts.model.cancelRestoreNetwork()
+        XCTAssertFalse(parts.model.restoreNeedsConfirmation)
+        XCTAssertTrue(parts.helper.disarmIntents.isEmpty)
+        await parts.model.confirmRestoreNetwork()
+        XCTAssertTrue(parts.helper.disarmIntents.isEmpty)
+        XCTAssertTrue(parts.model.showsConnected)
+    }
+
+    func testNotInstalledState() async throws {
+        let parts = try await connectFully()
+        parts.helper.statusHandler = { throw HelperClientError.notInstalled }
+        await parts.model.refresh()
+        XCTAssertEqual(parts.model.helperAvailability, .notInstalled)
+        XCTAssertFalse(parts.model.showsConnected)
+        XCTAssertEqual(parts.model.statusLine, ConnectionModel.helperNotInstalledLine)
+        XCTAssertEqual(parts.model.reasonText, ConnectionModel.helperInstallInstructions)
+        XCTAssertNil(parts.model.lastError)
+    }
+
+    func testVersionMismatchState() async throws {
+        let parts = try await connectFully()
+        parts.helper.statusHandler = { throw HelperClientError.versionMismatch(9) }
+        await parts.model.refresh()
+        XCTAssertEqual(parts.model.helperAvailability, .versionMismatch)
+        XCTAssertFalse(parts.model.showsConnected)
+        XCTAssertEqual(parts.model.statusLine, ConnectionModel.versionMismatchLine)
+        XCTAssertTrue(parts.model.reasonText.contains("version 9"))
+        XCTAssertTrue(parts.model.reasonText.contains("version \(HelperProtocolVersion.current)"))
+        XCTAssertNil(parts.model.lastError)
+    }
+
+    func testUnauthorizedState() async throws {
+        let parts = try await connectFully()
+        parts.helper.statusHandler = { throw HelperClientError.unauthorized }
+        await parts.model.refresh()
+        XCTAssertEqual(parts.model.helperAvailability, .unauthorized)
+        XCTAssertFalse(parts.model.showsConnected)
+        XCTAssertEqual(parts.model.statusLine, ConnectionModel.unauthorizedLine)
+        XCTAssertEqual(parts.model.reasonText, ConnectionModel.unauthorizedReason)
+    }
+
+    func testTransportFailureKeepsConnectedReadback() async throws {
+        let parts = try await connectFully()
+        parts.helper.statusHandler = { throw HelperClientError.transport }
+        await parts.model.refresh()
+        XCTAssertTrue(parts.model.showsConnected)
+        XCTAssertEqual(parts.model.helperAvailability, .ready)
+        XCTAssertEqual(parts.model.lastError, "Couldn't reach the helper on this Mac.")
+    }
+
+    func testPollingBacksOffWhenMenuCloses() async throws {
+        XCTAssertEqual(ConnectionModel.openPollInterval, 2)
+        let clock = ManualPollClock()
+        let fake = FakeControlClient()
+        let model = makeModel(client: fake, clock: clock, startsPolling: true)
+        defer { model.applicationWillQuit() }
+
+        let closed = await clock.nextInterval()
+        XCTAssertEqual(closed, 4)
+
+        model.setMenuOpen(true)
+        let opened = await clock.nextInterval()
+        XCTAssertEqual(opened, ConnectionModel.openPollInterval)
+        clock.fire()
+        let stillOpen = await clock.nextInterval()
+        XCTAssertEqual(stillOpen, ConnectionModel.openPollInterval)
+
+        model.setMenuOpen(false)
+        let backedOff = await clock.nextInterval()
+        XCTAssertEqual(backedOff, 4)
+        clock.fire()
+        let doubled = await clock.nextInterval()
+        XCTAssertEqual(doubled, 8)
+        clock.fire()
+        let doubledAgain = await clock.nextInterval()
+        XCTAssertEqual(doubledAgain, 16)
+        clock.fire()
+        let capped = await clock.nextInterval()
+        XCTAssertEqual(capped, 32)
+        clock.fire()
+        let stillCapped = await clock.nextInterval()
+        XCTAssertEqual(stillCapped, ConnectionModel.closedPollMaxInterval)
+
+        model.noteWake()
+        let afterWake = await clock.nextInterval()
+        XCTAssertEqual(afterWake, 4)
+        model.noteNetworkChange()
+        let afterNetwork = await clock.nextInterval()
+        XCTAssertEqual(afterNetwork, 4)
+    }
+
+    private func connectFully() async throws -> (model: ConnectionModel, helper: FakeHelper) {
+        let fake = FakeControlClient()
+        let connected = try Fixtures.status("status-connected")
+        var down = connected
+        down.state = .disconnected
+        down.revoked = false
+        fake.connectHandler = { connected }
+        fake.statusHandler = { connected }
+        fake.disconnectHandler = { down }
+        let helper = FakeHelper()
+        let up = Self.helperStatus(armed: true, utun: true)
+        helper.statusHandler = { up }
+        helper.armHandler = { _ in up }
+        helper.disarmHandler = { intent in
+            Self.helperStatus(armed: false, utun: false, generation: intent.generation)
+        }
+        let model = makeModel(client: fake, helper: helper)
+        await model.connect()
+        return (model, helper)
+    }
+
+    private func makeModel(
+        client: FakeControlClient,
+        helper: FakeHelper? = nil,
+        clock: (any PollClock)? = nil,
+        startsPolling: Bool = false
+    ) -> ConnectionModel {
         let folder = URL(fileURLWithPath: home, isDirectory: true)
             .appendingPathComponent("Library/Application Support/Segue", isDirectory: true)
-        return ConnectionModel(client: client, configFolder: folder, homePath: home)
+        return ConnectionModel(
+            client: client,
+            configFolder: folder,
+            homePath: home,
+            helper: helper,
+            clock: clock,
+            startsPolling: startsPolling
+        )
+    }
+
+    private static func helperStatus(armed: Bool, utun: Bool, generation: UInt64 = 4) -> HelperStatus {
+        HelperStatus(
+            armed: armed,
+            generation: generation,
+            held: armed,
+            tunInterface: utun ? "utun4" : nil,
+            rulesDigest: "abc123",
+            evidence: StatusEvidence(tcpProofMs: utun ? 12 : nil, dnsReadback: utun),
+            lastError: nil,
+            aiLayer: armed ? "armed" : "not_implemented",
+            helper: HelperProcessReport(state: "running"),
+            kernel: KernelReport(state: "running", pid: nil, lastExit: nil)
+        )
     }
 }
 
@@ -159,5 +383,151 @@ final class FakeControlClient: ControlClient, @unchecked Sendable {
 
     func selectExit(_ exit: String) async throws -> KernelStatus {
         try await selectHandler(exit)
+    }
+}
+
+final class FakeHelper: HelperControlling, @unchecked Sendable {
+    var statusHandler: () async throws -> HelperStatus
+    var armHandler: (ArmIntent) async throws -> HelperStatus
+    var disarmHandler: (DisarmIntent) async throws -> HelperStatus
+    private let lock = NSLock()
+    private var arms: [ArmIntent] = []
+    private var disarms: [DisarmIntent] = []
+
+    var armIntents: [ArmIntent] {
+        lock.lock()
+        defer { lock.unlock() }
+        return arms
+    }
+
+    var disarmIntents: [DisarmIntent] {
+        lock.lock()
+        defer { lock.unlock() }
+        return disarms
+    }
+
+    init() {
+        let fail: () async throws -> HelperStatus = { throw HelperClientError.transport }
+        statusHandler = fail
+        armHandler = { _ in throw HelperClientError.transport }
+        disarmHandler = { _ in throw HelperClientError.transport }
+    }
+
+    func readStatus() async throws -> HelperStatus {
+        try await statusHandler()
+    }
+
+    func arm(_ intent: ArmIntent) async throws -> HelperStatus {
+        recordArm(intent)
+        return try await armHandler(intent)
+    }
+
+    func disarm(_ intent: DisarmIntent) async throws -> HelperStatus {
+        recordDisarm(intent)
+        return try await disarmHandler(intent)
+    }
+
+    private func recordArm(_ intent: ArmIntent) {
+        lock.lock()
+        arms.append(intent)
+        lock.unlock()
+    }
+
+    private func recordDisarm(_ intent: DisarmIntent) {
+        lock.lock()
+        disarms.append(intent)
+        lock.unlock()
+    }
+}
+
+/// Records each wait and blocks until `fire` or cancellation.
+final class ManualPollClock: PollClock, @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [TimeInterval] = []
+    private var cursor = 0
+    private var intervalWaiter: CheckedContinuation<TimeInterval, Never>?
+    private var current: OnceGate?
+
+    func wait(seconds: TimeInterval) async {
+        let gate = OnceGate()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                gate.store(continuation)
+                self.noteWaiting(seconds: seconds, gate: gate)
+            }
+        } onCancel: {
+            gate.signal()
+        }
+    }
+
+    func nextInterval() async -> TimeInterval {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if cursor < recorded.count {
+                let value = recorded[cursor]
+                cursor += 1
+                lock.unlock()
+                continuation.resume(returning: value)
+                return
+            }
+            intervalWaiter = continuation
+            lock.unlock()
+        }
+    }
+
+    func fire() {
+        lock.lock()
+        let gate = current
+        lock.unlock()
+        gate?.signal()
+    }
+
+    private func noteWaiting(seconds: TimeInterval, gate: OnceGate) {
+        let notify: CheckedContinuation<TimeInterval, Never>?
+        lock.lock()
+        recorded.append(seconds)
+        current = gate
+        notify = intervalWaiter
+        if notify != nil {
+            cursor += 1
+            intervalWaiter = nil
+        }
+        lock.unlock()
+        guard let notify else {
+            return
+        }
+        Task { @MainActor in
+            notify.resume(returning: seconds)
+        }
+    }
+
+    private final class OnceGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Void, Never>?
+        private var fired = false
+
+        func store(_ continuation: CheckedContinuation<Void, Never>) {
+            lock.lock()
+            if fired {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+        }
+
+        func signal() {
+            lock.lock()
+            if fired {
+                lock.unlock()
+                return
+            }
+            fired = true
+            let continuation = self.continuation
+            self.continuation = nil
+            lock.unlock()
+            continuation?.resume()
+        }
     }
 }

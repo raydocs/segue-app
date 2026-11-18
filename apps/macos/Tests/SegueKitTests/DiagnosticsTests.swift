@@ -84,4 +84,53 @@ final class DiagnosticsTests: XCTestCase {
             XCTAssertEqual(error, .directoryMissing)
         }
     }
+
+    func testCRC32KnownVector() {
+        XCTAssertEqual(CRC32.checksum(Data("123456789".utf8)), 0xCBF4_3926)
+    }
+
+    func testExportZipRedactsStatusAndLogs() async throws {
+        let directory = try temporaryDirectory("segue-zip")
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let when = Date(timeIntervalSince1970: 0)
+        let url = try await MainActor.run { () -> URL in
+            let folder = URL(fileURLWithPath: self.home, isDirectory: true)
+                .appendingPathComponent("Library/Application Support/Segue", isDirectory: true)
+            let model = ConnectionModel(
+                client: FakeControlClient(),
+                configFolder: folder,
+                homePath: self.home
+            )
+            model.lastError = "Bearer \(self.secret) utun peer 2001:db8::7"
+            return try model.exportDiagnosticsZip(
+                to: directory,
+                logs: [DiagnosticsLog(name: "helper.log", body: "token \(self.secret) \(self.home)/Library")],
+                now: when,
+                secrets: [self.secret]
+            )
+        }
+        XCTAssertEqual(url.lastPathComponent, "segue-diagnostics-19700101T000000Z.zip")
+        let bytes = try Data(contentsOf: url)
+        XCTAssertEqual([UInt8](bytes.prefix(4)), [0x50, 0x4B, 0x03, 0x04])
+        let files = try ZipStore.read(bytes)
+        let status = try XCTUnwrap(files["status.json"])
+        let log = try XCTUnwrap(files["logs/helper.log"])
+        XCTAssertNotNil(files["readbacks.json"])
+        let statusText = String(decoding: status, as: UTF8.self)
+        let logText = String(decoding: log, as: UTF8.self)
+        XCTAssertFalse(statusText.contains(secret))
+        XCTAssertFalse(statusText.contains(home))
+        XCTAssertFalse(statusText.contains("2001:db8::7"))
+        XCTAssertTrue(statusText.contains("<redacted>"))
+        XCTAssertTrue(statusText.contains("<peer>"))
+        XCTAssertFalse(logText.contains(secret))
+        XCTAssertFalse(logText.contains(home))
+        XCTAssertTrue(logText.contains("<redacted>"))
+        XCTAssertTrue(logText.contains("<home>"))
+        let mode = try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber
+        XCTAssertEqual((mode?.intValue ?? -1) & 0o777, 0o600)
+        XCTAssertNotNil(try JSONSerialization.jsonObject(with: status))
+    }
 }

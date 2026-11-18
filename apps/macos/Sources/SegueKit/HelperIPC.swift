@@ -2,7 +2,7 @@ import SegueHelperProtocol
 
 /// Wire types live in `SegueHelperProtocol` so the menu and the root helper
 /// share one contract. These aliases are the SegueKit surface callers already
-/// import. The menu still does not open the helper socket.
+/// import. `HelperClient` is what opens the helper socket.
 
 public typealias HelperProtocolVersion = SegueHelperProtocol.HelperProtocolVersion
 public typealias HelperProtocolError = SegueHelperProtocol.HelperProtocolError
