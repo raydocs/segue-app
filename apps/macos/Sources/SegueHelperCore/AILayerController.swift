@@ -113,6 +113,13 @@ public final class AILayerController {
     private var aiListError: String?
     /// Avoid logging the same refusal on every kernel poll.
     private var loggedListError: String?
+    /// Last body passed to `pfctl -f`. The tunnel poll calls `kernelChanged`
+    /// every 250ms for 20s after the kernel exits; reloading an identical
+    /// anchor zeroes rule counters, so a drop in that window never shows a
+    /// counter that moved. `pfctl -sr` does not echo this text back, so the
+    /// rendered body is the key. `flushAnchor` clears it. Nothing else
+    /// writes this anchor.
+    private var loadedAnchorRules: String?
 
     init(
         commands: SystemCommands,
@@ -128,6 +135,7 @@ public final class AILayerController {
         self.paths = paths
         self.listPath = listPath
         self.pfctlPath = pfctlPath
+        self.loadedAnchorRules = nil
     }
 
     /// The list-file failure from the last install, if it did not parse.
@@ -280,14 +288,19 @@ public final class AILayerController {
         } catch {
             throw AILayerError.invalidInterface
         }
+        if loadedAnchorRules == rules {
+            return
+        }
         _ = try runChecked(
             program: pfctlPath,
             arguments: ["-a", PFAnchorRenderer.anchorName, "-f", "-"],
             stdin: rules
         )
+        loadedAnchorRules = rules
     }
 
     private func flushAnchor() throws {
+        loadedAnchorRules = nil
         guard try anchorIsLoaded() else { return }
         _ = try runChecked(
             program: pfctlPath,
