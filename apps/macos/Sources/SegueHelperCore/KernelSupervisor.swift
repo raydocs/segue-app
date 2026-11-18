@@ -289,6 +289,13 @@ private struct RestartBudget {
     var window: TimeInterval
     private var stamps: [Date] = []
 
+    // Explicit: older Swift makes the memberwise init private when any stored
+    // property is private, which broke the macos-15 CI build.
+    init(limit: Int, window: TimeInterval) {
+        self.limit = limit
+        self.window = window
+    }
+
     mutating func reset() {
         stamps.removeAll()
     }

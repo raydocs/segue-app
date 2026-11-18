@@ -13,6 +13,10 @@ public enum SeguePaths {
             .appendingPathComponent("Segue", isDirectory: true)
     }
 
+    /// Helper unix socket from the macOS design. The menu connects; it does
+    /// not create the socket and it does not install the helper.
+    public static let helperSocketPath = "/var/run/segue/service.sock"
+
     /// Stage A default for a token file the caller placed in the user config
     /// folder. The production token stays in the helper runtime directory;
     /// this menu does not install a helper and does not look there.
