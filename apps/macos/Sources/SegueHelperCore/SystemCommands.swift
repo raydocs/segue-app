@@ -33,16 +33,21 @@ public protocol SystemCommands: AnyObject {
     func startGuardListener(address: String, port: UInt16, responder: GuardResponder) throws
     func stopGuardListener() throws
     func guardIsListening() -> Bool
+
+    /// Entry names directly inside a directory, sorted. A directory that does
+    /// not exist is an empty list, not an error: the release daemon scans
+    /// `/etc/resolver`, which a machine may not have.
+    func listDirectory(_ path: String) throws -> [String]
 }
 
-enum SystemPrograms {
-    static let pfctl = "/sbin/pfctl"
-    static let networksetup = "/usr/sbin/networksetup"
+public enum SystemPrograms {
+    public static let pfctl = "/sbin/pfctl"
+    public static let networksetup = "/usr/sbin/networksetup"
 }
 
 /// Parsers for the command text the controller sends and reads back.
-enum SystemText {
-    static func listsAnchor(_ text: String, name: String) -> Bool {
+public enum SystemText {
+    public static func listsAnchor(_ text: String, name: String) -> Bool {
         text.split(whereSeparator: \.isNewline).contains { line in
             line.trimmingCharacters(in: .whitespacesAndNewlines) == name
         }
@@ -51,7 +56,7 @@ enum SystemText {
     /// `networksetup -listnetworkserviceorder`. Disabled services (a leading
     /// `*` on the name) are skipped. The hardware device is the stable id;
     /// networksetup itself addresses services by display name.
-    static func serviceOrder(_ text: String) -> [DNSServiceRecord] {
+    public static func serviceOrder(_ text: String) -> [DNSServiceRecord] {
         var records: [DNSServiceRecord] = []
         var pending: String?
         for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
@@ -70,14 +75,14 @@ enum SystemText {
 
     /// `networksetup -getdnsservers`. The "aren't any" sentence is an empty
     /// list, which is a real restore target (DHCP), not a missing service.
-    static func dnsServers(_ text: String) -> [String] {
+    public static func dnsServers(_ text: String) -> [String] {
         if text.contains("aren't any") { return [] }
         return text.split(whereSeparator: \.isNewline).map {
             $0.trimmingCharacters(in: .whitespacesAndNewlines)
         }.filter { !$0.isEmpty }
     }
 
-    static func isDNSToken(_ text: String) -> Bool {
+    public static func isDNSToken(_ text: String) -> Bool {
         guard !text.isEmpty, text != "Empty", !text.hasPrefix("-") else { return false }
         return !text.contains(where: \.isWhitespace)
     }

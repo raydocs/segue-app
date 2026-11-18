@@ -25,6 +25,14 @@ public struct SystemPollClock: PollClock, Sendable {
     }
 }
 
+/// How long Restore network waits for the helper before bypassing it via
+/// the release daemon (`docs/design/macos.md` §3). The helper socket has its
+/// own 3 s timeout; this bound also covers a helper that accepted the
+/// request and went quiet. Not isolated: it is a default argument.
+public enum RestoreNetworkTiming {
+    public static let helperTimeout: TimeInterval = 3
+}
+
 /// Menu state. Connected is copied from read-backs only: the kernel reports
 /// `connected`, the helper sees a utun, and the AI lock is armed. A failed
 /// call leaves the previous read-back alone. Quitting does not disarm.
@@ -38,6 +46,10 @@ public final class ConnectionModel: ObservableObject {
     public static let versionMismatchLine = "Helper version mismatch."
     public static let unauthorizedLine = "The helper refused this app."
     public static let unauthorizedReason = "The helper did not accept this app."
+    public static let networkRestoredNotice =
+        "The release daemon restored this Mac's network."
+    public static let networkPartiallyRestoredNotice =
+        "The release daemon restored this Mac's network, but not everything read back clean. Export diagnostics."
 
     /// While the menu is open. A closed menu backs off from 4s to 32s.
     public static let openPollInterval: TimeInterval = 2
@@ -56,6 +68,8 @@ public final class ConnectionModel: ObservableObject {
 
     private let client: any ControlClient
     private let helper: (any HelperControlling)?
+    private let release: (any ReleaseControlling)?
+    private let restoreHelperTimeout: TimeInterval
     private let clock: (any PollClock)?
     private let fileManager: FileManager
     private let homePath: String
@@ -81,11 +95,15 @@ public final class ConnectionModel: ObservableObject {
         homePath: String? = nil,
         fileManager: FileManager = .default,
         helper: (any HelperControlling)? = nil,
+        release: (any ReleaseControlling)? = nil,
+        restoreHelperTimeout: TimeInterval = RestoreNetworkTiming.helperTimeout,
         clock: (any PollClock)? = nil,
         startsPolling: Bool = false
     ) {
         self.client = client
         self.helper = helper
+        self.release = release
+        self.restoreHelperTimeout = restoreHelperTimeout
         self.clock = clock
         self.configFolder = configFolder
         self.fileManager = fileManager
@@ -148,13 +166,17 @@ public final class ConnectionModel: ObservableObject {
         restoreNeedsConfirmation = false
     }
 
-    /// Confirm step for Restore network. Sends `user_disconnect` only now.
+    /// Confirm step for Restore network. Asks the helper to disarm first; a
+    /// helper that cannot answer in time is bypassed through the release
+    /// daemon, which clears the anchor, the resolver files, the DNS
+    /// snapshot, and the arm intent without the helper's help. The kernel is
+    /// disconnected either way.
     public func confirmRestoreNetwork() async {
         guard restoreNeedsConfirmation, !isBusy else {
             return
         }
         restoreNeedsConfirmation = false
-        await disarm(.userDisconnect)
+        await restoreNetwork()
     }
 
     /// Quit, force-quit, or a crash must not clear intent. This stops the
@@ -299,6 +321,93 @@ public final class ConnectionModel: ObservableObject {
                 return
             }
             note(error)
+        }
+    }
+
+    /// Restore network. Helper first, release daemon as the fallback; then
+    /// the kernel is told to disconnect. A failure surfaces like any other:
+    /// the previous read-back stands.
+    private func restoreNetwork() async {
+        guard begin() else {
+            return
+        }
+        defer { isBusy = false }
+        let serial = beginRead()
+        do {
+            try await disarmHelperOrRestore(serial: serial)
+            let kernel = try await client.disconnect()
+            guard serial == readSerial else {
+                return
+            }
+            apply(kernel: kernel)
+            lastError = nil
+        } catch {
+            guard serial == readSerial else {
+                return
+            }
+            note(error)
+        }
+    }
+
+    private func disarmHelperOrRestore(serial: Int) async throws {
+        guard let helper else {
+            guard release != nil else { return }
+            try await restoreViaRelease(serial: serial)
+            return
+        }
+        let generation = (latestHelper?.generation ?? 0) + 1
+        let intent = DisarmIntent(generation: generation, intent: .userDisconnect)
+        do {
+            let status = try await RestoreRace.withTimeout(seconds: restoreHelperTimeout) {
+                try await helper.disarm(intent)
+            }
+            guard serial == readSerial else {
+                return
+            }
+            helperAvailability = .ready
+            mismatchedVersion = nil
+            apply(helper: status)
+        } catch {
+            guard serial == readSerial else {
+                return
+            }
+            guard release != nil, Self.releaseShouldTakeOver(error) else {
+                throw error
+            }
+            try await restoreViaRelease(serial: serial)
+        }
+    }
+
+    private func restoreViaRelease(serial: Int) async throws {
+        guard let release else {
+            throw HelperClientError.transport
+        }
+        let report = try await release.restore()
+        guard serial == readSerial else {
+            return
+        }
+        present(notice: report.outcome == ReleaseOutcome.restored
+            ? Self.networkRestoredNotice
+            : Self.networkPartiallyRestoredNotice)
+    }
+
+    /// The release daemon takes over only when the helper gave no answer:
+    /// it timed out, its socket is dead, or it is not installed at all (it
+    /// may have left the machine locked behind it). A definitive refusal —
+    /// wrong version, wrong peer — would be repeated by the release daemon,
+    /// which checks peers the same way.
+    private static func releaseShouldTakeOver(_ error: Error) -> Bool {
+        if error is RestoreFallbackError {
+            return true
+        }
+        guard let helperError = error as? HelperClientError else {
+            return false
+        }
+        switch helperError {
+        case .transport, .notInstalled:
+            return true
+        case .versionMismatch, .unauthorized, .malformed, .rejected:
+            return false
         }
     }
 
@@ -590,6 +699,22 @@ public final class ConnectionModel: ObservableObject {
                 return "The helper rejected the request."
             case .transport:
                 return "Couldn't reach the helper on this Mac."
+            }
+        }
+        if let releaseError = error as? ReleaseClientError {
+            switch releaseError {
+            case .notInstalled:
+                return "The release daemon is not installed."
+            case .versionMismatch:
+                return "The release daemon speaks a different protocol. Update Segue."
+            case .unauthorized:
+                return "The release daemon refused this app."
+            case .malformed:
+                return "The release daemon reply was not understood."
+            case .rejected:
+                return "The release daemon rejected the request."
+            case .transport:
+                return "Couldn't reach the release daemon on this Mac."
             }
         }
         guard let error = error as? KernelControlError else {

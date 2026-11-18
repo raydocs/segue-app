@@ -12,6 +12,8 @@ let package = Package(
         .library(name: "SegueHelperCore", targets: ["SegueHelperCore"]),
         .executable(name: "Segue", targets: ["Segue"]),
         .executable(name: "segue-core-helper", targets: ["SegueCoreHelper"]),
+        .library(name: "SegueReleaseCore", targets: ["SegueReleaseCore"]),
+        .executable(name: "segue-release", targets: ["SegueRelease"]),
     ],
     targets: [
         .target(name: "SegueHelperProtocol"),
@@ -50,6 +52,22 @@ let package = Package(
             dependencies: ["SegueAILayer"],
             resources: [
                 .copy("Fixtures"),
+            ]
+        ),
+        // Release daemon (design §3) — the escape hatch that restores the
+        // network without the helper. Own blocks, nothing above changes.
+        .target(
+            name: "SegueReleaseCore",
+            dependencies: ["SegueHelperProtocol", "SegueAILayer", "SegueHelperCore"]
+        ),
+        .executableTarget(
+            name: "SegueRelease",
+            dependencies: ["SegueReleaseCore", "SegueHelperCore"]
+        ),
+        .testTarget(
+            name: "SegueReleaseCoreTests",
+            dependencies: [
+                "SegueReleaseCore", "SegueHelperProtocol", "SegueAILayer", "SegueHelperCore",
             ]
         ),
     ]

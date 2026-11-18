@@ -18,6 +18,11 @@ public enum ResolverFiles {
     public static let resolverDirectory = "/etc/resolver"
     public static let nameserver = "127.0.0.1"
 
+    /// First line of every file this lock writes. The release daemon removes
+    /// only `/etc/resolver` files that carry it, so files owned by other
+    /// software survive a Restore network.
+    public static let marker = "# managed by segue.ailock"
+
     /// One file per suffix, keyed by the filename under `/etc/resolver`
     /// (the normalized suffix, which is already a safe filename).
     public static func render(suffixes: [String], port: UInt16) throws -> [String: String] {
@@ -27,9 +32,16 @@ public enum ResolverFiles {
             guard let suffix = AILockSuffix.normalize(raw) else {
                 throw ResolverFileError.invalidSuffix(raw)
             }
-            files[suffix] = "nameserver \(nameserver)\nport \(port)\n"
+            files[suffix] = marker + "\nnameserver \(nameserver)\nport \(port)\n"
         }
         return files
+    }
+
+    /// true when this lock (or the helper) wrote the file. The marker must be
+    /// the first line; a file that only mentions the marker elsewhere is not
+    /// ours.
+    public static func carriesMarker(_ text: String) -> Bool {
+        text.hasPrefix(marker + "\n")
     }
 }
 

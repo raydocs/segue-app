@@ -1,23 +1,23 @@
 import Darwin
 import Foundation
 
-enum UnixSocketError: Error, Equatable {
+public enum UnixSocketError: Error, Equatable {
     case pathTooLong(Int)
     case notASocket
     case failed(String, Int32)
 }
 
-enum LineIOError: Error, Equatable {
+public enum LineIOError: Error, Equatable {
     case read(Int32)
     case write(Int32)
     case timeout
     case tooLong
 }
 
-enum LineIO {
-    static let maxBytes = 64 * 1024
+public enum LineIO {
+    public static let maxBytes = 64 * 1024
 
-    static func readLine(fd: Int32, limit: Int = maxBytes) throws -> Data? {
+    public static func readLine(fd: Int32, limit: Int = maxBytes) throws -> Data? {
         var data = Data()
         var byte: UInt8 = 0
         while true {
@@ -44,13 +44,13 @@ enum LineIO {
         }
     }
 
-    static func writeLine(fd: Int32, payload: Data) throws {
+    public static func writeLine(fd: Int32, payload: Data) throws {
         var bytes = payload
         bytes.append(0x0A)
         try writeAll(fd, bytes)
     }
 
-    static func writeAll(_ fd: Int32, _ data: Data) throws {
+    public static func writeAll(_ fd: Int32, _ data: Data) throws {
         try data.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
             var sent = 0
@@ -69,7 +69,7 @@ enum LineIO {
     }
 }
 
-func unixSocket() throws -> Int32 {
+public func unixSocket() throws -> Int32 {
     let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
     guard fd >= 0 else {
         throw UnixSocketError.failed("socket", errno)
@@ -80,20 +80,20 @@ func unixSocket() throws -> Int32 {
     return fd
 }
 
-func setNonBlocking(_ fd: Int32, _ enabled: Bool) {
+public func setNonBlocking(_ fd: Int32, _ enabled: Bool) {
     let flags = fcntl(fd, F_GETFL)
     guard flags >= 0 else { return }
     let updated = enabled ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK)
     _ = fcntl(fd, F_SETFL, updated)
 }
 
-func setReceiveTimeout(_ fd: Int32, seconds: Int) {
+public func setReceiveTimeout(_ fd: Int32, seconds: Int) {
     var tv = timeval(tv_sec: seconds, tv_usec: 0)
     _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
     _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 }
 
-func bindUnixSocket(fd: Int32, path: String) throws {
+public func bindUnixSocket(fd: Int32, path: String) throws {
     var addr = sockaddr_un()
     addr.sun_family = sa_family_t(AF_UNIX)
     addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
@@ -118,7 +118,7 @@ func bindUnixSocket(fd: Int32, path: String) throws {
     }
 }
 
-func connectUnixSocket(fd: Int32, path: String) throws {
+public func connectUnixSocket(fd: Int32, path: String) throws {
     var addr = sockaddr_un()
     addr.sun_family = sa_family_t(AF_UNIX)
     addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
@@ -143,7 +143,7 @@ func connectUnixSocket(fd: Int32, path: String) throws {
     }
 }
 
-func unlinkSocketFile(_ path: String) throws {
+public func unlinkSocketFile(_ path: String) throws {
     var info = stat()
     let exists = path.withCString { lstat($0, &info) }
     guard exists == 0 else { return }
