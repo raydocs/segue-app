@@ -20,8 +20,11 @@ private func runHelper() throws {
             "segue-core-helper: no allowed uids; denying every peer\n".utf8
         ))
     }
-    let peers = try DarwinPeerCredentials(requirement: SegueCodeSigning.requirement)
-    let policy = PeerPolicy(allowedUIDs: uids, requirement: SegueCodeSigning.requirement)
+    // Default is the Developer ID requirement. `--requirement` is how a dev
+    // run and the throwaway VM matrix admit a peer that is not that identity.
+    let requirement = paths.requirement.isEmpty ? SegueCodeSigning.requirement : paths.requirement
+    let peers = try DarwinPeerCredentials(requirement: requirement)
+    let policy = PeerPolicy(allowedUIDs: uids, requirement: requirement)
     let supervisor = KernelSupervisor(
         kernelPath: paths.kernelPath,
         configPath: paths.configPath,
@@ -31,7 +34,8 @@ private func runHelper() throws {
     let session = HelperSession(
         store: IntentStore(fileURL: URL(fileURLWithPath: paths.intentPath)),
         kernel: supervisor,
-        layer: AILayerController.live(kernel: supervisor, paths: paths)
+        layer: AILayerController.live(kernel: supervisor, paths: paths),
+        reconcileOnInit: false
     )
     let server = HelperSocketServer(
         path: paths.socketPath,
@@ -42,11 +46,15 @@ private func runHelper() throws {
     let socketDir = URL(fileURLWithPath: paths.socketPath).deletingLastPathComponent()
     try FileManager.default.createDirectory(
         at: socketDir,
-        withIntermediateDirectories: true,
-        attributes: [.posixPermissions: NSNumber(value: Int16(0o755))]
+        withIntermediateDirectories: true
     )
     try server.start()
-    FileHandle.standardError.write(Data("segue-core-helper: listening \(paths.socketPath)\n".utf8))
+    FileHandle.standardError.write(Data(
+        "segue-core-helper: listening \(paths.socketPath) guard \(paths.guardPort)\n".utf8
+    ))
+    // Socket is up before the anchor load. Reconcile can spend seconds in
+    // pfctl; the matrix used to probe during that window and record a missing socket.
+    session.reconcileArmedIntent()
 
     signal(SIGPIPE, SIG_IGN)
     signal(SIGTERM, SIG_IGN)

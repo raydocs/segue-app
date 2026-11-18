@@ -12,6 +12,17 @@ public struct HelperPaths: Equatable, Sendable {
     /// Built-in AI lock list (`suffix` / `cidr` lines). Missing means an
     /// empty list: the anchor passes everything and no resolver files exist.
     public var aiLockPath: String
+    /// Loopback DNS guard. Production is 5354; a dev run passes a port above 1024.
+    public var guardPort: UInt16
+    /// `/etc/pf.conf` in production. A dev run points this at a temp file so
+    /// the helper can arm without root.
+    public var pfConfPath: String
+    /// `/etc/resolver` in production. A dev run points this at a temp directory.
+    public var resolverDirectory: String
+    /// Empty means the production Developer ID requirement. A non-empty value
+    /// is what the daemon evaluates instead (the same escape the release
+    /// daemon has) so an unsigned dev build can answer `status_read`.
+    public var requirement: String
 
     public init(
         socketPath: String,
@@ -20,7 +31,11 @@ public struct HelperPaths: Equatable, Sendable {
         configPath: String,
         stateDir: String,
         allowedUIDFile: String,
-        aiLockPath: String
+        aiLockPath: String,
+        guardPort: UInt16 = 5354,
+        pfConfPath: String = "/etc/pf.conf",
+        resolverDirectory: String = "/etc/resolver",
+        requirement: String = ""
     ) {
         self.socketPath = socketPath
         self.intentPath = intentPath
@@ -29,6 +44,10 @@ public struct HelperPaths: Equatable, Sendable {
         self.stateDir = stateDir
         self.allowedUIDFile = allowedUIDFile
         self.aiLockPath = aiLockPath
+        self.guardPort = guardPort
+        self.pfConfPath = pfConfPath
+        self.resolverDirectory = resolverDirectory
+        self.requirement = requirement
     }
 
     public static let production = HelperPaths(
@@ -38,7 +57,11 @@ public struct HelperPaths: Equatable, Sendable {
         configPath: "/Library/Application Support/Segue/kernel.json",
         stateDir: "/Library/Application Support/Segue/kernel",
         allowedUIDFile: "/Library/PrivilegedHelperTools/segue.allowed-uid",
-        aiLockPath: "/Library/Application Support/Segue/ai-lock.txt"
+        aiLockPath: "/Library/Application Support/Segue/ai-lock.txt",
+        guardPort: 5354,
+        pfConfPath: "/etc/pf.conf",
+        resolverDirectory: "/etc/resolver",
+        requirement: ""
     )
 
     /// `arguments` includes argv0. Unknown tokens are skipped.
@@ -66,11 +89,43 @@ public struct HelperPaths: Equatable, Sendable {
                 if let next { paths.allowedUIDFile = next; index += 1 }
             case "--ai-lock":
                 if let next { paths.aiLockPath = next; index += 1 }
+            case "--guard-port":
+                if let next, let port = UInt16(next), port > 0 {
+                    paths.guardPort = port
+                    index += 1
+                }
+            case "--pf-conf":
+                if let next { paths.pfConfPath = next; index += 1 }
+            case "--resolver-dir":
+                if let next { paths.resolverDirectory = next; index += 1 }
+            case "--requirement":
+                if let next { paths.requirement = next; index += 1 }
+            case "--paths-root":
+                if let next {
+                    applyRoot(next, to: &paths)
+                    index += 1
+                }
             default:
                 break
             }
             index += 1
         }
         return paths
+    }
+
+    /// Dev/test base. Later flags still win, so `--paths-root` then
+    /// `--socket` keeps the explicit socket. Every path the helper writes
+    /// lands under `root`; production launchd does not pass this flag.
+    private static func applyRoot(_ root: String, to paths: inout HelperPaths) {
+        let base = root.hasSuffix("/") ? String(root.dropLast()) : root
+        paths.socketPath = base + "/run/service.sock"
+        paths.intentPath = base + "/ai-lock.intent"
+        paths.kernelPath = base + "/bin/segue-kernel"
+        paths.configPath = base + "/kernel.json"
+        paths.stateDir = base + "/kernel"
+        paths.allowedUIDFile = base + "/allowed-uid"
+        paths.aiLockPath = base + "/ai-lock.txt"
+        paths.pfConfPath = base + "/pf.conf"
+        paths.resolverDirectory = base + "/resolver"
     }
 }

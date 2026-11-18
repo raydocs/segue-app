@@ -100,11 +100,11 @@ public final class AILayerController {
             kernel: kernel,
             list: loadList(paths.aiLockPath),
             paths: AILayerPaths(
-                pfConfPath: "/etc/pf.conf",
-                resolverDirectory: ResolverFiles.resolverDirectory,
+                pfConfPath: paths.pfConfPath,
+                resolverDirectory: paths.resolverDirectory,
                 snapshotPath: snapshot,
                 guardAddress: ResolverFiles.nameserver,
-                guardPort: AILayerPaths.defaultGuardPort
+                guardPort: paths.guardPort
             )
         )
     }
@@ -142,16 +142,29 @@ public final class AILayerController {
     // MARK: - converge
 
     /// Caller holds `lock`.
+    ///
+    /// The guard is installed even when the anchor cannot be loaded. A
+    /// pfctl failure used to skip the listener, so armed names fell through
+    /// to the system resolver while the resolver file (written on a later
+    /// retry) made the matrix think the guard was up. The anchor error is
+    /// still reported; the names stay held.
     private func install(allowTunnelDNS: Bool) throws {
         let snap = kernel.snapshot()
         let utun = Self.utunName(snap.tunInterface)
-        try ensureHook()
-        try loadAnchor(utun: utun)
-        if allowTunnelDNS, utun != nil, let dns = Self.normalizeAddress(snap.dnsAddress) {
+        var anchorError: Error?
+        do {
+            try ensureHook()
+            try loadAnchor(utun: utun)
+        } catch {
+            anchorError = error
+        }
+        if allowTunnelDNS, utun != nil, anchorError == nil,
+           let dns = Self.normalizeAddress(snap.dnsAddress) {
             try applyTunnelDNS(dns)
         } else {
             try applyGuardDNS()
         }
+        if let anchorError { throw anchorError }
     }
 
     /// Point every service at the kernel resolver, then drop the guard
@@ -262,12 +275,14 @@ public final class AILayerController {
     }
 
     private func anchorIsLoaded() throws -> Bool {
+        // `pfctl -s Anchors` still lists segue.ailock after `-F all` because
+        // the pf.conf hook names it. An empty anchor is not a hold.
         let output = try runChecked(
             program: SystemPrograms.pfctl,
-            arguments: ["-s", "Anchors"],
+            arguments: ["-a", PFAnchorRenderer.anchorName, "-sr"],
             stdin: nil
         )
-        return SystemText.listsAnchor(output.stdout, name: PFAnchorRenderer.anchorName)
+        return SystemText.anchorHasRules(output.stdout)
     }
 
     private func installGuard() throws {

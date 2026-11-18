@@ -117,14 +117,18 @@ public final class ReleaseRestorer {
     }
 
     private func anchorIsLoaded() -> Bool? {
+        // Flushing rules does not drop the name from `pfctl -s Anchors`:
+        // the pf.conf line `anchor "segue.ailock"` keeps it listed. That
+        // made every real restore `partial` with an empty failure list.
+        // Loaded means the anchor still has rules.
         guard let output = try? runChecked(
             program: SystemPrograms.pfctl,
-            arguments: ["-s", "Anchors"],
+            arguments: ["-a", PFAnchorRenderer.anchorName, "-sr"],
             standardInput: nil
         ) else {
             return nil
         }
-        return SystemText.listsAnchor(output.stdout, name: PFAnchorRenderer.anchorName)
+        return SystemText.anchorHasRules(output.stdout)
     }
 
     // MARK: - resolver files

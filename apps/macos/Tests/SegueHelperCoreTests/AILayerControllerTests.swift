@@ -121,6 +121,11 @@ final class AILayerControllerTests: XCTestCase {
         )
         XCTAssertTrue(SystemText.listsAnchor("  segue.ailock\n", name: "segue.ailock"))
         XCTAssertFalse(SystemText.listsAnchor("  segue.ailock.extra\n", name: "segue.ailock"))
+        XCTAssertFalse(SystemText.anchorHasRules(""))
+        XCTAssertFalse(SystemText.anchorHasRules("No ALTQ support in kernel\nALTQ related functions disabled\n"))
+        XCTAssertTrue(SystemText.anchorHasRules(
+            "block drop out quick inet from any to 198.51.100.0/24 label \"segue-ai-0\"\n"
+        ))
         XCTAssertEqual(AILayerController.normalizeAddress("192.0.2.53:53"), "192.0.2.53")
         XCTAssertNil(AILayerController.normalizeAddress("192.0.2.53:5354"))
         XCTAssertNil(AILayerController.utunName("en0"))
