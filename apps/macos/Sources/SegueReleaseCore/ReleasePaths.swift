@@ -12,19 +12,26 @@ public struct ReleasePaths: Equatable, Sendable {
     public var snapshotPath: String
     public var resolverDirectory: String
     public var allowedUIDFile: String
+    /// Empty means the production Developer ID requirement. A non-empty value
+    /// is the requirement text the daemon evaluates instead — the throwaway
+    /// VM matrix passes an `identifier` requirement for its ad-hoc ctl.
+    /// Production launchd plists omit the flag.
+    public var requirement: String
 
     public init(
         socketPath: String,
         intentPath: String,
         snapshotPath: String,
         resolverDirectory: String,
-        allowedUIDFile: String
+        allowedUIDFile: String,
+        requirement: String = ""
     ) {
         self.socketPath = socketPath
         self.intentPath = intentPath
         self.snapshotPath = snapshotPath
         self.resolverDirectory = resolverDirectory
         self.allowedUIDFile = allowedUIDFile
+        self.requirement = requirement
     }
 
     public static let production = ReleasePaths(
@@ -59,6 +66,8 @@ public struct ReleasePaths: Equatable, Sendable {
                 if let next { paths.resolverDirectory = next; index += 1 }
             case "--allowed-uids":
                 if let next { paths.allowedUIDFile = next; index += 1 }
+            case "--requirement":
+                if let next { paths.requirement = next; index += 1 }
             default:
                 break
             }

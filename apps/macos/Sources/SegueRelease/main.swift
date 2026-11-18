@@ -24,8 +24,12 @@ private func runReleaseDaemon() throws {
             "segue-release: no allowed uids; denying every peer\n".utf8
         ))
     }
-    let peers = try DarwinPeerCredentials(requirement: SegueCodeSigning.requirement)
-    let policy = PeerPolicy(allowedUIDs: uids, requirement: SegueCodeSigning.requirement)
+    // Default is the Developer ID requirement. `--requirement` is how the
+    // throwaway VM matrix admits its ad-hoc signed ctl; a production plist
+    // does not pass it.
+    let requirement = paths.requirement.isEmpty ? SegueCodeSigning.requirement : paths.requirement
+    let peers = try DarwinPeerCredentials(requirement: requirement)
+    let policy = PeerPolicy(allowedUIDs: uids, requirement: requirement)
     let restorer = ReleaseRestorer.live(paths: paths)
     let server = ReleaseSocketServer(
         path: paths.socketPath,

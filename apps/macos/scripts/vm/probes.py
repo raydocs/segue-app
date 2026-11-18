@@ -106,14 +106,49 @@ def cmd_tcp(argv):
 
 
 def cmd_udp(argv):
-    host, port_text = argv
+    """Send one datagram and wait for the same bytes back. recv=1 is a round trip."""
+    host, port_text = argv[0], argv[1]
+    timeout = float(argv[2]) if len(argv) > 2 else 1.0
+    payload = b"segue-leak-probe"
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
     try:
-        sock.sendto(b"\x00" * 16, (host, int(port_text)))
+        try:
+            sock.sendto(payload, (host, int(port_text)))
+        except OSError as exc:
+            print("sent=0 recv=0 error=%s" % exc.__class__.__name__)
+            return 1
+        try:
+            data, _addr = sock.recvfrom(4096)
+        except socket.timeout:
+            print("sent=1 recv=0")
+            return 1
+        except OSError as exc:
+            print("sent=1 recv=0 error=%s" % exc.__class__.__name__)
+            return 1
     finally:
         sock.close()
-    print("sent=1")
-    return 0
+    if data == payload:
+        print("sent=1 recv=1")
+        return 0
+    print("sent=1 recv=0 mismatch=1")
+    return 1
+
+
+def cmd_udp_echo(argv):
+    """Echo UDP datagrams. The leak row's stand-in for an unlisted QUIC peer."""
+    host, port_text = argv
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, int(port_text)))
+    while True:
+        data, addr = sock.recvfrom(4096)
+        if not data:
+            continue
+        try:
+            sock.sendto(data, addr)
+        except OSError:
+            pass
 
 
 def cmd_serve(argv):
@@ -288,8 +323,7 @@ def cmd_leak_rules(argv):
     return 0
 
 
-def cmd_dns_save(argv):
-    path = argv[0]
+def current_dns_services():
     listing = subprocess.run(
         ["/usr/sbin/networksetup", "-listallnetworkservices"],
         check=False,
@@ -313,9 +347,37 @@ def cmd_dns_save(argv):
         else:
             servers = [item.strip() for item in text.splitlines() if item.strip()]
         services.append({"name": name, "servers": servers})
+    return services
+
+
+def cmd_dns_save(argv):
+    path = argv[0]
+    services = current_dns_services()
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(services, handle)
     print("saved=%s" % len(services))
+    return 0
+
+
+def cmd_dns_match(argv):
+    """Compare live resolvers to the snapshot save_dns wrote before arm."""
+    path = argv[0]
+    with open(path, "r", encoding="utf-8") as handle:
+        saved = json.load(handle)
+    current = {}
+    for item in current_dns_services():
+        current[item["name"]] = item["servers"]
+    bad = []
+    for item in saved:
+        name = item.get("name") or ""
+        wanted = item.get("servers") or []
+        if current.get(name) != wanted:
+            bad.append(name)
+    if bad:
+        print("match=no")
+        print("services=%s" % ",".join(bad))
+        return 1
+    print("match=yes")
     return 0
 
 
@@ -344,12 +406,14 @@ def main(argv):
         "dns": (3, cmd_dns),
         "tcp": (3, cmd_tcp),
         "udp": (2, cmd_udp),
+        "udp-echo": (2, cmd_udp_echo),
         "serve": (3, cmd_serve),
         "helper": (2, cmd_helper),
         "egress": (6, cmd_egress),
         "counter": (0, cmd_counter),
         "leak-rules": (0, cmd_leak_rules),
         "dns-save": (1, cmd_dns_save),
+        "dns-match": (1, cmd_dns_match),
         "dns-restore": (1, cmd_dns_restore),
     }
     if command not in commands:

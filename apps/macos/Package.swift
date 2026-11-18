@@ -14,6 +14,7 @@ let package = Package(
         .executable(name: "segue-core-helper", targets: ["SegueCoreHelper"]),
         .library(name: "SegueReleaseCore", targets: ["SegueReleaseCore"]),
         .executable(name: "segue-release", targets: ["SegueRelease"]),
+        .executable(name: "segue-release-ctl", targets: ["SegueReleaseCtl"]),
     ],
     targets: [
         .target(name: "SegueHelperProtocol"),
@@ -63,6 +64,10 @@ let package = Package(
         .executableTarget(
             name: "SegueRelease",
             dependencies: ["SegueReleaseCore", "SegueHelperCore"]
+        ),
+        .executableTarget(
+            name: "SegueReleaseCtl",
+            dependencies: ["SegueKit", "SegueHelperProtocol"]
         ),
         .testTarget(
             name: "SegueReleaseCoreTests",
