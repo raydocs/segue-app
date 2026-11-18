@@ -3,20 +3,28 @@ import SegueHelperProtocol
 
 /// Arm, disarm, and status for one helper.
 ///
-/// Arm and disarm are persisted and answered. They do not start the kernel,
-/// install a packet filter, or write a resolver file. The reply says
-/// `ai_layer` is not implemented so a caller cannot mistake stage 0 for
-/// protection. A corrupt intent file comes back disarmed rather than armed.
+/// Arm persists intent, then asks the AI layer to install. A failed install
+/// keeps the intent and reports `last_error`; it does not roll the bit back
+/// and it does not start the kernel. Disarm persists the clear bit, then
+/// releases the layer. Status while armed converges to the kernel: a dead
+/// tunnel switches to the guard and does not release the layer. A clear
+/// intent on start installs nothing, even if rule files are still around.
 public final class HelperSession {
     private let store: IntentStore
     private let kernel: KernelSupervising
+    private let layer: AILayerController
     private let lock = NSLock()
     private var intent: StoredIntent
+    private var layerError: String?
 
-    public init(store: IntentStore, kernel: KernelSupervising) {
+    public init(store: IntentStore, kernel: KernelSupervising, layer: AILayerController) {
         self.store = store
         self.kernel = kernel
+        self.layer = layer
         intent = (try? store.load()) ?? .disarmed
+        if intent.armed {
+            converge { try layer.reconcileOnLaunch() }
+        }
     }
 
     public func handle(_ envelope: HelperEnvelope) throws -> HelperEnvelope {
@@ -28,6 +36,7 @@ public final class HelperSession {
                 generation: arm.generation,
                 name: arm.intent.rawValue
             ))
+            converge { try layer.arm() }
         case .disarm:
             guard let disarm = envelope.disarm else { throw HelperProtocolError.malformed }
             try remember(StoredIntent(
@@ -35,12 +44,24 @@ public final class HelperSession {
                 generation: disarm.generation,
                 name: disarm.intent.rawValue
             ))
+            converge { try layer.disarm() }
         case .statusRead:
-            break
+            if isArmed() {
+                converge { try layer.kernelChanged() }
+            }
         case .status, .error:
             throw HelperProtocolError.malformed
         }
         return HelperEnvelope.status(currentStatus())
+    }
+
+    private func converge(_ body: () throws -> Void) {
+        do {
+            try body()
+            setLayerError(nil)
+        } catch {
+            setLayerError(AILayerError.code(of: error))
+        }
     }
 
     private func remember(_ updated: StoredIntent) throws {
@@ -50,22 +71,42 @@ public final class HelperSession {
         lock.unlock()
     }
 
+    private func isArmed() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return intent.armed
+    }
+
+    private func setLayerError(_ message: String?) {
+        lock.lock()
+        layerError = message
+        lock.unlock()
+    }
+
     private func currentStatus() -> HelperStatus {
         lock.lock()
         let intent = self.intent
+        let layerError = self.layerError
         lock.unlock()
-        let kernel = kernel.snapshot()
+        let kernelSnap = kernel.snapshot()
+        let observed = (try? layer.observe()) ?? .unknown
+        let lastError = layerError ?? (kernelSnap.state == "kernel_failed" ? "kernel_failed" : nil)
+        let held = intent.armed && (observed.anchorLoaded || observed.namesHeld)
         return HelperStatus(
             armed: intent.armed,
             generation: intent.generation,
-            held: false,
-            tunInterface: nil,
+            held: held,
+            tunInterface: kernelSnap.tunInterface,
             rulesDigest: "",
-            evidence: StatusEvidence(tcpProofMs: nil, dnsReadback: false),
-            lastError: kernel.state == "kernel_failed" ? "kernel_failed" : nil,
-            aiLayer: AILayerState.notImplemented,
+            evidence: StatusEvidence(tcpProofMs: nil, dnsReadback: observed.dnsReadback),
+            lastError: lastError,
+            aiLayer: observed.dnsMode,
             helper: HelperProcessReport(state: "running"),
-            kernel: KernelReport(state: kernel.state, pid: kernel.pid, lastExit: kernel.lastExit)
+            kernel: KernelReport(state: kernelSnap.state, pid: kernelSnap.pid, lastExit: kernelSnap.lastExit),
+            anchorLoaded: observed.anchorLoaded,
+            resolverFilesPresent: observed.resolverFilesPresent,
+            guardListening: observed.guardListening,
+            dnsMode: observed.dnsMode
         )
     }
 }

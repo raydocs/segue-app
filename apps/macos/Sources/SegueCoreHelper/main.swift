@@ -9,8 +9,8 @@ do {
     exit(1)
 }
 
-/// Stage 0 daemon. It listens, checks the peer, and stores arm intent.
-/// It does not start `segue-kernel` and it does not touch PF or DNS.
+/// Root helper. It listens, checks the peer, stores arm intent, and installs
+/// or releases the narrow AI layer. It does not start `segue-kernel`.
 private func runHelper() throws {
     let paths = HelperPaths.parse(CommandLine.arguments)
     let uidText = (try? String(contentsOfFile: paths.allowedUIDFile, encoding: .utf8)) ?? ""
@@ -30,7 +30,8 @@ private func runHelper() throws {
     )
     let session = HelperSession(
         store: IntentStore(fileURL: URL(fileURLWithPath: paths.intentPath)),
-        kernel: supervisor
+        kernel: supervisor,
+        layer: AILayerController.live(kernel: supervisor, paths: paths)
     )
     let server = HelperSocketServer(
         path: paths.socketPath,

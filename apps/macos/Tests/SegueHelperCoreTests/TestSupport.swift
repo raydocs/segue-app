@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import SegueAILayer
 import SegueHelperProtocol
 import XCTest
 
@@ -189,7 +190,26 @@ final class HelperHarness {
         )
         let peers = StaticPeers()
         peers.set(PeerIdentity(uid: getuid(), codeSigningSatisfied: true))
-        let session = HelperSession(store: IntentStore(fileURL: intentURL), kernel: supervisor)
+        let layer = AILayerController(
+            commands: RecordingSystemCommands(),
+            kernel: supervisor,
+            list: AILockList(
+                suffixes: ["example.com"],
+                cidrs: [try CIDR(parsing: "192.0.2.0/24")]
+            ),
+            paths: AILayerPaths(
+                pfConfPath: "/etc/pf.conf",
+                resolverDirectory: "/etc/resolver",
+                snapshotPath: directory.appendingPathComponent("dns-snapshot.json").path,
+                guardAddress: "127.0.0.1",
+                guardPort: AILayerPaths.defaultGuardPort
+            )
+        )
+        let session = HelperSession(
+            store: IntentStore(fileURL: intentURL),
+            kernel: supervisor,
+            layer: layer
+        )
         let server = HelperSocketServer(
             path: socketPath,
             session: session,

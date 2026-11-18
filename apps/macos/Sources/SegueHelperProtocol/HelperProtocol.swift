@@ -24,10 +24,14 @@ public enum HelperErrorCode {
     public static let internalError = "internal"
 }
 
-/// Stage 0 has no packet filter and no DNS. Replies say so instead of
-/// pretending the AI layer is up.
+/// DNS mode on a status read-back. `tunnel`, `guard`, and `system` are
+/// what the helper sends. `not_implemented` is the stage-0 sentinel; current
+/// replies do not use it, and older fixtures still decode it.
 public enum AILayerState {
     public static let notImplemented = "not_implemented"
+    public static let tunnel = "tunnel"
+    public static let guardMode = "guard"
+    public static let system = "system"
 }
 
 public enum HelperMessageKind: String, Codable, Equatable, Sendable {
@@ -181,8 +185,8 @@ public struct HelperErrorBody: Codable, Equatable, Sendable {
 }
 
 /// Helper read-back. `tunInterface` is set only when the helper sees a utun.
-/// `aiLayer`, `helper`, and `kernel` are omitted by older peers; stage 0
-/// fills them and leaves the filter unset.
+/// `aiLayer` is the DNS mode (`tunnel`, `guard`, or `system`). The anchor,
+/// resolver-file, and listener flags are omitted by older peers.
 public struct HelperStatus: Codable, Equatable, Sendable {
     public var armed: Bool
     public var generation: UInt64
@@ -194,6 +198,10 @@ public struct HelperStatus: Codable, Equatable, Sendable {
     public var aiLayer: String?
     public var helper: HelperProcessReport?
     public var kernel: KernelReport?
+    public var anchorLoaded: Bool?
+    public var resolverFilesPresent: Bool?
+    public var guardListening: Bool?
+    public var dnsMode: String?
 
     enum CodingKeys: String, CodingKey {
         case armed
@@ -206,6 +214,10 @@ public struct HelperStatus: Codable, Equatable, Sendable {
         case aiLayer = "ai_layer"
         case helper
         case kernel
+        case anchorLoaded = "anchor_loaded"
+        case resolverFilesPresent = "resolver_files"
+        case guardListening = "guard_listening"
+        case dnsMode = "dns_mode"
     }
 
     public init(
@@ -218,7 +230,11 @@ public struct HelperStatus: Codable, Equatable, Sendable {
         lastError: String?,
         aiLayer: String? = nil,
         helper: HelperProcessReport? = nil,
-        kernel: KernelReport? = nil
+        kernel: KernelReport? = nil,
+        anchorLoaded: Bool? = nil,
+        resolverFilesPresent: Bool? = nil,
+        guardListening: Bool? = nil,
+        dnsMode: String? = nil
     ) {
         self.armed = armed
         self.generation = generation
@@ -230,6 +246,10 @@ public struct HelperStatus: Codable, Equatable, Sendable {
         self.aiLayer = aiLayer
         self.helper = helper
         self.kernel = kernel
+        self.anchorLoaded = anchorLoaded
+        self.resolverFilesPresent = resolverFilesPresent
+        self.guardListening = guardListening
+        self.dnsMode = dnsMode
     }
 }
 

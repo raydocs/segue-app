@@ -17,7 +17,11 @@ final class HelperSocketServerTests: XCTestCase {
         XCTAssertFalse(status.held)
         XCTAssertNil(status.tunInterface)
         XCTAssertFalse(status.evidence.dnsReadback)
-        XCTAssertEqual(status.aiLayer, AILayerState.notImplemented)
+        XCTAssertEqual(status.aiLayer, AILayerState.system)
+        XCTAssertEqual(status.dnsMode, AILayerState.system)
+        XCTAssertEqual(status.anchorLoaded, false)
+        XCTAssertEqual(status.resolverFilesPresent, false)
+        XCTAssertEqual(status.guardListening, false)
         XCTAssertEqual(status.helper?.state, "running")
         XCTAssertEqual(status.kernel?.state, "stopped")
         XCTAssertNil(status.lastError)
@@ -27,7 +31,12 @@ final class HelperSocketServerTests: XCTestCase {
         let armed = try harness.roundTrip(HelperFixtures.minified("helper-arm"))
         XCTAssertEqual(armed.status?.armed, true)
         XCTAssertEqual(armed.status?.generation, 4)
-        XCTAssertEqual(armed.status?.aiLayer, "not_implemented")
+        XCTAssertEqual(armed.status?.held, true)
+        XCTAssertEqual(armed.status?.aiLayer, AILayerState.guardMode)
+        XCTAssertEqual(armed.status?.dnsMode, "guard")
+        XCTAssertEqual(armed.status?.anchorLoaded, true)
+        XCTAssertEqual(armed.status?.resolverFilesPresent, true)
+        XCTAssertEqual(armed.status?.guardListening, true)
         XCTAssertEqual(armed.status?.kernel?.state, "stopped")
         XCTAssertEqual(harness.launcher.procs.count, 0)
         XCTAssertEqual(try posixMode(at: harness.intentURL), 0o600)
@@ -49,7 +58,12 @@ final class HelperSocketServerTests: XCTestCase {
         let disarmed = try harness.roundTrip(HelperFixtures.minified("helper-disarm"))
         XCTAssertEqual(disarmed.status?.armed, false)
         XCTAssertEqual(disarmed.status?.generation, 4)
-        XCTAssertEqual(disarmed.status?.aiLayer, "not_implemented")
+        XCTAssertEqual(disarmed.status?.held, false)
+        XCTAssertEqual(disarmed.status?.aiLayer, AILayerState.system)
+        XCTAssertEqual(disarmed.status?.dnsMode, AILayerState.system)
+        XCTAssertEqual(disarmed.status?.anchorLoaded, false)
+        XCTAssertEqual(disarmed.status?.resolverFilesPresent, false)
+        XCTAssertEqual(disarmed.status?.guardListening, false)
         XCTAssertEqual(try posixMode(at: harness.intentURL), 0o600)
         XCTAssertEqual(
             try IntentStore(fileURL: harness.intentURL).load()?.name,
@@ -76,7 +90,7 @@ final class HelperSocketServerTests: XCTestCase {
 
         harness.peers.set(PeerIdentity(uid: getuid(), codeSigningSatisfied: true))
         let allowed = try harness.roundTrip(#"{"version":1,"kind":"status_read"}"#)
-        XCTAssertEqual(allowed.status?.aiLayer, AILayerState.notImplemented)
+        XCTAssertEqual(allowed.status?.aiLayer, AILayerState.system)
         XCTAssertEqual(allowed.status?.kernel?.state, "stopped")
     }
 
@@ -91,7 +105,7 @@ final class HelperSocketServerTests: XCTestCase {
         let reply = try harness.roundTrip(#"{"version":1,"kind":"status_read"}"#)
         XCTAssertEqual(reply.status?.kernel?.state, "kernel_failed")
         XCTAssertEqual(reply.status?.lastError, "kernel_failed")
-        XCTAssertEqual(reply.status?.aiLayer, "not_implemented")
+        XCTAssertEqual(reply.status?.aiLayer, AILayerState.system)
         XCTAssertFalse(reply.status?.armed ?? true)
     }
 }

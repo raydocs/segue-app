@@ -104,11 +104,25 @@ public struct KernelSnapshot: Equatable, Sendable {
     public var state: String
     public var pid: Int32?
     public var lastExit: String?
+    /// Set when a utun is up. This supervisor does not poll the kernel
+    /// control API, so its own snapshots leave the field nil; a stand-in
+    /// used by tests publishes the interface and the kernel DNS address.
+    public var tunInterface: String?
+    /// Kernel DNS listen address: an IP, or `ip:53`. Nil when unpublished.
+    public var dnsAddress: String?
 
-    public init(state: String, pid: Int32?, lastExit: String?) {
+    public init(
+        state: String,
+        pid: Int32?,
+        lastExit: String?,
+        tunInterface: String? = nil,
+        dnsAddress: String? = nil
+    ) {
         self.state = state
         self.pid = pid
         self.lastExit = lastExit
+        self.tunInterface = tunInterface
+        self.dnsAddress = dnsAddress
     }
 }
 
