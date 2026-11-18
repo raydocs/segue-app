@@ -384,6 +384,20 @@ fn reject_trust_bypass(value: &Value) -> Result<(), PrepareError> {
     }
 }
 
+/// Kernel exit tag: `[a-z0-9-]{1,32}` and not a built-in route name.
+/// Catalog admission uses this so an admitted node can be a [`PrepareInput`].
+pub(crate) fn is_kernel_exit_name(name: &str) -> bool {
+    is_exit_name(name) && !RESERVED_NAMES.contains(&name)
+}
+
+pub(crate) fn is_reserved_route_name(name: &str) -> bool {
+    RESERVED_NAMES.contains(&name)
+}
+
+pub(crate) fn is_kernel_egress_group(name: &str) -> bool {
+    is_egress_group(name)
+}
+
 fn is_exit_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes.len() > 32 {

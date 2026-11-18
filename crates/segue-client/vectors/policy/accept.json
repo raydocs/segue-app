@@ -1,0 +1,51 @@
+{
+  "fixtureVersion": 1,
+  "seedLabel": "segue-client-policy-v1",
+  "keyId": 1,
+  "now": 1700001000,
+  "document": {
+    "version": 7,
+    "expires_at": 1800000000,
+    "rules": [{ "note": "ignored" }]
+  },
+  "cases": [
+    {
+      "id": "accept",
+      "steps": [{ "expect": "accept" }]
+    },
+    {
+      "id": "ignores-rules",
+      "steps": [
+        {
+          "mutations": [
+            {
+              "find": "\"rules\":[{\"note\":\"ignored\"}]",
+              "replace": "\"rules\":\"not-rules\""
+            }
+          ],
+          "expect": "accept"
+        }
+      ]
+    },
+    {
+      "id": "idempotent",
+      "steps": [{ "expect": "accept" }, { "expect": "idempotent" }]
+    },
+    {
+      "id": "newer-version",
+      "steps": [
+        { "expect": "accept" },
+        {
+          "mutations": [{ "find": "\"version\":7", "replace": "\"version\":8" }],
+          "expect": "accept"
+        }
+      ]
+    },
+    {
+      "id": "device-clock-ahead",
+      "now": 1900000000,
+      "serverTime": 1700001000,
+      "steps": [{ "expect": "accept" }]
+    }
+  ]
+}

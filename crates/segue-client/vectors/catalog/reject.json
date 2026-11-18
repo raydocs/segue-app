@@ -1,0 +1,257 @@
+{
+  "fixtureVersion": 1,
+  "seedLabel": "segue-client-catalog-v1",
+  "keyId": 1,
+  "now": 1700001000,
+  "document": {
+    "schemaVersion": 1,
+    "revision": 2,
+    "issued_at": 1700000000,
+    "expires_at": 1800000000,
+    "ai_route": "ai",
+    "nodes": [
+      {
+        "id": 12,
+        "name": "la-1",
+        "region": "us",
+        "outbound": {
+          "protocol": "vless",
+          "settings": { "address": "203.0.113.10", "port": 443 }
+        },
+        "relay": "198.51.100.4:7443",
+        "node_id": 12,
+        "egress_group": "us-west",
+        "roles": ["overseas"]
+      }
+    ]
+  },
+  "cases": [
+    {
+      "id": "rollback",
+      "steps": [
+        { "expect": "accept" },
+        {
+          "mutations": [{ "find": "\"revision\":2", "replace": "\"revision\":1" }],
+          "expect": "reject",
+          "error": "rollback"
+        }
+      ]
+    },
+    {
+      "id": "digest-conflict",
+      "steps": [
+        { "expect": "accept" },
+        {
+          "mutations": [{ "find": "\"region\":\"us\"", "replace": "\"region\":\"eu\"" }],
+          "expect": "reject",
+          "error": "digest_conflict"
+        }
+      ]
+    },
+    {
+      "id": "schema-version",
+      "steps": [
+        {
+          "mutations": [{ "find": "\"schemaVersion\":1", "replace": "\"schemaVersion\":2" }],
+          "expect": "reject",
+          "error": "schema"
+        }
+      ]
+    },
+    {
+      "id": "unknown-field",
+      "steps": [
+        {
+          "mutations": [
+            {
+              "find": "\"schemaVersion\":1}",
+              "replace": "\"schemaVersion\":1,\"zzz\":true}"
+            }
+          ],
+          "expect": "reject",
+          "error": "unknown_field"
+        }
+      ]
+    },
+    {
+      "id": "reserved-auto",
+      "steps": [
+        {
+          "mutations": [{ "find": "\"name\":\"la-1\"", "replace": "\"name\":\"auto\"" }],
+          "expect": "reject",
+          "error": "reserved_name"
+        }
+      ]
+    },
+    {
+      "id": "reserved-direct",
+      "steps": [
+        {
+          "mutations": [{ "find": "\"name\":\"la-1\"", "replace": "\"name\":\"direct\"" }],
+          "expect": "reject",
+          "error": "reserved_name"
+        }
+      ]
+    },
+    {
+      "id": "reserved-overseas",
+      "steps": [
+        {
+          "mutations": [{ "find": "\"name\":\"la-1\"", "replace": "\"name\":\"overseas\"" }],
+          "expect": "reject",
+          "error": "reserved_name"
+        }
+      ]
+    },
+    {
+      "id": "duplicate-name",
+      "steps": [
+        {
+          "mutations": [{ "op": "duplicate_node" }],
+          "expect": "reject",
+          "error": "duplicate_name"
+        }
+      ]
+    },
+    {
+      "id": "too-many-nodes",
+      "steps": [
+        {
+          "mutations": [{ "op": "repeat_node", "count": 201 }],
+          "expect": "reject",
+          "error": "too_many_nodes"
+        }
+      ]
+    },
+    {
+      "id": "non-public-ip",
+      "steps": [
+        {
+          "mutations": [
+            {
+              "find": "\"address\":\"203.0.113.10\"",
+              "replace": "\"address\":\"10.0.0.4\""
+            }
+          ],
+          "expect": "reject",
+          "error": "public_ip"
+        }
+      ]
+    },
+    {
+      "id": "hostname-server",
+      "steps": [
+        {
+          "mutations": [
+            {
+              "find": "\"address\":\"203.0.113.10\"",
+              "replace": "\"address\":\"vpn.example\""
+            }
+          ],
+          "expect": "reject",
+          "error": "public_ip"
+        }
+      ]
+    },
+    {
+      "id": "hostname-relay",
+      "steps": [
+        {
+          "mutations": [
+            {
+              "find": "\"relay\":\"198.51.100.4:7443\"",
+              "replace": "\"relay\":\"relay.example:7443\""
+            }
+          ],
+          "expect": "reject",
+          "error": "relay"
+        }
+      ]
+    },
+    {
+      "id": "trust-bypass",
+      "steps": [
+        {
+          "mutations": [
+            {
+              "find": "\"protocol\":\"vless\"",
+              "replace": "\"allowInsecure\":true,\"protocol\":\"vless\""
+            }
+          ],
+          "expect": "reject",
+          "error": "trust_bypass"
+        }
+      ]
+    },
+    {
+      "id": "bad-signature",
+      "steps": [
+        {
+          "mutations": [{ "op": "flip_sig" }],
+          "expect": "reject",
+          "error": "bad_signature"
+        }
+      ]
+    },
+    {
+      "id": "unknown-key",
+      "steps": [
+        {
+          "mutations": [{ "op": "key_id", "value": 99 }],
+          "expect": "reject",
+          "error": "unknown_key"
+        }
+      ]
+    },
+    {
+      "id": "oversized",
+      "steps": [
+        {
+          "mutations": [{ "op": "grow", "to": 1048577 }],
+          "expect": "reject",
+          "error": "oversized"
+        }
+      ]
+    },
+    {
+      "id": "expired",
+      "steps": [
+        {
+          "mutations": [
+            {
+              "find": "\"expires_at\":1800000000",
+              "replace": "\"expires_at\":1700000500"
+            }
+          ],
+          "expect": "reject",
+          "error": "expired"
+        }
+      ]
+    },
+    {
+      "id": "empty-nodes",
+      "steps": [
+        {
+          "mutations": [{ "op": "clear_nodes" }],
+          "expect": "reject",
+          "error": "empty"
+        }
+      ]
+    },
+    {
+      "id": "bad-egress-group",
+      "steps": [
+        {
+          "mutations": [
+            {
+              "find": "\"egress_group\":\"us-west\"",
+              "replace": "\"egress_group\":\"bad group\""
+            }
+          ],
+          "expect": "reject",
+          "error": "egress_group"
+        }
+      ]
+    }
+  ]
+}

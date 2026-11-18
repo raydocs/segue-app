@@ -1,0 +1,100 @@
+{
+  "fixtureVersion": 1,
+  "seedLabel": "segue-client-policy-v1",
+  "keyId": 1,
+  "now": 1700001000,
+  "document": {
+    "version": 7,
+    "expires_at": 1800000000,
+    "rules": [{ "note": "ignored" }]
+  },
+  "cases": [
+    {
+      "id": "rollback",
+      "steps": [
+        { "expect": "accept" },
+        {
+          "mutations": [{ "find": "\"version\":7", "replace": "\"version\":6" }],
+          "expect": "reject",
+          "error": "rollback"
+        }
+      ]
+    },
+    {
+      "id": "digest-conflict",
+      "steps": [
+        { "expect": "accept" },
+        {
+          "mutations": [
+            {
+              "find": "\"expires_at\":1800000000",
+              "replace": "\"expires_at\":1700005000"
+            }
+          ],
+          "expect": "reject",
+          "error": "digest_conflict"
+        }
+      ]
+    },
+    {
+      "id": "bad-signature",
+      "steps": [
+        {
+          "mutations": [{ "op": "flip_sig" }],
+          "expect": "reject",
+          "error": "bad_signature"
+        }
+      ]
+    },
+    {
+      "id": "unknown-key",
+      "steps": [
+        {
+          "mutations": [{ "op": "key_id", "value": 99 }],
+          "expect": "reject",
+          "error": "unknown_key"
+        }
+      ]
+    },
+    {
+      "id": "oversized",
+      "steps": [
+        {
+          "mutations": [{ "op": "grow", "to": 8388609 }],
+          "expect": "reject",
+          "error": "oversized"
+        }
+      ]
+    },
+    {
+      "id": "expired",
+      "now": 1800000000,
+      "steps": [{ "expect": "reject", "error": "expired" }]
+    },
+    {
+      "id": "server-time",
+      "serverTime": 1800000000,
+      "steps": [{ "expect": "reject", "error": "server_time" }]
+    },
+    {
+      "id": "missing-version",
+      "steps": [
+        {
+          "mutations": [{ "find": "\"version\":7", "replace": "\"version_gone\":7" }],
+          "expect": "reject",
+          "error": "malformed"
+        }
+      ]
+    },
+    {
+      "id": "malformed",
+      "steps": [
+        {
+          "mutations": [{ "op": "raw_body", "text": "not-json" }],
+          "expect": "reject",
+          "error": "malformed"
+        }
+      ]
+    }
+  ]
+}
