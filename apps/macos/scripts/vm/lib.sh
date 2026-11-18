@@ -42,6 +42,17 @@ SEEN_ROWS=" "
 EXIT_CODE=0
 SKIP_CLEANUP=0
 CLEANED=0
+# Default: the helper starts and supervises segue-kernel (arm -> start).
+# --kernel-by-script restores the old path where this script execs the
+# kernel itself; then no kernel.json is installed where the helper looks,
+# so the helper's own start attempt settles as config_rejected instead of
+# fighting the script's kernel for the ports. The entry script owns the
+# value: it parses --kernel-by-script before sourcing this file.
+: "${KERNEL_BY_SCRIPT:=0}"
+
+kernel_by_script() {
+  [[ "$KERNEL_BY_SCRIPT" == 1 ]]
+}
 
 dry() {
   [[ "$DRY_RUN" == 1 ]]
@@ -109,7 +120,7 @@ $(capture_fail_context)"
 skip_pending() {
   local why="$1" name
   for name in \
-    armed-kernel-not-started \
+    armed-kernel-not-running \
     connected \
     kill-kernel \
     kill-helper \
@@ -377,6 +388,8 @@ write_helper_plist() {
 		<string>${SUPPORT}/kernel.json</string>
 		<string>--state-dir</string>
 		<string>${SUPPORT}/kernel</string>
+		<string>--kernel-log</string>
+		<string>${WORK}/logs/kernel.log</string>
 		<string>--intent</string>
 		<string>${INTENT}</string>
 		<string>--socket</string>
@@ -400,7 +413,7 @@ EOF
 install_daemons() {
   note "segue has no VLESS inbound (socks, http, tun, tproxy). The fixture exit is a loopback SOCKS server."
   note "fixture AI suffix and CIDR are added by a signed policy bundle. The product ai-lock.txt is not edited."
-  note "the helper supervisor does not publish a utun and its argv passes --config, which segue-kernel rejects. This matrix starts segue-kernel itself."
+  note "arm starts segue-kernel via the helper: it supervises the child, restarts it on crash, and polls /v1/status (control section in kernel.json, token under ${SUPPORT}/kernel) for the utun. --kernel-by-script execs the kernel here instead, for debugging."
   write_helper_plist
   printf '0\n' > "${WORK}/state/allowed-uid"
   priv /bin/mkdir -p /Library/PrivilegedHelperTools /Library/LaunchDaemons /var/run/segue "$SUPPORT" "${SUPPORT}/kernel" "${WORK}/logs" || return 1
@@ -482,6 +495,14 @@ try_socket_arm() {
 
 arm_helper() {
   copy_fixture_list || return 1
+  # The stack the kernel needs goes in before the intent: the helper reads
+  # kernel.json the moment it arms. In --kernel-by-script the script execs
+  # the kernel first, so the helper's own start settles config_rejected
+  # and leaves the script's kernel the ports.
+  prepare_kernel_stack || return 1
+  if kernel_by_script; then
+    start_kernel_process || return 1
+  fi
   write_intent true user_connect 1 || return 1
   note "same-boot PF: the helper writes the anchor line into /etc/pf.conf but does not reload it. The harness runs pfctl -f /etc/pf.conf so the anchor is referenced, then restarts the helper to refill the anchor. A reboot loads that file itself."
   note "arm waits until the helper socket exists and dig @127.0.0.1 -p ${GUARD_PORT} is empty NOERROR. A resolver file alone is written before the listener and survives a crash."
@@ -489,6 +510,12 @@ arm_helper() {
     priv /bin/launchctl kickstart -k "system/${HELPER_LABEL}"
     plan test -S /var/run/segue/service.sock
     try_socket_arm >/dev/null
+    if kernel_by_script; then
+      note "kernel-by-script: the kernel above was exec'd by this script, not the helper."
+    else
+      note "the helper starts ${KERNEL_DST} run --state-dir ${SUPPORT}/kernel --log ${WORK}/logs/kernel.log ${SUPPORT}/kernel.json at arm and reports it over status_read."
+      plan /usr/bin/python3 "$PROBES" helper /var/run/segue/service.sock '<status_read: kernel_state=running kernel_pid=<pid> tun=utun<N>>'
+    fi
     priv /sbin/pfctl -f /etc/pf.conf
     priv /bin/launchctl kickstart -k "system/${HELPER_LABEL}"
     plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A
@@ -512,6 +539,11 @@ arm_helper() {
   fi
   wait_until 15 anchor_has_fixture || return 1
   wait_until 15 guard_answers || return 1
+  if ! kernel_by_script; then
+    # The kernel the helper started: running, with a utun its control API
+    # reports. Its pid lands in the file the kill rows use.
+    wait_until 30 helper_kernel_up || return 1
+  fi
   /usr/bin/dscacheutil -flushcache >/dev/null 2>&1 || true
   /usr/bin/killall -HUP mDNSResponder >/dev/null 2>&1 || true
 }
@@ -641,6 +673,10 @@ EOF
     "installed": "policy.installed",
     "ai_route": "home"
   },
+  "control": {
+    "listen": "127.0.0.1:0",
+    "token_file": "control.json"
+  },
   "dns": {
     "listen": "127.0.0.1:${KERNEL_DNS_PORT}",
     "domestic": ["192.0.2.53:53"],
@@ -650,17 +686,27 @@ EOF
   "sniff": {"timeout_ms": 300, "max_bytes": 16384}
 }
 EOF
+  # dns.listen is port 15353, not a resolver port, so the helper keeps the
+  # guard as the system hold even while the kernel is connected; the
+  # control section is what tells the helper the utun and the carrier.
+  if kernel_by_script; then
+    note "kernel-by-script: kernel.json stays in ${WORK}/state; the helper own start settles config_rejected and leaves the script kernel alone."
+    return 0
+  fi
   priv /bin/cp "${WORK}/state/kernel.json" "${SUPPORT}/kernel.json" || return 1
 }
 
-start_kernel_stack() {
+# Everything the kernel needs except the kernel itself: the fixture SOCKS
+# exit, the signed policy bundle, kernel.json (control section included),
+# the lo0 aliases, and the AI fixture host. Runs before arm so the helper
+# finds a complete config the moment it starts the kernel.
+prepare_kernel_stack() {
   write_server_config
   if dry; then
     plan "${SEGUE_DST}" run -config "${WORK}/state/fixture-server.json"
     sign_bundle || return 1
     priv /sbin/ifconfig lo0 alias "${FIXTURE_HOST}" netmask 255.255.255.0
     plan /usr/bin/python3 "$PROBES" serve "${FIXTURE_HOST}" "$FIXTURE_TCP_PORT" ai-host
-    plan "${KERNEL_DST}" run --state-dir "${SUPPORT}/kernel" --log "${WORK}/logs/kernel.log" "${SUPPORT}/kernel.json"
     return 0
   fi
   start_bg "${WORK}/state/fixture.pid" "${SEGUE_DST}" run -config "${WORK}/state/fixture-server.json" || return 1
@@ -670,11 +716,66 @@ start_kernel_stack() {
   fi
   start_bg "${WORK}/state/ai-host.pid" /usr/bin/python3 "$PROBES" serve "${FIXTURE_HOST}" "$FIXTURE_TCP_PORT" ai-host || return 1
   UTUN_BEFORE=" $(utun_list) "
+}
+
+# The debug fallback (--kernel-by-script): this script execs the kernel
+# with the config in ${WORK}/state. No kernel.json is installed at
+# ${SUPPORT}, so the helper does not spawn a rival for these ports.
+start_kernel_process() {
+  if dry; then
+    plan "${KERNEL_DST}" run --state-dir "${SUPPORT}/kernel" --log "${WORK}/logs/kernel.log" "${WORK}/state/kernel.json"
+    return 0
+  fi
   mkdir -p "${WORK}/logs"
-  nohup "${KERNEL_DST}" run --state-dir "${SUPPORT}/kernel" --log "${WORK}/logs/kernel.log" "${SUPPORT}/kernel.json" >>"${WORK}/logs/kernel.stdout" 2>&1 &
+  nohup "${KERNEL_DST}" run --state-dir "${SUPPORT}/kernel" --log "${WORK}/logs/kernel.log" "${WORK}/state/kernel.json" >>"${WORK}/logs/kernel.stdout" 2>&1 &
   echo $! > "${WORK}/state/kernel.pid"
   wait_until 20 saw_new_utun || return 1
   wait_until 15 kernel_dns_up || return 1
+}
+
+start_kernel_stack() {
+  prepare_kernel_stack || return 1
+  start_kernel_process
+}
+
+# status_read through the helper socket, parsed into key=value lines the
+# rows can kv out of. Empty output means the helper did not answer.
+helper_kernel_status() {
+  local payload='{"version":1,"kind":"status_read"}'
+  /usr/bin/python3 "$PROBES" helper /var/run/segue/service.sock "$payload" 2>/dev/null     | /usr/bin/python3 -c '
+import json, sys
+try:
+    obj = json.loads(sys.stdin.read().strip())
+except Exception:
+    sys.exit(0)
+body = obj.get("status") or {}
+kernel = body.get("kernel") or {}
+print("kernel_state=%s" % kernel.get("state", "missing"))
+print("kernel_pid=%s" % (kernel.get("pid") or ""))
+print("kernel_last_exit=%s" % (kernel.get("last_exit") or ""))
+print("tun=%s" % (body.get("tun_interface") or ""))
+print("armed=%s" % body.get("armed"))
+'
+}
+
+# The helper started the kernel and its control API reports a utun. The
+# pid is recorded where the kill rows and cleanup already look for it.
+# (kv answers 0 for a missing key, so the fields are matched explicitly.)
+helper_kernel_up() {
+  local parsed pid tun
+  parsed=$(helper_kernel_status)
+  printf '%s\n' "$parsed" | grep -q '^kernel_state=running$' || return 1
+  pid=$(printf '%s\n' "$parsed" | sed -n 's/^kernel_pid=//p')
+  tun=$(printf '%s\n' "$parsed" | sed -n 's/^tun=//p')
+  case "$pid" in
+    ''|0|*[!0-9]*) return 1 ;;
+  esac
+  case "$tun" in
+    utun*) ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' "$pid" > "${WORK}/state/kernel.pid"
+  printf '%s\n' "$tun" > "${WORK}/state/utun.name"
 }
 
 saw_new_utun() {
@@ -735,16 +836,17 @@ evaluations ${be} -> ${ae}"
 }
 
 row_armed() {
-  local name=armed-kernel-not-started
+  local name=armed-kernel-not-running
   if dry; then
+    plan /usr/bin/pgrep -x segue-kernel
     plan /usr/bin/dig +time=2 +tries=1 "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/dig +time=2 +tries=1 example.com A
     plan /usr/bin/python3 "$PROBES" dns 127.0.0.1 "$GUARD_PORT" "www.${FIXTURE_SUFFIX}"
     plan /usr/bin/python3 "$PROBES" tcp 127.0.0.1 "$LOOPBACK_PORT" 2
     cidr_drop_probe || true
-    note "kernel is not started for this row"
-    record "$name" DRY-RUN "armed, kernel not started: system dig of www.${FIXTURE_SUFFIX} is empty NOERROR from 127.0.0.1; dig @127.0.0.1 -p ${GUARD_PORT} is empty NOERROR; dig example.com is a real answer; TCP to ${FIXTURE_CIDR} is dropped; TCP to 127.0.0.1 works"
+    note "this row runs after kill-kernel: the SIGTERM was a clean shutdown, so the supervisor does not restart it, and the helper converged the layer to the guard"
+    record "$name" DRY-RUN "armed, kernel not running: no segue-kernel process; system dig of www.${FIXTURE_SUFFIX} is empty NOERROR from 127.0.0.1; dig @127.0.0.1 -p ${GUARD_PORT} is empty NOERROR; dig example.com is a real answer; TCP to ${FIXTURE_CIDR} is dropped; TCP to 127.0.0.1 works"
     return 0
   fi
   local dig_ai dig_ex guard loop rules leak guard_dig
@@ -789,9 +891,9 @@ row_armed() {
     ok=0
     why="${why} anchor rules are not the narrow fixture block."
   fi
-  if [[ -f "${WORK}/state/kernel.pid" ]]; then
+  if pgrep -x segue-kernel >/dev/null 2>&1; then
     ok=0
-    why="${why} kernel pid file exists."
+    why="${why} a segue-kernel process is still running."
   fi
   local evidence socket_reply
   socket_reply=$(cat "${WORK}/state/socket-arm.txt" 2>/dev/null || true)
@@ -819,15 +921,15 @@ ${rules}"
 row_connected() {
   local name=connected
   if dry; then
-    start_kernel_stack || true
     plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/python3 "$PROBES" dns 127.0.0.1 "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}"
     plan /usr/bin/python3 "$PROBES" egress 198.18.0.1 "$FIXTURE_TCP_PORT" "$SOCKS_PORT" "$UNLISTED_HOST" "$UNLISTED_PORT" "$LOOPBACK_PORT"
-    record "$name" DRY-RUN "kernel DNS for www.${FIXTURE_SUFFIX} is a 198.18.0.0/15 fake-IP; a TCP connection to that address opens a session to the fixture SOCKS exit; a non-AI address does not; loopback still connects. System DNS stays on the guard because the helper does not observe this utun."
+    record "$name" DRY-RUN "the kernel arm started is up: its DNS for www.${FIXTURE_SUFFIX} is a 198.18.0.0/15 fake-IP; a TCP connection to that address opens a session to the fixture SOCKS exit; a non-AI address does not; loopback still connects. System DNS stays on the guard: the kernel DNS listens on port ${KERNEL_DNS_PORT}, which is not a system-resolver port."
     return 0
   fi
-  if ! start_kernel_stack; then
-    record "$name" FAIL "kernel stack did not come up
+  if [[ ! -f "${WORK}/state/kernel.pid" ]] || ! pgrep -x segue-kernel >/dev/null 2>&1; then
+    record "$name" FAIL "the kernel arm started is not running
+$(helper_kernel_status)
 $(log_tail "${WORK}/logs/kernel.log")
 $(log_tail "${WORK}/logs/kernel.stdout")
 $(log_tail "${WORK}/logs/fixture.pid.log")"
@@ -869,7 +971,7 @@ row_kill_kernel() {
     plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/dig +time=2 +tries=1 example.com A
     cidr_drop_probe || true
-    record "$name" DRY-RUN "after SIGTERM to segue-kernel only, waiting for it to exit before SIGKILL: its utun is gone and the pid is dead; armed name is still empty NOERROR from 127.0.0.1; dig @127.0.0.1 -p ${GUARD_PORT} is empty NOERROR; example.com still answers; fixture CIDR still dropped; non-AI loopback still connects"
+    record "$name" DRY-RUN "after SIGTERM to segue-kernel only, waiting for it to exit before SIGKILL: a SIGTERM is a clean shutdown (exit 0), so the supervisor does not restart it and converges the layer to the guard; its utun is gone and the pid is dead; armed name is still empty NOERROR from 127.0.0.1; dig @127.0.0.1 -p ${GUARD_PORT} is empty NOERROR; example.com still answers; fixture CIDR still dropped; non-AI loopback still connects"
     return 0
   fi
   if [[ ! -f "${WORK}/state/kernel.pid" ]]; then
@@ -972,6 +1074,11 @@ row_kill_helper() {
     # The process is back before the guard is. Do not score the restart
     # against the gap where the listener is still coming up.
     wait_until 15 guard_answers || true
+    if ! kernel_by_script; then
+      # The restarted helper re-armed the narrow layer and took the kernel
+      # back over (the orphan's pid file named it) or started it fresh.
+      wait_until 30 helper_kernel_up || true
+    fi
   fi
   after=$(dig_query "www.${FIXTURE_SUFFIX}")
   ex_after=$(dig_query example.com)
@@ -1381,14 +1488,14 @@ run_all() {
   fi
   start_bg "${WORK}/state/loopback.pid" /usr/bin/python3 "$PROBES" serve 127.0.0.1 "$LOOPBACK_PORT" non-ai-ok
   if ! arm_helper; then
-    record armed-kernel-not-started FAIL "helper did not arm
+    record armed-kernel-not-running FAIL "helper did not arm
 $(log_tail "${WORK}/logs/helper.err")"
     skip_pending "arm failed"
     return 0
   fi
-  row_armed
   row_connected
   row_kill_kernel
+  row_armed
   row_kill_helper
   # Leak while the anchor is still armed. Restore flushes it.
   row_leak

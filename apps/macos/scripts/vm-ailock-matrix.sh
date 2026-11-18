@@ -19,6 +19,7 @@ usage: SEGUE_VM_MATRIX=throwaway $SCRIPT_PATH [--dry-run]
        [--core-rev REV] [--app-rev REV]
        [--core-repo URL] [--app-repo URL]
        [--work-dir DIR] [--json PATH] [--skip-build]
+       [--kernel-by-script]
 
 --dry-run prints the plan and exits 0. It still requires
 SEGUE_VM_MATRIX=throwaway. A real run also requires a VM
@@ -27,6 +28,12 @@ SEGUE_VM_MATRIX=throwaway. A real run also requires a VM
 --host-kind satellite skips reboot rows (a Satellite is destroyed on
 reboot). --host-kind vm (the default) is a persistent VM such as Tart,
 where reboot cycles are separate pre/post phases.
+
+By default arm starts segue-kernel through the helper (it supervises the
+child and polls the kernel control API for the utun). --kernel-by-script
+is a debug fallback: the script execs the kernel itself and installs no
+kernel.json where the helper looks, so the helper's own start attempt
+settles config_rejected instead of fighting the script's kernel.
 
 Default JSON: <work-dir>/vm-ailock-matrix-<phase>[-<expect>].json
 Default work dir: /var/tmp/segue-vm-matrix
@@ -44,6 +51,7 @@ APP_REPO=https://github.com/raydocs/segue-app.git
 WORK=/var/tmp/segue-vm-matrix
 JSON=
 SKIP_BUILD=0
+KERNEL_BY_SCRIPT=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -58,6 +66,7 @@ while [[ $# -gt 0 ]]; do
     --work-dir) WORK="${2:?}"; shift 2 ;;
     --json) JSON="${2:?}"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
+    --kernel-by-script) KERNEL_BY_SCRIPT=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *)
       echo "unknown argument: $1" >&2
