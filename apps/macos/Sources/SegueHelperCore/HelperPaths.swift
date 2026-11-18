@@ -9,6 +9,9 @@ public struct HelperPaths: Equatable, Sendable {
     public var configPath: String
     public var stateDir: String
     public var allowedUIDFile: String
+    /// Built-in AI lock list (`suffix` / `cidr` lines). Missing means an
+    /// empty list: the anchor passes everything and no resolver files exist.
+    public var aiLockPath: String
 
     public init(
         socketPath: String,
@@ -16,7 +19,8 @@ public struct HelperPaths: Equatable, Sendable {
         kernelPath: String,
         configPath: String,
         stateDir: String,
-        allowedUIDFile: String
+        allowedUIDFile: String,
+        aiLockPath: String
     ) {
         self.socketPath = socketPath
         self.intentPath = intentPath
@@ -24,6 +28,7 @@ public struct HelperPaths: Equatable, Sendable {
         self.configPath = configPath
         self.stateDir = stateDir
         self.allowedUIDFile = allowedUIDFile
+        self.aiLockPath = aiLockPath
     }
 
     public static let production = HelperPaths(
@@ -32,7 +37,8 @@ public struct HelperPaths: Equatable, Sendable {
         kernelPath: "/Library/PrivilegedHelperTools/segue-kernel",
         configPath: "/Library/Application Support/Segue/kernel.json",
         stateDir: "/Library/Application Support/Segue/kernel",
-        allowedUIDFile: "/Library/PrivilegedHelperTools/segue.allowed-uid"
+        allowedUIDFile: "/Library/PrivilegedHelperTools/segue.allowed-uid",
+        aiLockPath: "/Library/Application Support/Segue/ai-lock.txt"
     )
 
     /// `arguments` includes argv0. Unknown tokens are skipped.
@@ -58,6 +64,8 @@ public struct HelperPaths: Equatable, Sendable {
                 if let next { paths.stateDir = next; index += 1 }
             case "--allowed-uids":
                 if let next { paths.allowedUIDFile = next; index += 1 }
+            case "--ai-lock":
+                if let next { paths.aiLockPath = next; index += 1 }
             default:
                 break
             }
