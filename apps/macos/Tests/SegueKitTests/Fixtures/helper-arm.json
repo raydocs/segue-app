@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "kind": "arm",
+  "arm": {
+    "schemaVersion": 1,
+    "generation": 4,
+    "intent": "user_connect",
+    "anchor_revision": 3,
+    "manifest_digest": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+    "egress": [{"ip": "192.0.2.10", "port": 443}],
+    "exit_ifaces": ["utun4"],
+    "strict": false,
+    "evidence": {"policy_version": 7, "posture": "connecting"}
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "state": "disconnected",
+  "posture": "disconnected",
+  "exit_choice": "auto",
+  "current_exit": null,
+  "exits": ["la", "ny"],
+  "revoked": true,
+  "control_refused": [],
+  "policy": {
+    "source": "signed",
+    "valid": false,
+    "version": null,
+    "expires_at": null,
+    "high_water": 4
+  },
+  "tun": {
+    "interface": null,
+    "routes": "absent"
+  }
+}

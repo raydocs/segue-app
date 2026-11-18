@@ -1,0 +1,20 @@
+{
+  "state": "connected",
+  "posture": "connected",
+  "exit_choice": "ny",
+  "current_exit": "ny",
+  "exits": ["la", "ny"],
+  "revoked": false,
+  "control_refused": [{"exit": "la", "code": 1}],
+  "policy": {
+    "source": "signed",
+    "valid": true,
+    "version": 7,
+    "expires_at": 1893456000,
+    "high_water": 7
+  },
+  "tun": {
+    "interface": "utun4",
+    "routes": "installed"
+  }
+}

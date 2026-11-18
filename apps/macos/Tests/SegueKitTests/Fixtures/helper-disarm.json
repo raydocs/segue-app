@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "kind": "disarm",
+  "disarm": {
+    "schemaVersion": 1,
+    "generation": 4,
+    "intent": "user_disconnect"
+  }
+}
