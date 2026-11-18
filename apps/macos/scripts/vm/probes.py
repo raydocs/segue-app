@@ -153,14 +153,32 @@ def cmd_udp_echo(argv):
 
 
 def cmd_serve(argv):
-    host, port_text, banner = argv
+    """Accept TCP and optionally append `peer=<ip>` lines.
+
+    The fourth argument is the peer log. The connected row reads it to
+    see who dialed the fixture: the home SOCKS path is loopback (or the
+    fixture address itself, when the stack uses the lo0 alias as the
+    source). A flow that left via utun or en0 is some other address.
+    """
+    host, port_text, banner = argv[:3]
+    peer_log = argv[3] if len(argv) > 3 and argv[3] else ""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, int(port_text)))
     sock.listen(8)
     banner_bytes = (banner + "\n").encode("ascii", "replace")
+    if peer_log:
+        with open(peer_log, "w", encoding="utf-8"):
+            pass
     while True:
-        client, _addr = sock.accept()
+        client, addr = sock.accept()
+        if peer_log:
+            try:
+                with open(peer_log, "a", encoding="utf-8") as handle:
+                    handle.write("peer=%s\n" % addr[0])
+                    handle.flush()
+            except OSError:
+                pass
         try:
             client.sendall(banner_bytes)
         except OSError:
@@ -470,9 +488,57 @@ def _delta(before, after):
     return str(after - before)
 
 
+def _read_peers(path):
+    """Peer addresses already logged, or None when the file is missing."""
+    if not path:
+        return []
+    try:
+        handle = open(path, "r", encoding="utf-8")
+    except OSError:
+        return None
+    peers = []
+    with handle:
+        for line in handle:
+            line = line.strip()
+            if line.startswith("peer="):
+                peers.append(line[len("peer=") :])
+    return peers
+
+
+def _is_relay_peer(addr, fixture_host):
+    """Home SOCKS dials from this machine. Loopback is that dial; the
+    fixture address is the same dial when the source is the lo0 alias.
+    """
+    if addr == "::1" or addr.startswith("127."):
+        return True
+    return bool(fixture_host) and addr == fixture_host
+
+
+def _classify_peers(addrs, fixture_host):
+    if addrs is None:
+        return "missing", ""
+    if not addrs:
+        return "none", ""
+    flags = [_is_relay_peer(addr, fixture_host) for addr in addrs]
+    shown = ",".join(addrs)
+    if all(flags):
+        return "relay", shown
+    if any(flags):
+        return "mixed", shown
+    return "direct", shown
+
+
 def cmd_egress(argv):
-    """AI flow should move segue_relay_connects_home; a non-AI flow should not."""
+    """AI flow should move segue_relay_connects_home and arrive at the fixture from the home SOCKS path.
+
+    A non-AI flow should not move connects_home or connects_overseas, and
+    should not be accepted by the fixture. argv[6] is the peer log;
+    argv[7] is the fixture address (a local source, not a bypass).
+    """
     fake_ip, fake_port, metrics_port, other_host, other_port, loopback_port = argv[:6]
+    peer_log = argv[6] if len(argv) > 6 else ""
+    fixture_host = argv[7] if len(argv) > 7 else ""
+    peers_before = _read_peers(peer_log)
     home_before = metric_value(metrics_port, "connects_home")
     overseas_before = metric_value(metrics_port, "connects_overseas")
     ai_connect = held_connect(fake_ip, fake_port, 1.5, 5.0)
@@ -480,6 +546,12 @@ def cmd_egress(argv):
     ai_overseas = _delta(
         overseas_before, metric_value(metrics_port, "connects_overseas")
     )
+    peers_after_ai = _read_peers(peer_log)
+    if peers_before is None or peers_after_ai is None:
+        ai_new = None
+    else:
+        ai_new = peers_after_ai[len(peers_before) :]
+    ai_peer, ai_peer_addr = _classify_peers(ai_new, fixture_host)
     other_home_before = metric_value(metrics_port, "connects_home")
     other_overseas_before = metric_value(metrics_port, "connects_overseas")
     other_connect = held_connect(other_host, other_port, 0.2, 1.5)
@@ -489,6 +561,12 @@ def cmd_egress(argv):
     other_overseas = _delta(
         other_overseas_before, metric_value(metrics_port, "connects_overseas")
     )
+    peers_after_other = _read_peers(peer_log)
+    if peers_after_ai is None or peers_after_other is None:
+        other_new = None
+    else:
+        other_new = peers_after_other[len(peers_after_ai) :]
+    other_peer, other_peer_addr = _classify_peers(other_new, fixture_host)
     try:
         sock = socket.create_connection(("127.0.0.1", int(loopback_port)), 2.0)
         sock.close()
@@ -498,9 +576,13 @@ def cmd_egress(argv):
     print("ai_connect=%s" % ai_connect)
     print("ai_home_delta=%s" % ai_home)
     print("ai_overseas_delta=%s" % ai_overseas)
+    print("ai_peer=%s" % ai_peer)
+    print("ai_peer_addr=%s" % (ai_peer_addr or "-"))
     print("other_connect=%s" % other_connect)
     print("other_home_delta=%s" % other_home)
     print("other_overseas_delta=%s" % other_overseas)
+    print("other_peers=%s" % other_peer)
+    print("other_peer_addr=%s" % (other_peer_addr or "-"))
     print("loopback=%s" % loopback)
     return 0
 

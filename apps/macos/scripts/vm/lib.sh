@@ -370,6 +370,10 @@ log_tail() {
   fi
 }
 
+now_ms() {
+  /usr/bin/python3 -c 'import time; print(int(time.time() * 1000))'
+}
+
 # Printed on every FAIL row. Dry-run lists the same commands via plan_fail_probes.
 capture_fail_context() {
   {
@@ -1085,24 +1089,16 @@ remove_carrier_alias() {
 }
 
 hosts_install() {
-  # No /etc/hosts line: it also changes what the CLIENT's system resolver
-  # returns (run 11 saw 198.51.100.10 for the armed name from dscacheutil).
-  # The fixture server maps the name in its own Xray-style dns.hosts and
-  # its freedom outbound resolves with UseIP. Only strip a stale line.
+  # No /etc/hosts line. Run 11: that line made the client's system resolver
+  # return ${FIXTURE_HOST}, so the fake-IP checks failed and an app would
+  # have dialled the alias directly. The relay cannot use the system
+  # resolver either: /etc/resolver sends this suffix to the kernel, which
+  # answers with a 198.18.0.0/15 fake-IP, and the relay SSRF-blocks that
+  # range. The fixture server's dns.hosts is not consulted: segue-relay
+  # resolves to an IP before the home SOCKS CONNECT. build_relay_hosts is
+  # the relay-only map. Only strip a stale line.
   hosts_remove
   return 0
-  local line="${FIXTURE_HOST} www.${FIXTURE_SUFFIX} # segue-vm-matrix"
-  if dry; then
-    note "hosts line so segue-relay resolves www.${FIXTURE_SUFFIX} to ${FIXTURE_HOST}; dig does not read /etc/hosts, so fake-IP checks stay on the kernel resolver"
-    priv /bin/sh -c "printf '%s\n' '${line}' >> /etc/hosts"
-    return 0
-  fi
-  if /usr/bin/grep -q 'segue-vm-matrix' /etc/hosts 2>/dev/null; then
-    return 0
-  fi
-  printf '%s\n' "$line" >> /etc/hosts || return 1
-  /usr/bin/dscacheutil -flushcache >/dev/null 2>&1 || true
-  /usr/bin/killall -HUP mDNSResponder >/dev/null 2>&1 || true
 }
 
 hosts_remove() {
@@ -1151,6 +1147,46 @@ wait_listen() {
 # signed bundle, kernel.json, lo0 alias and the AI fixture host. Runs
 # before arm so the helper finds a complete config the moment it starts
 # the kernel.
+
+# Compile the relay-only resolver and prove it answers the fixture name
+# with the lo0 alias, and still answers 127.0.0.1 as itself. The dylib is
+# not inserted into this check by the dynamic linker of a restricted
+# parent: the same bash wrapper start_relay uses sets DYLD_INSERT_LIBRARIES.
+build_relay_hosts() {
+  local dylib="${WORK}/state/relay-hosts.dylib"
+  local check="${WORK}/state/relay-hosts-check"
+  local name_flag="-DFIXTURE_NAME=\"www.${FIXTURE_SUFFIX}\""
+  local addr_flag="-DFIXTURE_ADDR=\"${FIXTURE_HOST}\""
+  if dry; then
+    plan /usr/bin/cc -dynamiclib -o "$dylib" "$name_flag" "$addr_flag" "${VM_DIR}/relay_hosts.c"
+    plan /usr/bin/cc -o "$check" "${VM_DIR}/relay_hosts_check.c"
+    plan /bin/bash -c 'export DYLD_INSERT_LIBRARIES="$1"; shift; exec "$@"' relay-hosts "$dylib" "$check" "www.${FIXTURE_SUFFIX}"
+    plan /bin/bash -c 'export DYLD_INSERT_LIBRARIES="$1"; shift; exec "$@"' relay-hosts "$dylib" "$check" 127.0.0.1
+    note "relay_hosts.dylib is inserted into segue-relay only. getaddrinfo of www.${FIXTURE_SUFFIX} returns ${FIXTURE_HOST}; every other name uses the system resolver. /etc/hosts is not used."
+    return 0
+  fi
+  mkdir -p "${WORK}/state"
+  /usr/bin/cc -dynamiclib -o "$dylib" "$name_flag" "$addr_flag" "${VM_DIR}/relay_hosts.c" || return 1
+  /usr/bin/cc -o "$check" "${VM_DIR}/relay_hosts_check.c" || return 1
+  local got got_lo
+  got=$(/bin/bash -c 'export DYLD_INSERT_LIBRARIES="$1"; shift; exec "$@"' relay-hosts "$dylib" "$check" "www.${FIXTURE_SUFFIX}") || return 1
+  got_lo=$(/bin/bash -c 'export DYLD_INSERT_LIBRARIES="$1"; shift; exec "$@"' relay-hosts "$dylib" "$check" 127.0.0.1) || return 1
+  if [[ "$got" != "$FIXTURE_HOST" || "$got_lo" != "127.0.0.1" ]]; then
+    echo "relay hosts dylib: www.${FIXTURE_SUFFIX}='${got}' (want ${FIXTURE_HOST}) 127.0.0.1='${got_lo}'" >&2
+    return 1
+  fi
+}
+
+# nohup strips DYLD_INSERT_LIBRARIES (it is a restricted binary). bash sets
+# the variable and execs, and that exec keeps it. After exec the pid's
+# comm is segue-relay, which kill_pidfile matches.
+start_relay() {
+  start_bg "${WORK}/state/relay.pid" /bin/bash -c \
+    'export DYLD_INSERT_LIBRARIES="$1"; shift; exec "$@"' \
+    relay-hosts "${WORK}/state/relay-hosts.dylib" \
+    "${RELAY_DST}" run "${WORK}/state/relay.json"
+}
+
 prepare_kernel_stack() {
   write_server_config
   if exit_via_alias; then
@@ -1161,20 +1197,22 @@ prepare_kernel_stack() {
   if dry; then
     sign_bundle || return 1
     hosts_install || return 1
+    build_relay_hosts || return 1
     plan "${SEGUE_DST}" run -config "${WORK}/state/fixture-server.json"
-    plan "${RELAY_DST}" run "${WORK}/state/relay.json"
+    start_relay
     if exit_via_alias; then
       plan /usr/bin/python3 "$PROBES" forward "$CARRIER_HOST" "$RELAY_PORT" 127.0.0.1 "$RELAY_PORT"
     fi
     priv /sbin/ifconfig lo0 alias "${FIXTURE_HOST}" netmask 255.255.255.0
-    plan /usr/bin/python3 "$PROBES" serve "${FIXTURE_HOST}" "$FIXTURE_TCP_PORT" ai-host
+    plan /usr/bin/python3 "$PROBES" serve "${FIXTURE_HOST}" "$FIXTURE_TCP_PORT" ai-host "${WORK}/state/ai-host.peers"
     return 0
   fi
   sign_bundle || return 1
   hosts_install || return 1
+  build_relay_hosts || return 1
   start_bg "${WORK}/state/fixture.pid" "${SEGUE_DST}" run -config "${WORK}/state/fixture-server.json" || return 1
   wait_listen 127.0.0.1 "$SOCKS_PORT" "${WORK}/state/fixture.pid" "home socks" || return 1
-  start_bg "${WORK}/state/relay.pid" "${RELAY_DST}" run "${WORK}/state/relay.json" || return 1
+  start_relay || return 1
   wait_listen 127.0.0.1 "$RELAY_PORT" "${WORK}/state/relay.pid" "segue-relay" || return 1
   if exit_via_alias; then
     start_bg "${WORK}/state/carrier.pid" /usr/bin/python3 "$PROBES" forward "$CARRIER_HOST" "$RELAY_PORT" 127.0.0.1 "$RELAY_PORT" || return 1
@@ -1183,7 +1221,7 @@ prepare_kernel_stack() {
   if ! /sbin/ifconfig lo0 | grep -q '198\.51\.100\.10'; then
     /sbin/ifconfig lo0 alias "${FIXTURE_HOST}" netmask 255.255.255.0 || return 1
   fi
-  start_bg "${WORK}/state/ai-host.pid" /usr/bin/python3 "$PROBES" serve "${FIXTURE_HOST}" "$FIXTURE_TCP_PORT" ai-host || return 1
+  start_bg "${WORK}/state/ai-host.pid" /usr/bin/python3 "$PROBES" serve "${FIXTURE_HOST}" "$FIXTURE_TCP_PORT" ai-host "${WORK}/state/ai-host.peers" || return 1
   UTUN_BEFORE=" $(utun_list) "
 }
 
@@ -1535,13 +1573,14 @@ row_connected() {
     system_resolve "www.${FIXTURE_SUFFIX}" || true
     plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/python3 "$PROBES" dns 127.0.0.1 "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}"
-    plan /usr/bin/python3 "$PROBES" egress 198.18.0.1 "$FIXTURE_TCP_PORT" "$RELAY_METRICS_PORT" "$UNLISTED_HOST" "$UNLISTED_PORT" "$LOOPBACK_PORT"
+    plan /usr/bin/python3 "$PROBES" egress 198.18.0.1 "$FIXTURE_TCP_PORT" "$RELAY_METRICS_PORT" "$UNLISTED_HOST" "$UNLISTED_PORT" "$LOOPBACK_PORT" "${WORK}/state/ai-host.peers" "$FIXTURE_HOST"
     plan /usr/bin/python3 "$PROBES" relay-metrics "$RELAY_METRICS_PORT"
-    note "relay metrics: the relay writes HTTP/1.0 200 on accept and does not read a request. The probe reads that banner; sending a request first is reset and the counter is missing."
+    note "relay metrics: the relay writes HTTP/1.0 200 on accept and does not read a request. The probe reads that banner; sending a request first is reset and the counter is missing. segue_relay_connects_home increments once the home SOCKS dial succeeds; segue_relay_connects_overseas is a direct connect; segue_relay_ssrf_blocked is a resolved address the guard refused. GET /v1/status has no per-flow counter."
+    note "egress proof: the fixture TCP server logs the peer. The AI flow must be accepted from the home SOCKS path (127.0.0.1, or ${FIXTURE_HOST} when the source is the lo0 alias). The non-AI flow must not be accepted there. A utun or en0 peer is not the relay path."
     if [[ -n "${ARM_BLOCK:-}" ]]; then
       note "blocked_by=${ARM_BLOCK}: the arm failed, so this row re-sends the socket arm and waits for the kernel itself; if it never comes up the row is FAIL with blocked_by=${ARM_BLOCK}, not SKIP"
     fi
-    record "$name" DRY-RUN "the kernel arm started is up: resolver file is nameserver 127.0.0.1 port ${KERNEL_DNS_PORT}; getaddrinfo/dscacheutil of www.${FIXTURE_SUFFIX} is a 198.18.0.0/15 fake-IP; dig @127.0.0.1 -p ${KERNEL_DNS_PORT} is the same fake-IP; a TCP connection to that address increments segue_relay_connects_home (metrics banner read on accept, no request); a non-AI address does not increment connects_home or connects_overseas; loopback still connects."
+    record "$name" DRY-RUN "the kernel arm started is up: resolver file is nameserver 127.0.0.1 port ${KERNEL_DNS_PORT}; getaddrinfo/dscacheutil of www.${FIXTURE_SUFFIX} is a 198.18.0.0/15 fake-IP; dig @127.0.0.1 -p ${KERNEL_DNS_PORT} is the same fake-IP; a TCP connection to that address increments segue_relay_connects_home (metrics banner read on accept, no request) and the fixture server's new peer is the home SOCKS path; a non-AI address does not increment connects_home or connects_overseas and is not accepted by the fixture; loopback still connects."
     return 0
   fi
   if ! kernel_pidfile_alive; then
@@ -1581,7 +1620,7 @@ ${kern_dig}
 dns:${dns}"
     return 0
   fi
-  egress=$(/usr/bin/python3 "$PROBES" egress "$ip" "$FIXTURE_TCP_PORT" "$RELAY_METRICS_PORT" "$UNLISTED_HOST" "$UNLISTED_PORT" "$LOOPBACK_PORT" 2>&1 || true)
+  egress=$(/usr/bin/python3 "$PROBES" egress "$ip" "$FIXTURE_TCP_PORT" "$RELAY_METRICS_PORT" "$UNLISTED_HOST" "$UNLISTED_PORT" "$LOOPBACK_PORT" "${WORK}/state/ai-host.peers" "$FIXTURE_HOST" 2>&1 || true)
   local evidence="utun=${utun}
 dns:${dns}
 egress:
@@ -1591,8 +1630,10 @@ $(log_tail "${WORK}/logs/relay.pid.log")"
   # Match whole lines. A missing key must not look like a zero delta.
   if printf '%s\n' "$egress" | grep -qx 'ai_connect=ok' \
     && printf '%s\n' "$egress" | grep -Eq '^ai_home_delta=[1-9][0-9]*$' \
+    && printf '%s\n' "$egress" | grep -qx 'ai_peer=relay' \
     && printf '%s\n' "$egress" | grep -qx 'other_home_delta=0' \
     && printf '%s\n' "$egress" | grep -qx 'other_overseas_delta=0' \
+    && printf '%s\n' "$egress" | grep -qx 'other_peers=none' \
     && printf '%s\n' "$egress" | grep -qx 'loopback=ok'; then
     record "$name" PASS "$evidence"
   else
@@ -1620,7 +1661,8 @@ row_kill_kernel() {
       note "blocked_by=${ARM_BLOCK}: no kernel pid file means the arm never brought one up; this row retries that itself and is FAIL with blocked_by=${ARM_BLOCK} if there is still no kernel to kill"
     fi
     note "SIGTERM is the kernel's clean shutdown (exit 0, log line 'SIGTERM, stopped'). The supervisor does not restart that. Run 10's utun field 'gone=no' means the interface was not still present. A crash (non-zero, or a signal other than SIGTERM/SIGINT) does restart: utun coming back is then expected, and the row scores the new pid instead of the guard."
-    record "$name" DRY-RUN "SIGTERM the kernel. The killed pid is gone. During the gap getaddrinfo/dscacheutil returns no real address (guard empty, or a 198.18.0.0/15 fake-IP) and the fixture CIDR is not reachable on the physical NIC. Clean SIGTERM is not restarted: steady state is the guard (resolution returns nothing, dig @127.0.0.1 -p ${GUARD_PORT} empty NOERROR, tunnel down so the CIDR is a PF drop, example.com is a real address). If a new pid appears, posture is connected again, the system resolver is a fake-IP, dig @127.0.0.1 -p ${KERNEL_DNS_PORT} is that fake-IP, and the CIDR route is a utun (not a PF drop)."
+    note "The row records millisecond timestamps of the kill, the pid's exit, whether the utun is still present at the gap probe, and the steady probe, plus whether segue-kernel is running then. The PF drop is required only while the kernel is not running. A TCP timeout to ${FIXTURE_HOST} is not itself a drop: that address is TEST-NET and the default route also times out. The counter has to move. The helper used to reload this anchor every 250ms after the exit, which zeroed the counter; an unchanged anchor body is not reloaded."
+    record "$name" DRY-RUN "SIGTERM the kernel. The killed pid is gone. During the gap getaddrinfo/dscacheutil returns no real address (guard empty, or a 198.18.0.0/15 fake-IP) and the fixture CIDR is not reachable on the physical NIC. Clean SIGTERM is not restarted: steady state is the guard (resolution returns nothing, dig @127.0.0.1 -p ${GUARD_PORT} empty NOERROR, tunnel down so the CIDR is a PF drop while segue-kernel is not running, example.com is a real address). If a new pid appears, posture is connected again, the system resolver is a fake-IP, dig @127.0.0.1 -p ${KERNEL_DNS_PORT} is that fake-IP, and the CIDR route is a utun (not a PF drop)."
     return 0
   fi
   if [[ ! -f "${WORK}/state/kernel.pid" ]]; then
@@ -1633,13 +1675,16 @@ $(log_tail "${WORK}/logs/helper.err")"
     return 0
   fi
   local pid utun i dead=no gap_res gap_direct=0 gap_real=0
+  local t_kill t_dead="" t_gap t_steady="" utun_at_gap=unknown kernel_at_steady=unknown
   pid=$(cat "${WORK}/state/kernel.pid")
   utun=$(cat "${WORK}/state/utun.name" 2>/dev/null || true)
+  t_kill=$(now_ms)
   kill -TERM "$pid" 2>/dev/null || true
   i=0
   while [[ "$i" -lt 20 ]]; do
     if ! ps -p "$pid" >/dev/null 2>&1; then
       dead=yes
+      t_dead=$(now_ms)
       break
     fi
     sleep 0.25
@@ -1650,9 +1695,17 @@ $(log_tail "${WORK}/logs/helper.err")"
     sleep 0.5
     if ! ps -p "$pid" >/dev/null 2>&1; then
       dead=yes
+      t_dead=$(now_ms)
     fi
   fi
   rm -f "${WORK}/state/kernel.pid"
+  t_gap=$(now_ms)
+  if [[ -n "$utun" ]]; then
+    case " $(utun_list) " in
+      *" $utun "*) utun_at_gap=present ;;
+      *) utun_at_gap=gone ;;
+    esac
+  fi
   flush_resolver_cache
   gap_res=$(system_resolve "www.${FIXTURE_SUFFIX}")
   if resolve_has_real "$gap_res"; then
@@ -1708,6 +1761,8 @@ $(log_tail "${WORK}/logs/helper.err")"
       ok=0
       why="${why} dig @127.0.0.1 -p ${KERNEL_DNS_PORT} was not a fake-IP after restart."
     fi
+    t_steady=$(now_ms)
+    if kernel_process_down; then kernel_at_steady=down; else kernel_at_steady=running; fi
     if ! cidr_probe up; then
       ok=0
       why="${why} fixture CIDR was not routed into the utun after restart."
@@ -1715,6 +1770,7 @@ $(log_tail "${WORK}/logs/helper.err")"
     evidence="why:${why}
 path=restarted
 pid=${pid} dead=${dead} newpid=${newpid} posture=${posture} utun=${utun}
+timeline_ms kill=${t_kill} dead=${t_dead:-never} utun_at_gap=${utun_at_gap} gap_probe=${t_gap} steady_probe=${t_steady} kernel_at_steady=${kernel_at_steady}
 --- gap resolver ---
 ${gap_res}
 --- gap cidr ---
@@ -1762,13 +1818,20 @@ ${CIDR_EVIDENCE}"
       ok=0
       why="${why} non-AI loopback TCP failed."
     fi
-    if ! cidr_probe down; then
-      ok=0
-      why="${why} fixture CIDR was not PF-dropped with the tunnel down."
+    t_steady=$(now_ms)
+    if kernel_process_down; then
+      kernel_at_steady=down
+      if ! cidr_probe down; then
+        ok=0
+        why="${why} fixture CIDR was not PF-dropped while segue-kernel was down."
+      fi
+    else
+      kernel_at_steady=running
     fi
     evidence="why:${why}
 path=clean-stop
 pid=${pid} dead=${dead} utun=${utun}
+timeline_ms kill=${t_kill} dead=${t_dead:-never} utun_at_gap=${utun_at_gap} gap_probe=${t_gap} steady_probe=${t_steady} kernel_at_steady=${kernel_at_steady}
 loop:${loop}
 --- gap resolver ---
 ${gap_res}
