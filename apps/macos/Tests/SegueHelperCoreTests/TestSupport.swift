@@ -88,6 +88,7 @@ final class FakeLauncher: ProcessLauncher {
 
     private(set) var procs: [Proc] = []
     private(set) var requests: [[String]] = []
+    private(set) var launchRequests: [LaunchRequest] = []
     private var nextPid: Int32 = 400
     var ignoreTerminate = false
     /// Fires inside `send`, before the exit callback, so a test can see
@@ -99,6 +100,7 @@ final class FakeLauncher: ProcessLauncher {
         onExit: @escaping (Int32, ProcessExit) -> Void
     ) throws -> RunningProcess {
         requests.append(request.arguments)
+        launchRequests.append(request)
         let pid = nextPid
         let proc = Proc(pid: pid, onExit: onExit)
         proc.ignoreTerminate = ignoreTerminate

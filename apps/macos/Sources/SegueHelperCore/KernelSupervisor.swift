@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import SegueHelperProtocol
 
 /// How a child ended. `signal` is an uncaught signal (`terminationReason`).
 public enum ProcessExit: Equatable, Sendable {
@@ -65,9 +66,15 @@ public enum KernelExitCode: Equatable, Sendable {
 
 public struct LaunchRequest: Equatable, Sendable {
     public var arguments: [String]
+    /// Where the child's stdout/stderr are appended (the kernel log dir).
+    /// Nil sends both to `/dev/null`, as before the capture existed.
+    public var stdoutPath: String?
+    public var stderrPath: String?
 
-    public init(arguments: [String]) {
+    public init(arguments: [String], stdoutPath: String? = nil, stderrPath: String? = nil) {
         self.arguments = arguments
+        self.stdoutPath = stdoutPath
+        self.stderrPath = stderrPath
     }
 }
 
@@ -104,6 +111,10 @@ public struct KernelSnapshot: Equatable, Sendable {
     public var state: String
     public var pid: Int32?
     public var lastExit: String?
+    /// Tail of `kernel.stderr` (≤2 KiB, redacted), published only while
+    /// the state is `kernel_failed` — the one state whose cause the exit
+    /// code alone does not name.
+    public var lastStderr: String?
     /// The utun the kernel's control API names, published only while the
     /// supervisor's child is running. Nil when the kernel is down or not
     /// answering.
@@ -118,12 +129,14 @@ public struct KernelSnapshot: Equatable, Sendable {
         state: String,
         pid: Int32?,
         lastExit: String?,
+        lastStderr: String? = nil,
         tunInterface: String? = nil,
         dnsAddress: String? = nil
     ) {
         self.state = state
         self.pid = pid
         self.lastExit = lastExit
+        self.lastStderr = lastStderr
         self.tunInterface = tunInterface
         self.dnsAddress = dnsAddress
     }
@@ -163,6 +176,13 @@ public enum LaunchError: Error, Equatable {
 /// live kernel named in a leftover pid file (a previous helper died
 /// without stopping it) takes that process over before spawning, because
 /// a fresh child could not bind the ports the orphan still holds.
+///
+/// The child's stdout and stderr are appended to `kernel.stdout` /
+/// `kernel.stderr` in the kernel log dir (the `--log` file's directory),
+/// mode 0600 and rotated by the launcher at 1 MiB, so a crash that only
+/// prints its cause still leaves it on disk. While the state is
+/// `kernel_failed` the snapshot also carries the last 2 KiB of stderr,
+/// redacted, as `lastStderr`.
 public final class KernelSupervisor: KernelControlling {
     public let kernelPath: String
     public let configPath: String
@@ -233,10 +253,15 @@ public final class KernelSupervisor: KernelControlling {
                 if status.state == "connected" { dnsAddress = dnsListen }
             }
         }
+        var lastStderr: String?
+        if case .kernelFailed = phase {
+            lastStderr = Self.redactedStderrTail(stderrCapturePath)
+        }
         return KernelSnapshot(
             state: phase.stateName,
             pid: pid,
             lastExit: lastExit?.stateName,
+            lastStderr: lastStderr,
             tunInterface: tunInterface,
             dnsAddress: dnsAddress
         )
@@ -310,9 +335,13 @@ public final class KernelSupervisor: KernelControlling {
 
     /// Caller holds `lock`.
     private func launchLocked() throws {
-        let request = LaunchRequest(arguments: [
-            kernelPath, "run", "--state-dir", stateDir, "--log", logPath, configPath,
-        ])
+        let request = LaunchRequest(
+            arguments: [
+                kernelPath, "run", "--state-dir", stateDir, "--log", logPath, configPath,
+            ],
+            stdoutPath: stdoutCapturePath,
+            stderrPath: stderrCapturePath
+        )
         let proc = try launcher.launch(request) { [weak self] pid, exit in
             self?.handleExit(pid: pid, exit: exit)
         }
@@ -349,6 +378,38 @@ public final class KernelSupervisor: KernelControlling {
     }
 
     private var pidFilePath: String { stateDir + "/kernel.pid" }
+
+    /// The kernel log dir (the `--log` file's directory) also holds the
+    /// captured child output: `kernel.stdout` / `kernel.stderr` next to
+    /// `kernel.log`.
+    private var logDirectory: String { (logPath as NSString).deletingLastPathComponent }
+    private var stdoutCapturePath: String { logDirectory + "/kernel.stdout" }
+    private var stderrCapturePath: String { logDirectory + "/kernel.stderr" }
+
+    /// Last `stderrTailBytes` of the capture file, redacted. The redaction
+    /// is the same one diagnostics export uses; the tail is what a
+    /// `kernel_failed` row can show without shipping the whole log.
+    private static func redactedStderrTail(_ path: String) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else {
+            return nil
+        }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        guard size > 0 else { return nil }
+        let window = UInt64(stderrTailBytes)
+        let start = size > window ? size - window : 0
+        guard (try? handle.seek(toOffset: start)) != nil,
+              let data = try? handle.read(upToCount: stderrTailBytes),
+              !data.isEmpty
+        else { return nil }
+        let text = String(decoding: data, as: UTF8.self)
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return DiagnosticsRedactor.redact(text, home: NSHomeDirectory())
+    }
+
+    /// The `kernel_failed` status carries at most this many bytes of the
+    /// captured stderr.
+    private static let stderrTailBytes = 2 * 1_024
 
     // MARK: - files and process facts
 

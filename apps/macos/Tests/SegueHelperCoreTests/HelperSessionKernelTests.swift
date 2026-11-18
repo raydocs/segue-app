@@ -267,6 +267,23 @@ final class HelperSessionKernelTests: XCTestCase {
         XCTAssertEqual(try IntentStore(fileURL: rig.intentURL).load()?.armed, true)
     }
 
+    func testStatusReadCarriesTheRedactedStderrTailWhenKernelFailed() throws {
+        let rig = try KernelRig(restartLimit: 1)
+        rig.control.status = nil
+        // What the captured kernel.stderr would hold after the crash loop.
+        try Data("listener failed: Bearer abcdefghijklmnop\n".utf8)
+            .write(to: rig.directory.appendingPathComponent("kernel.stderr"))
+        _ = try rig.session.handle(rig.armEnvelope())
+        rig.launcher.latest.finish(.code(1))
+        rig.launcher.latest.finish(.code(1))
+        XCTAssertEqual(rig.supervisor.snapshot().state, "kernel_failed")
+        let reply = try rig.session.handle(HelperEnvelope.statusRead())
+        XCTAssertEqual(reply.status?.kernel?.state, "kernel_failed")
+        let tail = try XCTUnwrap(reply.status?.kernel?.lastStderr)
+        XCTAssertTrue(tail.contains("listener failed"))
+        XCTAssertNil(tail.range(of: "abcdefghijklmnop"), "the tail is redacted on the wire")
+    }
+
     // MARK: helper restart
 
     func testHelperRestartWithArmedIntentReArmsAndStartsTheKernel() throws {
