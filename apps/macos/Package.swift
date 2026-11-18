@@ -8,13 +8,28 @@ let package = Package(
     ],
     products: [
         .library(name: "SegueKit", targets: ["SegueKit"]),
+        .library(name: "SegueHelperProtocol", targets: ["SegueHelperProtocol"]),
+        .library(name: "SegueHelperCore", targets: ["SegueHelperCore"]),
         .executable(name: "Segue", targets: ["Segue"]),
+        .executable(name: "segue-core-helper", targets: ["SegueCoreHelper"]),
     ],
     targets: [
-        .target(name: "SegueKit"),
+        .target(name: "SegueHelperProtocol"),
+        .target(
+            name: "SegueKit",
+            dependencies: ["SegueHelperProtocol"]
+        ),
+        .target(
+            name: "SegueHelperCore",
+            dependencies: ["SegueHelperProtocol"]
+        ),
         .executableTarget(
             name: "Segue",
             dependencies: ["SegueKit"]
+        ),
+        .executableTarget(
+            name: "SegueCoreHelper",
+            dependencies: ["SegueHelperCore"]
         ),
         .testTarget(
             name: "SegueKitTests",
@@ -22,6 +37,10 @@ let package = Package(
             resources: [
                 .copy("Fixtures"),
             ]
+        ),
+        .testTarget(
+            name: "SegueHelperCoreTests",
+            dependencies: ["SegueHelperCore"]
         ),
     ]
 )
