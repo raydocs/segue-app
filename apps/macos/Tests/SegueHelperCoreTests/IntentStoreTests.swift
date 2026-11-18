@@ -72,6 +72,7 @@ final class HelperPathsTests: XCTestCase {
         XCTAssertEqual(paths.guardPort, 5354)
         XCTAssertEqual(paths.pfConfPath, "/etc/pf.conf")
         XCTAssertEqual(paths.resolverDirectory, "/etc/resolver")
+        XCTAssertEqual(paths.pfctlPath, "/sbin/pfctl")
         XCTAssertEqual(paths.requirement, "")
     }
 
@@ -81,6 +82,8 @@ final class HelperPathsTests: XCTestCase {
             "--paths-root", "/tmp/segue-dev",
             "--socket", "/tmp/explicit.sock",
             "--guard-port", "15354",
+            "--ai-lock", "/tmp/segue-dev/ai-lock.fixture.txt",
+            "--pfctl", "/tmp/segue-dev/bin/pfctl",
             "--requirement", "identifier \"com.example.dev\"",
         ])
         XCTAssertEqual(paths.socketPath, "/tmp/explicit.sock")
@@ -91,9 +94,10 @@ final class HelperPathsTests: XCTestCase {
         XCTAssertEqual(paths.kernelLogPath, "/tmp/segue-dev/kernel.log")
         XCTAssertEqual(paths.controlTokenPath, "/tmp/segue-dev/kernel/control.json")
         XCTAssertEqual(paths.allowedUIDFile, "/tmp/segue-dev/allowed-uid")
-        XCTAssertEqual(paths.aiLockPath, "/tmp/segue-dev/ai-lock.txt")
-        XCTAssertEqual(paths.pfConfPath, "/tmp/segue-dev/pf.conf")
-        XCTAssertEqual(paths.resolverDirectory, "/tmp/segue-dev/resolver")
+        XCTAssertEqual(paths.aiLockPath, "/tmp/segue-dev/ai-lock.fixture.txt")
+        XCTAssertEqual(paths.pfConfPath, "/tmp/segue-dev/etc/pf.conf")
+        XCTAssertEqual(paths.resolverDirectory, "/tmp/segue-dev/etc/resolver")
+        XCTAssertEqual(paths.pfctlPath, "/tmp/segue-dev/bin/pfctl")
         XCTAssertEqual(paths.guardPort, 15354)
         XCTAssertEqual(paths.requirement, "identifier \"com.example.dev\"")
     }

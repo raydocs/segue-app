@@ -208,6 +208,9 @@ public struct HelperStatus: Codable, Equatable, Sendable {
     public var resolverFilesPresent: Bool?
     public var guardListening: Bool?
     public var dnsMode: String?
+    /// Set while armed when the AI list file is missing or does not parse.
+    /// A failed list is not installed as an empty one.
+    public var aiListError: String?
 
     enum CodingKeys: String, CodingKey {
         case armed
@@ -224,6 +227,7 @@ public struct HelperStatus: Codable, Equatable, Sendable {
         case resolverFilesPresent = "resolver_files"
         case guardListening = "guard_listening"
         case dnsMode = "dns_mode"
+        case aiListError = "ai_list_error"
     }
 
     public init(
@@ -240,7 +244,8 @@ public struct HelperStatus: Codable, Equatable, Sendable {
         anchorLoaded: Bool? = nil,
         resolverFilesPresent: Bool? = nil,
         guardListening: Bool? = nil,
-        dnsMode: String? = nil
+        dnsMode: String? = nil,
+        aiListError: String? = nil
     ) {
         self.armed = armed
         self.generation = generation
@@ -256,6 +261,7 @@ public struct HelperStatus: Codable, Equatable, Sendable {
         self.resolverFilesPresent = resolverFilesPresent
         self.guardListening = guardListening
         self.dnsMode = dnsMode
+        self.aiListError = aiListError
     }
 }
 

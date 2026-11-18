@@ -15,8 +15,9 @@ public struct HelperPaths: Equatable, Sendable {
     /// the state dir when it is relative.
     public var controlTokenPath: String
     public var allowedUIDFile: String
-    /// Built-in AI lock list (`suffix` / `cidr` lines). Missing means an
-    /// empty list: the anchor passes everything and no resolver files exist.
+    /// Built-in AI lock list (`suffix` / `cidr` lines). Reread on every arm.
+    /// A missing file or a parse error while armed is `ai_list_error`, not
+    /// an empty list.
     public var aiLockPath: String
     /// Loopback DNS guard. Production is 5354; a dev run passes a port above 1024.
     public var guardPort: UInt16
@@ -25,6 +26,9 @@ public struct HelperPaths: Equatable, Sendable {
     public var pfConfPath: String
     /// `/etc/resolver` in production. A dev run points this at a temp directory.
     public var resolverDirectory: String
+    /// `pfctl` binary. Production is `/sbin/pfctl`. `--pfctl` points a dev run
+    /// at a recording stand-in so the anchor text can be checked without root.
+    public var pfctlPath: String
     /// Empty means the production Developer ID requirement. A non-empty value
     /// is what the daemon evaluates instead (the same escape the release
     /// daemon has) so an unsigned dev build can answer `status_read`.
@@ -43,6 +47,7 @@ public struct HelperPaths: Equatable, Sendable {
         guardPort: UInt16 = 5354,
         pfConfPath: String = "/etc/pf.conf",
         resolverDirectory: String = "/etc/resolver",
+        pfctlPath: String = "/sbin/pfctl",
         requirement: String = ""
     ) {
         self.socketPath = socketPath
@@ -57,6 +62,7 @@ public struct HelperPaths: Equatable, Sendable {
         self.guardPort = guardPort
         self.pfConfPath = pfConfPath
         self.resolverDirectory = resolverDirectory
+        self.pfctlPath = pfctlPath
         self.requirement = requirement
     }
 
@@ -112,6 +118,8 @@ public struct HelperPaths: Equatable, Sendable {
                 }
             case "--pf-conf":
                 if let next { paths.pfConfPath = next; index += 1 }
+            case "--pfctl":
+                if let next { paths.pfctlPath = next; index += 1 }
             case "--resolver-dir":
                 if let next { paths.resolverDirectory = next; index += 1 }
             case "--requirement":
@@ -143,7 +151,7 @@ public struct HelperPaths: Equatable, Sendable {
         paths.controlTokenPath = base + "/kernel/control.json"
         paths.allowedUIDFile = base + "/allowed-uid"
         paths.aiLockPath = base + "/ai-lock.txt"
-        paths.pfConfPath = base + "/pf.conf"
-        paths.resolverDirectory = base + "/resolver"
+        paths.pfConfPath = base + "/etc/pf.conf"
+        paths.resolverDirectory = base + "/etc/resolver"
     }
 }

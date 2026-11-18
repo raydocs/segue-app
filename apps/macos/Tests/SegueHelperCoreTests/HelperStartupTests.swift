@@ -239,6 +239,178 @@ final class HelperStartupTests: XCTestCase {
         )
     }
 
+    /// The matrix starts the helper, then writes `ai-lock.fixture.txt`, then
+    /// arms on the socket. The anchor text, the resolver file, and the guard
+    /// must follow that file: tunnel while the fake kernel is connected,
+    /// guard after it is killed. `ai_layer` is never `degraded`.
+    func testMatrixFixtureArmsTunnelThenGuard() throws {
+        guard let binary = Self.builtHelper() else {
+            XCTFail("segue-core-helper was not built; run swift build before swift test")
+            return
+        }
+        let requirement = try XCTUnwrap(
+            Self.ownRequirement(),
+            "this process has no designated requirement to admit itself"
+        )
+        let root = URL(fileURLWithPath: "/tmp/segue-r5-\(UInt32.random(in: 0...UInt32.max))", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let kernelDir = root.appendingPathComponent("kernel")
+        let binDir = root.appendingPathComponent("bin")
+        let pfDir = root.appendingPathComponent("pfctl")
+        try FileManager.default.createDirectory(at: kernelDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: pfDir, withIntermediateDirectories: true)
+        let script = binDir.appendingPathComponent("segue-kernel")
+        try Data(Self.fakeKernelScript.utf8).write(to: script)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o755))],
+            ofItemAtPath: script.path
+        )
+        let pfctl = binDir.appendingPathComponent("pfctl")
+        try Data(Self.fakePfctlScript.utf8).write(to: pfctl)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o755))],
+            ofItemAtPath: pfctl.path
+        )
+        let kernelDNS = "127.0.0.1:15353"
+        let config: [String: Any] = ["dns": ["listen": kernelDNS]]
+        try JSONSerialization.data(withJSONObject: config).write(to: root.appendingPathComponent("kernel.json"))
+        try Data("\(getuid())\n".utf8).write(to: root.appendingPathComponent("allowed-uid"))
+
+        let port = Self.freeUDPPort()
+        XCTAssertNotEqual(port, 15353)
+        let socket = root.appendingPathComponent("run/service.sock").path
+        let listURL = root.appendingPathComponent("ai-lock.fixture.txt")
+        let resolverFile = root.appendingPathComponent("etc/resolver/ailock-fixture.example.com")
+        let errURL = root.appendingPathComponent("helper.err")
+        FileManager.default.createFile(atPath: errURL.path, contents: nil)
+        let errHandle = try FileHandle(forWritingTo: errURL)
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: binary)
+        process.arguments = [
+            "--paths-root", root.path,
+            "--ai-lock", listURL.path,
+            "--kernel", script.path,
+            "--guard-port", String(port),
+            "--pfctl", pfctl.path,
+            "--requirement", requirement,
+        ]
+        var env = ProcessInfo.processInfo.environment
+        env["SEGUE_FAKE_KERNEL_DELAY"] = "0.3"
+        env["SEGUE_FAKE_PFCTL_DIR"] = pfDir.path
+        process.environment = env
+        process.standardError = errHandle
+        process.standardOutput = errHandle
+        process.standardInput = FileHandle.nullDevice
+        try process.run()
+        defer {
+            if process.isRunning {
+                process.terminate()
+                process.waitUntilExit()
+            }
+            try? errHandle.close()
+        }
+
+        let appeared = Self.waitUntil(seconds: 8) {
+            FileManager.default.fileExists(atPath: socket) || !process.isRunning
+        }
+        XCTAssertTrue(appeared)
+        guard FileManager.default.fileExists(atPath: socket), process.isRunning else {
+            XCTFail("socket missing; helper stderr:\n\(Self.textFile(errURL))")
+            return
+        }
+
+        // The matrix copies this file after launchd has already started the
+        // helper. On current main the list was read once at startup and
+        // stayed empty.
+        try Data(Self.matrixFixture.utf8).write(to: listURL)
+        _ = try Self.roundTrip(socket: socket, line: Self.armLine, timeout: 10)
+
+        var degraded: String?
+        var tunnelLine = ""
+        let tunnel = Self.waitUntil(seconds: 20) {
+            let line: String
+            do {
+                line = try Self.roundTrip(socket: socket, line: #"{"version":1,"kind":"status_read"}"#, timeout: 10)
+            } catch {
+                return false
+            }
+            guard let status = Self.statusBody(line) else { return false }
+            if status["ai_layer"] as? String == "degraded" {
+                degraded = line
+                return true
+            }
+            let file = Self.textFile(resolverFile)
+            let rules = Self.textFile(pfDir.appendingPathComponent("anchor.rules"))
+            let ready = status["ai_layer"] as? String == "tunnel"
+                && status["dns_mode"] as? String == "kernel"
+                && status["tun_interface"] as? String == "utun9"
+                && file.contains("port 15353")
+                && file.contains("nameserver 127.0.0.1")
+                && rules.contains("block drop out quick inet to 198.51.100.0/24")
+            if ready { tunnelLine = line }
+            return ready
+        }
+        if degraded != nil || !tunnel {
+            XCTFail(
+                "expected tunnel, never degraded; degraded=\(degraded ?? "nil") last=\(tunnelLine) stderr:\n\(Self.textFile(errURL))\npfctl:\n\(Self.textFile(pfDir.appendingPathComponent("calls.log")))\nresolver:\n\(Self.textFile(resolverFile))\nfake:\n\(Self.textFile(kernelDir.appendingPathComponent("fake.log")))"
+            )
+            return
+        }
+        XCTAssertNil(Self.statusBody(tunnelLine)?["ai_list_error"])
+        let resolverDir = resolverFile.deletingLastPathComponent().path
+        let attrs = try FileManager.default.attributesOfItem(atPath: resolverDir)
+        let mode = try XCTUnwrap(attrs[.posixPermissions] as? NSNumber)
+        XCTAssertEqual(mode.intValue, 0o755)
+        for qtype in [UInt16(1), UInt16(28)] {
+            let reply = try Self.queryGuard(port: port, name: "www.ailock-fixture.example.com", qtype: qtype)
+            XCTAssertEqual(reply.rcode, 0, "qtype \(qtype)")
+            XCTAssertEqual(reply.ancount, 0, "qtype \(qtype)")
+        }
+
+        try Data(Self.sleepingKernelScript.utf8).write(to: script)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o755))],
+            ofItemAtPath: script.path
+        )
+        let kernelPID = try XCTUnwrap(Self.kernelPID(Self.statusBody(tunnelLine) ?? [:]))
+        XCTAssertEqual(Darwin.kill(pid_t(kernelPID), SIGKILL), 0, "SIGKILL kernel pid \(kernelPID)")
+
+        degraded = nil
+        var guardLine = ""
+        let held = Self.waitUntil(seconds: 20) {
+            let line: String
+            do {
+                line = try Self.roundTrip(socket: socket, line: #"{"version":1,"kind":"status_read"}"#, timeout: 10)
+            } catch {
+                return false
+            }
+            guard let status = Self.statusBody(line) else { return false }
+            if status["ai_layer"] as? String == "degraded" {
+                degraded = line
+                return true
+            }
+            let file = Self.textFile(resolverFile)
+            let ready = status["ai_layer"] as? String == "guard"
+                && status["dns_mode"] as? String == "guard"
+                && file.contains("port \(port)")
+                && !file.contains("port 15353")
+            if ready { guardLine = line }
+            return ready
+        }
+        if degraded != nil || !held {
+            XCTFail(
+                "expected guard after kill, never degraded; degraded=\(degraded ?? "nil") last=\(guardLine) stderr:\n\(Self.textFile(errURL))\nresolver:\n\(Self.textFile(resolverFile))\nfake:\n\(Self.textFile(kernelDir.appendingPathComponent("fake.log")))"
+            )
+            return
+        }
+        let rules = Self.textFile(pfDir.appendingPathComponent("anchor.rules"))
+        XCTAssertTrue(rules.contains("198.51.100.0/24"), rules)
+    }
+
     private static var lastStatus = ""
 
     /// `status_read` until `tun_interface` is utun9 and the kernel pid is set.
@@ -323,6 +495,81 @@ final class HelperStartupTests: XCTestCase {
         if named != 0 { return 35355 }
         return UInt16(bigEndian: latest.sin_port)
     }
+
+    /// Same text `copy_fixture_list` writes. Comments are the matrix's; the
+    /// suffix and CIDR are what the anchor and the guard must arm.
+    private static let matrixFixture = """
+    # VM matrix fixture. Not the product ai-lock.txt (that file is not modified).
+    # The kernel merges ailock-fixture.example.com and 198.51.100.0/24 from the signed
+    # bundle. The helper reads this file because it does not merge a bundle yet.
+    suffix ailock-fixture.example.com
+    cidr 198.51.100.0/24
+
+    """
+
+    private static let armLine = """
+    {"version":1,"kind":"arm","arm":{"schemaVersion":1,"generation":1,"intent":"user_connect","anchor_revision":1,"manifest_digest":"abc","egress":[],"exit_ifaces":[],"strict":false,"evidence":{"posture":"connecting"}}}
+    """
+
+    /// Records anchor stdin and answers `-sr` with it. No root, no real PF.
+    private static let fakePfctlScript = """
+    #!/usr/bin/python3
+    import os, sys
+    logdir = os.environ.get("SEGUE_FAKE_PFCTL_DIR", "")
+    if not logdir:
+        sys.stderr.write("no SEGUE_FAKE_PFCTL_DIR\\n")
+        sys.exit(2)
+    os.makedirs(logdir, exist_ok=True)
+    args = sys.argv[1:]
+    data = sys.stdin.read()
+    rules = os.path.join(logdir, "anchor.rules")
+    with open(os.path.join(logdir, "calls.log"), "a") as fh:
+        fh.write("%r\\n" % (args,))
+        if data:
+            fh.write(data)
+            if not data.endswith("\\n"):
+                fh.write("\\n")
+            fh.write("---\\n")
+    if args == ["-a", "segue.ailock", "-f", "-"]:
+        with open(rules, "w") as fh:
+            fh.write(data)
+        sys.exit(0)
+    if args == ["-a", "segue.ailock", "-sr"]:
+        if os.path.exists(rules):
+            sys.stdout.write(open(rules).read())
+        sys.exit(0)
+    if args == ["-a", "segue.ailock", "-F", "all"]:
+        try:
+            os.remove(rules)
+        except OSError:
+            pass
+        sys.exit(0)
+    sys.stderr.write("unexpected %r\\n" % (args,))
+    sys.exit(1)
+    """
+
+    /// Replacement kernel: stays up, never publishes a carrier, so the
+    /// helper has to hold names on the guard port.
+    private static let sleepingKernelScript = """
+    #!/usr/bin/python3
+    import os, sys, time
+    args = sys.argv[1:]
+    state = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--state-dir" and i + 1 < len(args):
+            state = args[i + 1]
+            i += 2
+            continue
+        i += 1
+    if state:
+        try:
+            os.remove(os.path.join(state, "control.json"))
+        except OSError:
+            pass
+    while True:
+        time.sleep(30)
+    """
 
     /// Fake `segue-kernel`. Delay, then serve the control API. `state` stays
     /// `disconnected` and `tun.interface` stays null until `POST /v1/connect`.

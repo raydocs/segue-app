@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import SegueAILayer
 import SegueHelperProtocol
@@ -58,7 +59,11 @@ enum AILayerError: Error, Equatable {
         case .snapshotUnreadable: return "dns_snapshot_unreadable"
         case .snapshotRefused: return "dns_snapshot_refused"
         case .dnsReadbackMismatch: return "dns_readback_mismatch"
-        case .io: return "io_failed"
+        case .io(let message):
+            // Resolver writes put `errno N:` in the message so status_read
+            // can name the failure. Other io errors stay the short code.
+            if message.hasPrefix("errno ") { return "io_failed \(message)" }
+            return "io_failed"
         }
     }
 
@@ -88,19 +93,49 @@ enum AILayerError: Error, Equatable {
 public final class AILayerController {
     private let commands: SystemCommands
     private let kernel: KernelSupervising
-    private let list: AILockList
+    /// Replaced on every install from `listPath` when that path is set.
+    /// A failed reread keeps the previous list: a parse error must not
+    /// become an empty anchor.
+    private var list: AILockList
     private let paths: AILayerPaths
+    /// Nil in unit tests, which inject `list` directly. Production is the
+    /// `--ai-lock` file, reread because the matrix writes it after the
+    /// helper has already started.
+    private let listPath: String?
+    private let pfctlPath: String
     private let lock = NSLock()
     /// Set when a resolver-file write threw. Cleared by a later successful
     /// write or a completed disarm. `observe` will not report `system`
     /// while this is set.
     private var resolverWriteFailed = false
+    /// Last list-file failure. Nil when the file parsed, including a
+    /// legitimately empty list. Reported as `ai_list_error` while armed.
+    private var aiListError: String?
+    /// Avoid logging the same refusal on every kernel poll.
+    private var loggedListError: String?
 
-    init(commands: SystemCommands, kernel: KernelSupervising, list: AILockList, paths: AILayerPaths) {
+    init(
+        commands: SystemCommands,
+        kernel: KernelSupervising,
+        list: AILockList,
+        paths: AILayerPaths,
+        listPath: String? = nil,
+        pfctlPath: String = SystemPrograms.pfctl
+    ) {
         self.commands = commands
         self.kernel = kernel
         self.list = list
         self.paths = paths
+        self.listPath = listPath
+        self.pfctlPath = pfctlPath
+    }
+
+    /// The list-file failure from the last install, if it did not parse.
+    /// Empty when the file was read, or when no path is configured.
+    func listError() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return aiListError
     }
 
     /// Production wiring. Talks to pfctl, networksetup, and the real
@@ -113,14 +148,16 @@ public final class AILayerController {
         return AILayerController(
             commands: LiveSystemCommands(),
             kernel: kernel,
-            list: loadList(paths.aiLockPath),
+            list: AILockList(),
             paths: AILayerPaths(
                 pfConfPath: paths.pfConfPath,
                 resolverDirectory: paths.resolverDirectory,
                 snapshotPath: snapshot,
                 guardAddress: ResolverFiles.nameserver,
                 guardPort: paths.guardPort
-            )
+            ),
+            listPath: paths.aiLockPath,
+            pfctlPath: paths.pfctlPath
         )
     }
 
@@ -164,6 +201,7 @@ public final class AILayerController {
     /// fell through to the system resolver. The anchor error is still
     /// reported; the names stay held.
     private func install(allowTunnelDNS: Bool) throws {
+        try refreshList()
         let snap = kernel.snapshot()
         let utun = Self.utunName(snap.tunInterface)
         var anchorError: Error?
@@ -243,7 +281,7 @@ public final class AILayerController {
             throw AILayerError.invalidInterface
         }
         _ = try runChecked(
-            program: SystemPrograms.pfctl,
+            program: pfctlPath,
             arguments: ["-a", PFAnchorRenderer.anchorName, "-f", "-"],
             stdin: rules
         )
@@ -252,7 +290,7 @@ public final class AILayerController {
     private func flushAnchor() throws {
         guard try anchorIsLoaded() else { return }
         _ = try runChecked(
-            program: SystemPrograms.pfctl,
+            program: pfctlPath,
             arguments: ["-a", PFAnchorRenderer.anchorName, "-F", "all"],
             stdin: nil
         )
@@ -262,7 +300,7 @@ public final class AILayerController {
         // `pfctl -s Anchors` still lists segue.ailock after `-F all` because
         // the pf.conf hook names it. An empty anchor is not a hold.
         let output = try runChecked(
-            program: SystemPrograms.pfctl,
+            program: pfctlPath,
             arguments: ["-a", PFAnchorRenderer.anchorName, "-sr"],
             stdin: nil
         )
@@ -289,7 +327,7 @@ public final class AILayerController {
                     let existing = try commands.readTextFile(path)
                     if existing == body { continue }
                 }
-                try commands.writeTextFile(path, body)
+                try writeResolverFile(path, body)
             }
             for name in rendered.keys.sorted() {
                 guard let body = rendered[name] else { continue }
@@ -558,17 +596,112 @@ public final class AILayerController {
         return port
     }
 
-    private static func loadList(_ path: String) -> AILockList {
-        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
-            return AILockList()
+    /// Caller holds `lock`. A missing or unreadable file, or a parse error,
+    /// is remembered and thrown. The previous list stays in place so the
+    /// failure cannot install an empty anchor.
+    private func refreshList() throws {
+        guard let listPath else { return }
+        let loaded = Self.readList(path: listPath)
+        if let error = loaded.error {
+            aiListError = error
+            if loggedListError != error {
+                loggedListError = error
+                FileHandle.standardError.write(Data(
+                    "segue-core-helper: ai-lock list refused (\(error))\n".utf8
+                ))
+            }
+            throw AILayerError.io("ai-lock")
+        }
+        list = loaded.list
+        aiListError = nil
+        loggedListError = nil
+    }
+
+    private func writeResolverFile(_ path: String, _ body: String) throws {
+        do {
+            try commands.writeTextFile(path, body)
+        } catch let error as SystemCommandError {
+            if case .io(let message) = error {
+                throw AILayerError.io(message)
+            }
+            throw AILayerError.io("resolver")
+        }
+    }
+
+    private struct ListRead {
+        var list: AILockList
+        var error: String?
+    }
+
+    /// Reads `path` with the errno intact. A parse error is `error` and an
+    /// empty list that the caller must not install. A file that parses,
+    /// even with no entries, has `error == nil`.
+    private static func readList(path: String) -> ListRead {
+        let fd = path.withCString { Darwin.open($0, O_RDONLY | O_CLOEXEC) }
+        if fd < 0 {
+            let err = errno
+            return ListRead(list: AILockList(), error: Self.fileError(path, err))
+        }
+        defer { _ = Darwin.close(fd) }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let n = buffer.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return -1 }
+                return Darwin.read(fd, base, raw.count)
+            }
+            if n < 0 {
+                if errno == EINTR { continue }
+                let err = errno
+                return ListRead(list: AILockList(), error: Self.fileError(path, err))
+            }
+            if n == 0 { break }
+            data.append(contentsOf: buffer.prefix(n))
+        }
+        guard let text = String(data: data, encoding: .utf8) else {
+            return ListRead(list: AILockList(), error: "\(path): not utf-8")
         }
         do {
-            return try AILockList.parse(text)
+            return ListRead(list: try AILockList.parse(text), error: nil)
+        } catch let error as AILockList.Error {
+            return ListRead(list: AILockList(), error: "\(path): \(describe(error))")
         } catch {
-            FileHandle.standardError.write(Data(
-                "segue-core-helper: ai-lock list ignored (\(path))\n".utf8
-            ))
-            return AILockList()
+            return ListRead(list: AILockList(), error: "\(path): \(error)")
+        }
+    }
+
+    private static func fileError(_ path: String, _ err: Int32) -> String {
+        "\(path): \(String(cString: strerror(err))) (errno \(err))"
+    }
+
+    private static func describe(_ error: AILockList.Error) -> String {
+        switch error {
+        case .unknownDirective(let lineNumber, let directive):
+            return "unknown directive \(directive) at line \(lineText(lineNumber))"
+        case .missingValue(let lineNumber, let directive):
+            return "missing value for \(directive) at line \(lineText(lineNumber))"
+        case .extraTokens(let lineNumber):
+            return "extra tokens at line \(lineText(lineNumber))"
+        case .invalidSuffix(let lineNumber, let value):
+            return "invalid suffix \(value) at line \(lineText(lineNumber))"
+        case .invalidCIDR(let lineNumber, let value, let problem):
+            return "invalid cidr \(value) (\(cidrProblem(problem))) at line \(lineText(lineNumber))"
+        }
+    }
+
+    private static func lineText(_ lineNumber: Int?) -> String {
+        if let lineNumber { return String(lineNumber) }
+        return "-"
+    }
+
+    private static func cidrProblem(_ problem: CIDR.ParseProblem) -> String {
+        switch problem {
+        case .notAnAddress: return "not an address"
+        case .missingPrefixLength: return "missing prefix length"
+        case .extraSlashes: return "extra slashes"
+        case .prefixNotNumeric: return "prefix not numeric"
+        case .prefixOutOfRange(let max): return "prefix out of range (max \(max))"
+        case .hostBitsSet: return "host bits set"
         }
     }
 }

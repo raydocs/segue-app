@@ -69,13 +69,90 @@ public final class LiveSystemCommands: SystemCommands {
     }
 
     public func writeTextFile(_ path: String, _ contents: String) throws {
-        let parent = URL(fileURLWithPath: path).deletingLastPathComponent()
-        do {
-            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-            try Data(contents.utf8).write(to: URL(fileURLWithPath: path), options: .atomic)
-        } catch {
-            throw SystemCommandError.io("write \(path)")
+        let parent = URL(fileURLWithPath: path).deletingLastPathComponent().path
+        if parent != "/" && !parent.isEmpty {
+            try ensureDirectory0755(parent)
         }
+        // Temp file sits in the destination directory so rename is atomic
+        // and never crosses a filesystem. A reader sees the old body or
+        // the new one, never a missing file and never a torn write.
+        let tmp = path + ".\(Darwin.getpid()).segue.tmp"
+        let fd: Int32 = tmp.withCString { Darwin.open($0, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0o644) }
+        guard fd >= 0 else {
+            throw SystemCommandError.io(Self.errnoMessage(errno, path))
+        }
+        defer { _ = Darwin.close(fd) }
+        do {
+            try writeAll(fd, Data(contents.utf8), path: path)
+            if Darwin.fsync(fd) != 0 {
+                throw SystemCommandError.io(Self.errnoMessage(errno, path))
+            }
+        } catch {
+            _ = tmp.withCString { Darwin.unlink($0) }
+            throw error
+        }
+        let renamed = tmp.withCString { source in
+            path.withCString { dest in
+                Darwin.rename(source, dest)
+            }
+        }
+        if renamed != 0 {
+            let err = errno
+            _ = tmp.withCString { Darwin.unlink($0) }
+            throw SystemCommandError.io(Self.errnoMessage(err, path))
+        }
+        if path.withCString({ Darwin.chmod($0, 0o644) }) != 0 {
+            throw SystemCommandError.io(Self.errnoMessage(errno, path))
+        }
+    }
+
+    /// Create `path` and any missing parents at mode 0755. A directory this
+    /// call creates is chmod'd after mkdir, because mkdir applies the
+    /// process umask. An existing directory is left alone (so `/etc` is
+    /// not rewritten when `/etc/resolver` is the thing being created).
+    private func ensureDirectory0755(_ path: String) throws {
+        guard !path.isEmpty, path != "/" else { return }
+        var built = ""
+        for part in path.split(separator: "/") {
+            built += "/" + part
+            if Darwin.mkdir(built, 0o755) == 0 {
+                if Darwin.chmod(built, 0o755) != 0 {
+                    throw SystemCommandError.io(Self.errnoMessage(errno, built))
+                }
+                continue
+            }
+            let err = errno
+            if err == EEXIST {
+                var isDir: ObjCBool = false
+                if FileManager.default.fileExists(atPath: built, isDirectory: &isDir), isDir.boolValue {
+                    continue
+                }
+                throw SystemCommandError.io(Self.errnoMessage(ENOTDIR, built))
+            }
+            throw SystemCommandError.io(Self.errnoMessage(err, built))
+        }
+    }
+
+    private func writeAll(_ fd: Int32, _ data: Data, path: String) throws {
+        try data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var sent = 0
+            while sent < raw.count {
+                let n = Darwin.write(fd, base.advanced(by: sent), raw.count - sent)
+                if n < 0 {
+                    if errno == EINTR { continue }
+                    throw SystemCommandError.io(Self.errnoMessage(errno, path))
+                }
+                if n == 0 {
+                    throw SystemCommandError.io(Self.errnoMessage(EIO, path))
+                }
+                sent += n
+            }
+        }
+    }
+
+    private static func errnoMessage(_ err: Int32, _ path: String) -> String {
+        "errno \(err): \(String(cString: strerror(err))) \(path)"
     }
 
     public func removeFile(_ path: String) throws {

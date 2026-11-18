@@ -12,5 +12,9 @@
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
+	<key>StandardOutPath</key>
+	<string>/var/log/segue-release.out</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/segue-release.err</string>
 </dict>
 </plist>

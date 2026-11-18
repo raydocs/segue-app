@@ -598,6 +598,105 @@ final class AILayerControllerTests: XCTestCase {
         )
     }
 
+    /// The matrix writes the fixture after the helper is already up. Arm
+    /// must read it then. A later parse error is `ai_list_error` and must
+    /// not replace the loaded anchor with an empty list.
+    func testFixtureArrivingAfterStartIsArmedAndABadListIsNotEmptied() throws {
+        let directory = try temporaryDirectory("list-late")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let listURL = directory.appendingPathComponent("ai-lock.fixture.txt")
+        let rig = try LayerRig(tunnelUp: false)
+        let controller = AILayerController(
+            commands: rig.commands,
+            kernel: rig.kernel,
+            list: AILockList(),
+            paths: rig.paths,
+            listPath: listURL.path
+        )
+        let session = HelperSession(
+            store: IntentStore(fileURL: directory.appendingPathComponent("ai-lock.intent")),
+            kernel: rig.kernel,
+            layer: controller,
+            tunnelTimeout: 0
+        )
+
+        let missing = try XCTUnwrap(try session.handle(try armEnvelope()).status)
+        XCTAssertTrue(missing.armed)
+        let missingError = try XCTUnwrap(missing.aiListError)
+        XCTAssertTrue(missingError.contains("errno"), missingError)
+        XCTAssertNil(rig.commands.anchorRules)
+        XCTAssertNil(rig.commands.files["/etc/resolver/ailock-fixture.example.com"])
+
+        // Same bytes the VM matrix writes in copy_fixture_list.
+        let fixture = """
+        # VM matrix fixture. Not the product ai-lock.txt (that file is not modified).
+        # The kernel merges ailock-fixture.example.com and 198.51.100.0/24 from the signed
+        # bundle. The helper reads this file because it does not merge a bundle yet.
+        suffix ailock-fixture.example.com
+        cidr 198.51.100.0/24
+
+        """
+        try Data(fixture.utf8).write(to: listURL)
+        let armed = try XCTUnwrap(try session.handle(try armEnvelope(generation: 5)).status)
+        XCTAssertNil(armed.aiListError)
+        XCTAssertNil(armed.lastError)
+        let rules = try XCTUnwrap(rig.commands.anchorRules)
+        XCTAssertTrue(rules.contains("block drop out quick inet to 198.51.100.0/24"), rules)
+        XCTAssertNotNil(rig.commands.files["/etc/resolver/ailock-fixture.example.com"])
+
+        try Data("suffix not_a_name\n".utf8).write(to: listURL)
+        let refused = try XCTUnwrap(try session.handle(HelperEnvelope.statusRead()).status)
+        let refusedError = try XCTUnwrap(refused.aiListError)
+        XCTAssertTrue(refusedError.contains("invalid suffix"), refusedError)
+        XCTAssertTrue(refusedError.contains("not_a_name"), refusedError)
+        let kept = try XCTUnwrap(rig.commands.anchorRules)
+        XCTAssertTrue(kept.contains("198.51.100.0/24"), kept)
+        XCTAssertNotNil(rig.commands.files["/etc/resolver/ailock-fixture.example.com"])
+    }
+
+    func testResolverWriteErrnoIsReportedWhileDegraded() throws {
+        let directory = try temporaryDirectory("list-errno")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let rig = try LayerRig(tunnelUp: false)
+        rig.commands.resolverWriteErrno = 13
+        let session = HelperSession(
+            store: IntentStore(fileURL: directory.appendingPathComponent("ai-lock.intent")),
+            kernel: rig.kernel,
+            layer: rig.controller,
+            tunnelTimeout: 0
+        )
+        let status = try XCTUnwrap(try session.handle(try armEnvelope()).status)
+        XCTAssertTrue(status.armed)
+        XCTAssertEqual(status.aiLayer, AILayerState.degraded)
+        XCTAssertTrue(status.lastError?.contains("errno 13") == true, status.lastError ?? "")
+        XCTAssertNotEqual(status.dnsMode, AILayerState.system)
+    }
+
+    func testLiveResolverWriteCreatesDirectory0755() throws {
+        let directory = try temporaryDirectory("resolver-mode")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let commands = LiveSystemCommands()
+        let file = directory.appendingPathComponent("etc/resolver/ailock-fixture.example.com")
+        let body = "nameserver 127.0.0.1\nport 5354\n"
+        try commands.writeTextFile(file.path, body)
+        XCTAssertEqual(try String(contentsOfFile: file.path, encoding: .utf8), body)
+        let dir = file.deletingLastPathComponent().path
+        let attrs = try FileManager.default.attributesOfItem(atPath: dir)
+        let mode = try XCTUnwrap(attrs[.posixPermissions] as? NSNumber)
+        XCTAssertEqual(mode.intValue, 0o755)
+
+        let blocker = directory.appendingPathComponent("blocked")
+        try Data("x".utf8).write(to: blocker)
+        XCTAssertThrowsError(
+            try commands.writeTextFile(blocker.appendingPathComponent("child").path, "z")
+        ) { error in
+            guard case SystemCommandError.io(let message) = error else {
+                return XCTFail("\(error)")
+            }
+            XCTAssertTrue(message.contains("errno"), message)
+        }
+    }
+
     private func assertFailuresNeverOpen(
         _ prepare: () throws -> LayerRig,
         _ op: (LayerRig) throws -> Void,
