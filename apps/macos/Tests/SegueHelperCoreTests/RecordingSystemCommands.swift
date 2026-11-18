@@ -15,8 +15,14 @@ final class RecordingSystemCommands: SystemCommands {
     private(set) var guardPort: UInt16?
     private(set) var guardSuffixes: [String] = []
     private(set) var invocations: [String] = []
+    /// Successful `writeTextFile` calls, in order, including the body.
+    /// A thrown write is not recorded: the previous body is still there.
+    private(set) var fileWrites: [(path: String, contents: String)] = []
     private(set) var injected: [String] = []
     var failCallIndex: Int?
+    /// Throw from `writeTextFile` when the path is a resolver file, after
+    /// the call is counted. The file is left unchanged.
+    var failResolverWrites = false
     /// Fail every call, not just one index: a layer whose commands never
     /// succeed keeps its `last_error` instead of recovering on the retry.
     var failEveryCall = false
@@ -36,6 +42,17 @@ final class RecordingSystemCommands: SystemCommands {
 
     func discardLog() {
         invocations.removeAll()
+        fileWrites.removeAll()
+    }
+
+    func replaceServers(name: String, servers: [String]) {
+        guard let index = services.firstIndex(where: { $0.name == name }) else { return }
+        let existing = services[index]
+        services[index] = DNSServiceRecord(
+            serviceID: existing.serviceID,
+            name: existing.name,
+            servers: servers
+        )
     }
 
     func seedFile(_ path: String, contents: String) {
@@ -65,6 +82,10 @@ final class RecordingSystemCommands: SystemCommands {
 
     func writeTextFile(_ path: String, _ contents: String) throws {
         try check("write \(path)")
+        if failResolverWrites && path.contains("/resolver/") {
+            throw RecordingFault(label: "resolver write \(path)")
+        }
+        fileWrites.append((path, contents))
         files[path] = contents
     }
 

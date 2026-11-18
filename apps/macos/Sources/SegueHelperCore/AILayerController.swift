@@ -16,12 +16,19 @@ struct AILayerObservation: Equatable {
     var anchorLoaded: Bool
     var resolverFilesPresent: Bool
     var guardListening: Bool
-    /// `tunnel`, `guard`, or `system`.
+    /// Where armed-suffix resolver files point: `kernel`, `guard`, or
+    /// `system` (no files). `system` is never reported while intent is armed;
+    /// the session turns that into `guard`.
     var dnsMode: String
+    /// `tunnel` (files name the live kernel DNS port), `guard`, `degraded`
+    /// (a write failed or the files are not a uniform hold), or `system`
+    /// (disarmed, no files).
+    var aiLayer: String
+    /// True when every armed suffix file was read back and matches one hold.
     var dnsReadback: Bool
 
     var namesHeld: Bool {
-        dnsMode == AILayerState.tunnel || dnsMode == AILayerState.guardMode
+        aiLayer == AILayerState.tunnel || aiLayer == AILayerState.guardMode
     }
 
     static let unknown = AILayerObservation(
@@ -29,6 +36,7 @@ struct AILayerObservation: Equatable {
         resolverFilesPresent: false,
         guardListening: false,
         dnsMode: AILayerState.system,
+        aiLayer: AILayerState.system,
         dnsReadback: false
     )
 }
@@ -61,25 +69,32 @@ enum AILayerError: Error, Equatable {
 }
 
 /// Installs and removes the narrow AI layer: PF anchor `segue.ailock`,
-/// per-service DNS, `/etc/resolver` files, and the helper's loopback
-/// listener.
+/// `/etc/resolver` files, and the helper's loopback listener.
 ///
-/// A failure mid-way leaves the layer more closed, never less. Resolver
-/// files go in before a restore that would move DNS off the kernel
-/// resolver, and the anchor is flushed only after that restore has been
-/// read back. Startup (`reconcileOnLaunch`) re-arms the narrow layer and
-/// never releases it.
+/// Armed names are never steered by per-service DNS. `networksetup` cannot
+/// carry a port, and the kernel listens on `127.0.0.1:<port>` (15353 in
+/// production), so a service pointed at `127.0.0.1` would miss it and a
+/// failed read-back used to delete the resolver files. While intent is
+/// armed every suffix file exists. Tunnel up replaces it, atomically, with
+/// `nameserver 127.0.0.1` and the kernel's port. Tunnel down, or an unknown
+/// kernel address, replaces it with the helper's guard port. A suffix is
+/// never unlinked to change its port. A write failure is `degraded`, not
+/// `system`.
+///
+/// A leftover per-service snapshot from an older helper is restored only
+/// after the resolver files are in place. The anchor is flushed only after
+/// those files are gone. Startup (`reconcileOnLaunch`) re-arms the narrow
+/// layer and never releases it.
 public final class AILayerController {
     private let commands: SystemCommands
     private let kernel: KernelSupervising
     private let list: AILockList
     private let paths: AILayerPaths
     private let lock = NSLock()
-    /// Address we last pointed services at. Not persisted: a restart learns
-    /// the original servers from the snapshot file and pins names with
-    /// resolver files before restoring them.
-    private var kernelDNSAddress: String?
-    private var dnsReadbackOK = false
+    /// Set when a resolver-file write threw. Cleared by a later successful
+    /// write or a completed disarm. `observe` will not report `system`
+    /// while this is set.
+    private var resolverWriteFailed = false
 
     init(commands: SystemCommands, kernel: KernelSupervising, list: AILockList, paths: AILayerPaths) {
         self.commands = commands
@@ -121,16 +136,17 @@ public final class AILayerController {
     }
 
     /// Helper start. Armed intent re-installs the anchor and the resolver
-    /// files and does not point DNS at the kernel. Disarmed intent is not
-    /// this method's job: the session does not call it, so a clear intent
-    /// installs nothing and releases nothing.
+    /// files on the guard port. The session's follow-up converge moves them
+    /// to the kernel port once the control API reports a carrier. Disarmed
+    /// intent is not this method's job: the session does not call it, so a
+    /// clear intent installs nothing and releases nothing.
     func reconcileOnLaunch() throws {
         try sync { try install(allowTunnelDNS: false) }
     }
 
-    /// Kernel liveness changed. Same converge as `arm`: tunnel up keeps
-    /// DNS on the kernel, tunnel down switches to the guard without
-    /// dropping the layer.
+    /// Kernel liveness changed. Tunnel up (a published loopback DNS port)
+    /// points the resolver files at that port. Anything else points them at
+    /// the guard. Neither path deletes a file to get there.
     func kernelChanged() throws {
         try sync { try install(allowTunnelDNS: true) }
     }
@@ -143,11 +159,10 @@ public final class AILayerController {
 
     /// Caller holds `lock`.
     ///
-    /// The guard is installed even when the anchor cannot be loaded. A
-    /// pfctl failure used to skip the listener, so armed names fell through
-    /// to the system resolver while the resolver file (written on a later
-    /// retry) made the matrix think the guard was up. The anchor error is
-    /// still reported; the names stay held.
+    /// The resolver files are installed even when the anchor cannot be
+    /// loaded. A pfctl failure used to skip the listener, so armed names
+    /// fell through to the system resolver. The anchor error is still
+    /// reported; the names stay held.
     private func install(allowTunnelDNS: Bool) throws {
         let snap = kernel.snapshot()
         let utun = Self.utunName(snap.tunInterface)
@@ -158,77 +173,46 @@ public final class AILayerController {
         } catch {
             anchorError = error
         }
-        if allowTunnelDNS, utun != nil, anchorError == nil,
-           let dns = Self.normalizeAddress(snap.dnsAddress) {
-            try applyTunnelDNS(dns)
-        } else {
-            try applyGuardDNS()
+        let kernelPort = allowTunnelDNS ? Self.kernelDNSPort(snap.dnsAddress) : nil
+        let port = kernelPort ?? paths.guardPort
+        // The guard listener stays up for the whole arm, so moving names
+        // back onto its port is only a file replace. Start it first when
+        // that is the port we are about to publish: a closed port fails
+        // closed, but an already-bound one answers empty NOERROR the moment
+        // the file changes. A listener failure still writes the files, then
+        // surfaces, so the session retries.
+        var listenerError: Error?
+        do {
+            try ensureGuardListener()
+        } catch {
+            listenerError = error
         }
+        try pointResolvers(port: port)
+        // An older helper rewrote per-service DNS and left a snapshot.
+        // Armed names are already on the resolver files, so putting the
+        // saved servers back cannot open them. Tunnel-up does not create
+        // a new snapshot.
+        try restoreLegacySnapshot()
+        if let listenerError { throw listenerError }
         if let anchorError { throw anchorError }
-    }
-
-    /// Point every service at the kernel resolver, then drop the guard
-    /// files. Files stay until the read-back matches, so a failed set cannot
-    /// uncover names the files were holding.
-    private func applyTunnelDNS(_ address: String) throws {
-        let current = try captureServices()
-        if current.isEmpty {
-            try applyGuardDNS()
-            return
-        }
-        kernelDNSAddress = address
-        dnsReadbackOK = false
-        try ensureSnapshot(current: current, kernelAddress: address)
-        for service in current {
-            try assign(name: service.name, current: service.servers, servers: [address])
-        }
-        dnsReadbackOK = true
-        try removeGuard()
-    }
-
-    /// Resolver files and the listener first, then the saved servers. A
-    /// restore that fails after the files are in place still holds AI names
-    /// (the files win over the system resolver). Restoring first would open
-    /// those names for the whole window until the write succeeded.
-    private func applyGuardDNS() throws {
-        try installGuard()
-        try restoreSnapshot()
-        kernelDNSAddress = nil
     }
 
     /// Caller holds `lock`.
     private func release() throws {
-        let hold = try inspect()
         do {
-            if hold.dnsMode == AILayerState.tunnel || shouldPinBeforeRestore(hold) {
-                try installGuard()
+            // Legacy snapshot first, while the files still hold names.
+            try restoreLegacySnapshot()
+            try removeResolverFiles()
+            if commands.guardIsListening() {
+                try commands.stopGuardListener()
             }
-            try restoreSnapshot()
-            try removeGuard()
             try flushAnchor()
-            kernelDNSAddress = nil
+            resolverWriteFailed = false
             removeSnapshotBestEffort()
         } catch {
-            switch hold.dnsMode {
-            case AILayerState.tunnel:
-                try? install(allowTunnelDNS: true)
-            case AILayerState.guardMode:
-                try? install(allowTunnelDNS: false)
-            default:
-                if hold.anchorLoaded {
-                    try? ensureHook()
-                    try? loadAnchor(utun: Self.utunName(kernel.snapshot().tunInterface))
-                }
-            }
+            try? install(allowTunnelDNS: true)
             throw error
         }
-    }
-
-    /// A snapshot on disk means some earlier arm changed DNS. Pin names
-    /// before putting the saved servers back, unless the guard files are
-    /// already the hold.
-    private func shouldPinBeforeRestore(_ hold: AILayerObservation) -> Bool {
-        hold.dnsMode != AILayerState.guardMode && commands.fileExists(paths.snapshotPath)
     }
 
     // MARK: - pieces
@@ -285,17 +269,43 @@ public final class AILayerController {
         return SystemText.anchorHasRules(output.stdout)
     }
 
-    private func installGuard() throws {
-        let rendered = try ResolverFiles.render(suffixes: list.suffixes, port: paths.guardPort)
-        for name in rendered.keys.sorted() {
-            guard let body = rendered[name] else { continue }
-            let path = resolverPath(name)
-            if commands.fileExists(path) {
-                let existing = try commands.readTextFile(path)
-                if existing == body { continue }
-            }
-            try commands.writeTextFile(path, body)
+    /// Replace each suffix file in place. `writeTextFile` is an atomic
+    /// rename, so a reader never sees a missing file and never sees a torn
+    /// body. A failed write leaves the previous body (or no file, if this
+    /// suffix had none yet) and is remembered as degraded.
+    private func pointResolvers(port: UInt16) throws {
+        let rendered: [String: String]
+        do {
+            rendered = try ResolverFiles.render(suffixes: list.suffixes, port: port)
+        } catch {
+            resolverWriteFailed = true
+            throw AILayerError.io("resolver")
         }
+        do {
+            for name in rendered.keys.sorted() {
+                guard let body = rendered[name] else { continue }
+                let path = resolverPath(name)
+                if commands.fileExists(path) {
+                    let existing = try commands.readTextFile(path)
+                    if existing == body { continue }
+                }
+                try commands.writeTextFile(path, body)
+            }
+            for name in rendered.keys.sorted() {
+                guard let body = rendered[name] else { continue }
+                let got = try commands.readTextFile(resolverPath(name))
+                guard got == body else {
+                    throw AILayerError.dnsReadbackMismatch(service: name)
+                }
+            }
+        } catch {
+            resolverWriteFailed = true
+            throw error
+        }
+        resolverWriteFailed = false
+    }
+
+    private func ensureGuardListener() throws {
         try commands.startGuardListener(
             address: paths.guardAddress,
             port: paths.guardPort,
@@ -303,27 +313,22 @@ public final class AILayerController {
         )
     }
 
-    private func removeGuard() throws {
+    private func removeResolverFiles() throws {
         for suffix in list.suffixes.sorted() {
             let path = resolverPath(suffix)
             if commands.fileExists(path) {
                 try commands.removeFile(path)
             }
         }
-        if commands.guardIsListening() {
-            try commands.stopGuardListener()
-        }
     }
 
-    private func ensureSnapshot(current: [DNSServiceRecord], kernelAddress: String) throws {
-        if commands.fileExists(paths.snapshotPath) { return }
-        let alreadyOverride = !current.isEmpty && current.allSatisfy { $0.servers == [kernelAddress] }
-        if alreadyOverride { throw AILayerError.snapshotRefused }
-        let data = try JSONEncoder().encode(DNSSnapshot(services: current))
-        guard let text = String(data: data, encoding: .utf8) else {
-            throw AILayerError.io("snapshot")
-        }
-        try commands.writeTextFile(paths.snapshotPath, text)
+    /// Restore a snapshot left by an older helper, then delete it so a
+    /// later converge does not keep rewriting services. No snapshot is the
+    /// common case: tunnel-up does not create one.
+    private func restoreLegacySnapshot() throws {
+        guard commands.fileExists(paths.snapshotPath) else { return }
+        try restoreSnapshot()
+        removeSnapshotBestEffort()
     }
 
     private func restoreSnapshot() throws {
@@ -331,12 +336,10 @@ public final class AILayerController {
         let saved = try loadSnapshot()
         let live = try captureServices()
         let plan = saved.restorePlan(current: live)
-        dnsReadbackOK = false
         for item in plan.restores {
             let name = live.first { $0.serviceID == item.record.serviceID }?.name ?? item.record.name
             try assign(name: name, current: item.currentServers, servers: item.record.servers)
         }
-        dnsReadbackOK = plan.missingServices.isEmpty
     }
 
     private func loadSnapshot() throws -> DNSSnapshot {
@@ -401,37 +404,92 @@ public final class AILayerController {
 
     private func inspect() throws -> AILayerObservation {
         let anchor = try anchorIsLoaded()
-        let files = resolverFilesPresent()
+        let hold = classifyHold()
         let listening = commands.guardIsListening()
-        let services = try captureServices()
+        let clean = hold.aiLayer == AILayerState.tunnel || hold.aiLayer == AILayerState.guardMode
         return AILayerObservation(
             anchorLoaded: anchor,
-            resolverFilesPresent: files,
+            resolverFilesPresent: hold.filesPresent,
             guardListening: listening,
-            dnsMode: dnsMode(filesPresent: files, services: services),
-            dnsReadback: dnsReadbackOK
+            dnsMode: hold.dnsMode,
+            aiLayer: hold.aiLayer,
+            dnsReadback: clean && hold.filesPresent
         )
     }
 
-    private func dnsMode(filesPresent: Bool, services: [DNSServiceRecord]) -> String {
-        if filesPresent { return AILayerState.guardMode }
-        if let address = activeKernelDNS(),
-            !services.isEmpty,
-            services.allSatisfy({ $0.servers == [address] })
-        {
-            return AILayerState.tunnel
+    private struct ResolverHold {
+        var filesPresent: Bool
+        var dnsMode: String
+        var aiLayer: String
+    }
+
+    /// What the suffix files actually say. A uniform match of the live
+    /// kernel port is `tunnel` / `kernel`. A uniform match of the guard
+    /// port is `guard`. Anything else with a file on disk, or a remembered
+    /// write failure, is `degraded` and is not `system`.
+    private func classifyHold() -> ResolverHold {
+        let suffixes = list.suffixes
+        if suffixes.isEmpty {
+            return degradedIfWriteFailed(ResolverHold(
+                filesPresent: false,
+                dnsMode: AILayerState.system,
+                aiLayer: AILayerState.system
+            ))
         }
-        return AILayerState.system
+        let kernelPort = Self.kernelDNSPort(kernel.snapshot().dnsAddress)
+        var ports: [UInt16] = []
+        var missing = false
+        for suffix in suffixes {
+            let path = resolverPath(suffix)
+            guard commands.fileExists(path),
+                  let text = try? commands.readTextFile(path),
+                  let port = Self.portOfResolverFile(text)
+            else {
+                missing = true
+                continue
+            }
+            ports.append(port)
+        }
+        let filesPresent = !missing && ports.count == suffixes.count
+        if filesPresent, let kernelPort, ports.allSatisfy({ $0 == kernelPort }) {
+            return ResolverHold(
+                filesPresent: true,
+                dnsMode: AILayerState.kernel,
+                aiLayer: AILayerState.tunnel
+            )
+        }
+        if filesPresent, ports.allSatisfy({ $0 == paths.guardPort }) {
+            return ResolverHold(
+                filesPresent: true,
+                dnsMode: AILayerState.guardMode,
+                aiLayer: AILayerState.guardMode
+            )
+        }
+        if ports.isEmpty {
+            return degradedIfWriteFailed(ResolverHold(
+                filesPresent: false,
+                dnsMode: AILayerState.system,
+                aiLayer: AILayerState.system
+            ))
+        }
+        // Partial, mixed, or a port the live kernel is not publishing.
+        // `kernel` only when every file names one non-guard port (they
+        // still aim at a kernel listener). Otherwise `guard`: not system.
+        let uniform = ports.allSatisfy { $0 == ports[0] }
+        let dnsMode = (filesPresent && uniform && ports[0] != paths.guardPort)
+            ? AILayerState.kernel
+            : AILayerState.guardMode
+        return ResolverHold(filesPresent: filesPresent, dnsMode: dnsMode, aiLayer: AILayerState.degraded)
     }
 
-    private func activeKernelDNS() -> String? {
-        if let kernelDNSAddress { return kernelDNSAddress }
-        return Self.normalizeAddress(kernel.snapshot().dnsAddress)
-    }
-
-    private func resolverFilesPresent() -> Bool {
-        guard !list.suffixes.isEmpty else { return false }
-        return list.suffixes.allSatisfy { commands.fileExists(resolverPath($0)) }
+    private func degradedIfWriteFailed(_ hold: ResolverHold) -> ResolverHold {
+        guard resolverWriteFailed else { return hold }
+        var degraded = hold
+        degraded.aiLayer = AILayerState.degraded
+        if degraded.dnsMode == AILayerState.system {
+            degraded.dnsMode = AILayerState.guardMode
+        }
+        return degraded
     }
 
     private func resolverPath(_ suffix: String) -> String {
@@ -464,21 +522,40 @@ public final class AILayerController {
         return name
     }
 
-    /// An IPv4 or IPv6 address, or `host:53`. Anything else is unpublished.
-    static func normalizeAddress(_ raw: String?) -> String? {
-        guard var text = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+    /// `127.0.0.1:<port>` with a non-zero port. A bare address, a non-loopback
+    /// host, or port 0 is unpublished: the layer keeps the guard.
+    static func kernelDNSPort(_ raw: String?) -> UInt16? {
+        guard let text = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
             return nil
         }
         guard !text.contains(where: \.isWhitespace), !text.contains("/") else { return nil }
-        let colons = text.filter { $0 == ":" }.count
-        if colons == 1 {
-            guard let colon = text.firstIndex(of: ":") else { return nil }
-            let host = String(text[..<colon])
-            let port = String(text[text.index(after: colon)...])
-            guard port == "53", !host.isEmpty else { return nil }
-            text = host
+        guard text.filter({ $0 == ":" }).count == 1, let colon = text.firstIndex(of: ":") else {
+            return nil
         }
-        return text
+        let host = String(text[..<colon])
+        let portText = String(text[text.index(after: colon)...])
+        guard host == ResolverFiles.nameserver, let port = UInt16(portText), port != 0 else {
+            return nil
+        }
+        return port
+    }
+
+    /// Port named by a file this lock wrote. Nil when the marker, the
+    /// loopback nameserver, or the port line is missing.
+    static func portOfResolverFile(_ text: String) -> UInt16? {
+        guard ResolverFiles.carriesMarker(text) else { return nil }
+        var nameserverOK = false
+        var port: UInt16?
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line == "nameserver \(ResolverFiles.nameserver)" {
+                nameserverOK = true
+            } else if line.hasPrefix("port ") {
+                port = UInt16(line.dropFirst("port ".count))
+            }
+        }
+        guard nameserverOK, let port, port != 0 else { return nil }
+        return port
     }
 
     private static func loadList(_ path: String) -> AILockList {

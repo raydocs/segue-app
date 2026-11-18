@@ -29,8 +29,13 @@ final class LayerRig {
     let paths: AILayerPaths
     let list: AILockList
 
-    static let kernelDNS = "192.0.2.53"
+    static let kernelDNS = "127.0.0.1:15353"
+    static let kernelPort: UInt16 = 15353
     static let suffixes = ["example.com", "example.org"]
+
+    static func resolverBody(port: UInt16) -> String {
+        "# managed by segue.ailock\nnameserver 127.0.0.1\nport \(port)\n"
+    }
 
     init(tunnelUp: Bool) throws {
         let commands = RecordingSystemCommands()
@@ -72,10 +77,7 @@ final class LayerRig {
         let files = Self.suffixes.allSatisfy { suffix in
             commands.files[paths.resolverDirectory + "/" + suffix] != nil
         }
-        let pointed = !commands.services.isEmpty && commands.services.allSatisfy {
-            $0.servers == [Self.kernelDNS]
-        }
-        return Openness(anchorLoaded: commands.anchorRules != nil, namesHeld: files || pointed)
+        return Openness(anchorLoaded: commands.anchorRules != nil, namesHeld: files)
     }
 }
 
@@ -133,8 +135,17 @@ final class AILayerControllerTests: XCTestCase {
         XCTAssertTrue(SystemText.anchorHasRules(
             "block drop out quick inet from any to 198.51.100.0/24 label \"segue-ai-0\"\n"
         ))
-        XCTAssertEqual(AILayerController.normalizeAddress("192.0.2.53:53"), "192.0.2.53")
-        XCTAssertNil(AILayerController.normalizeAddress("192.0.2.53:5354"))
+        XCTAssertEqual(AILayerController.kernelDNSPort("127.0.0.1:15353"), 15353)
+        XCTAssertEqual(AILayerController.kernelDNSPort("127.0.0.1:53"), 53)
+        XCTAssertNil(AILayerController.kernelDNSPort("192.0.2.53"))
+        XCTAssertNil(AILayerController.kernelDNSPort("192.0.2.53:53"))
+        XCTAssertNil(AILayerController.kernelDNSPort("127.0.0.1"))
+        XCTAssertNil(AILayerController.kernelDNSPort("127.0.0.1:0"))
+        XCTAssertEqual(
+            AILayerController.portOfResolverFile(LayerRig.resolverBody(port: 15353)),
+            15353
+        )
+        XCTAssertNil(AILayerController.portOfResolverFile("nameserver 127.0.0.1\nport 5354\n"))
         XCTAssertNil(AILayerController.utunName("en0"))
         XCTAssertEqual(AILayerController.utunName("utun4"), "utun4")
     }
@@ -173,10 +184,11 @@ final class AILayerControllerTests: XCTestCase {
         XCTAssertTrue(observed.anchorLoaded)
         XCTAssertTrue(observed.resolverFilesPresent)
         XCTAssertTrue(observed.guardListening)
-        XCTAssertFalse(observed.dnsReadback)
+        XCTAssertEqual(observed.aiLayer, AILayerState.guardMode)
+        XCTAssertTrue(observed.dnsReadback)
     }
 
-    func testArmTunnelUpPointsDNSAtTheKernel() throws {
+    func testArmTunnelUpWritesKernelPortFiles() throws {
         let rig = try LayerRig(tunnelUp: true)
         try rig.controller.arm()
 
@@ -184,63 +196,97 @@ final class AILayerControllerTests: XCTestCase {
         XCTAssertTrue(rules.contains("pass quick on utun4"))
         XCTAssertTrue(rules.contains("label \"segue-ai-0\""))
         XCTAssertFalse(rules.contains("block drop all"))
-        XCTAssertNil(rig.commands.files["/etc/resolver/example.com"])
-        XCTAssertNil(rig.commands.guardPort)
-        XCTAssertEqual(rig.servers("Wi-Fi"), [LayerRig.kernelDNS])
-        XCTAssertEqual(rig.servers("Ethernet"), [LayerRig.kernelDNS])
-        let snapshot = try XCTUnwrap(rig.commands.files[rig.paths.snapshotPath])
-        XCTAssertTrue(snapshot.contains("192.0.2.1"))
-        XCTAssertFalse(snapshot.contains(LayerRig.kernelDNS))
-        XCTAssertTrue(rig.commands.invocations.contains(
-            "/usr/sbin/networksetup -setdnsservers Wi-Fi \(LayerRig.kernelDNS)"
-        ))
-        XCTAssertTrue(rig.commands.invocations.contains(
-            "/usr/sbin/networksetup -setdnsservers Ethernet \(LayerRig.kernelDNS)"
-        ))
+        let kernelBody = LayerRig.resolverBody(port: LayerRig.kernelPort)
+        XCTAssertEqual(rig.commands.files["/etc/resolver/example.com"], kernelBody)
+        XCTAssertEqual(rig.commands.files["/etc/resolver/example.org"], kernelBody)
+        XCTAssertEqual(rig.commands.guardPort, 5354)
+        XCTAssertEqual(rig.servers("Wi-Fi"), ["192.0.2.1"])
+        XCTAssertEqual(rig.servers("Ethernet"), [])
+        XCTAssertNil(rig.commands.files[rig.paths.snapshotPath])
+        XCTAssertFalse(rig.commands.invocations.contains { $0.contains("-setdnsservers") })
 
         let observed = try rig.controller.observe()
-        XCTAssertEqual(observed.dnsMode, AILayerState.tunnel)
+        XCTAssertEqual(observed.dnsMode, AILayerState.kernel)
+        XCTAssertEqual(observed.aiLayer, AILayerState.tunnel)
         XCTAssertTrue(observed.anchorLoaded)
-        XCTAssertFalse(observed.resolverFilesPresent)
-        XCTAssertFalse(observed.guardListening)
+        XCTAssertTrue(observed.resolverFilesPresent)
+        XCTAssertTrue(observed.guardListening)
         XCTAssertTrue(observed.dnsReadback)
 
-        let saved = snapshot
         try rig.controller.arm()
-        XCTAssertEqual(rig.commands.files[rig.paths.snapshotPath], saved)
+        XCTAssertEqual(rig.commands.files["/etc/resolver/example.com"], kernelBody)
+        XCTAssertNil(rig.commands.files[rig.paths.snapshotPath])
         let pf = try XCTUnwrap(rig.commands.files["/etc/pf.conf"])
         XCTAssertEqual(pf.components(separatedBy: "anchor \"segue.ailock\"").count - 1, 1)
     }
 
-    func testDisarmRestoresDNSBeforeFlushingTheAnchor() throws {
+    func testUnknownKernelDNSStaysOnTheGuard() throws {
+        let rig = try LayerRig(tunnelUp: true)
+        rig.kernel.snap.dnsAddress = "192.0.2.53"
+        try rig.controller.arm()
+        let guardBody = LayerRig.resolverBody(port: AILayerPaths.defaultGuardPort)
+        XCTAssertEqual(rig.commands.files["/etc/resolver/example.com"], guardBody)
+        XCTAssertEqual(rig.servers("Wi-Fi"), ["192.0.2.1"])
+        let observed = try rig.controller.observe()
+        XCTAssertEqual(observed.dnsMode, AILayerState.guardMode)
+        XCTAssertEqual(observed.aiLayer, AILayerState.guardMode)
+        XCTAssertNotEqual(observed.aiLayer, AILayerState.system)
+
+        rig.kernel.snap.dnsAddress = nil
+        try rig.controller.kernelChanged()
+        XCTAssertEqual(rig.commands.files["/etc/resolver/example.com"], guardBody)
+        XCTAssertEqual(try rig.controller.observe().dnsMode, AILayerState.guardMode)
+    }
+
+    func testLegacySnapshotIsRestoredWithoutOpeningNames() throws {
+        let rig = try LayerRig(tunnelUp: true)
+        rig.commands.replaceServers(name: "Wi-Fi", servers: ["127.0.0.1"])
+        let snapshot = DNSSnapshot(services: [
+            DNSServiceRecord(serviceID: "en0", name: "Wi-Fi", servers: ["192.0.2.1"]),
+            DNSServiceRecord(serviceID: "en1", name: "Ethernet", servers: []),
+        ])
+        let data = try JSONEncoder().encode(snapshot)
+        rig.commands.seedFile(rig.paths.snapshotPath, contents: String(decoding: data, as: UTF8.self))
+        try rig.controller.arm()
+
+        let kernelBody = LayerRig.resolverBody(port: LayerRig.kernelPort)
+        XCTAssertEqual(rig.commands.files["/etc/resolver/example.com"], kernelBody)
+        XCTAssertEqual(rig.servers("Wi-Fi"), ["192.0.2.1"])
+        XCTAssertEqual(rig.servers("Ethernet"), [])
+        XCTAssertNil(rig.commands.files[rig.paths.snapshotPath])
+        let write = try XCTUnwrap(
+            rig.commands.invocations.firstIndex { $0 == "write /etc/resolver/example.com" }
+        )
+        let restore = try XCTUnwrap(
+            rig.commands.invocations.firstIndex { $0.contains("-setdnsservers Wi-Fi 192.0.2.1") }
+        )
+        XCTAssertLessThan(write, restore)
+        XCTAssertFalse(rig.commands.invocations.contains { $0.hasPrefix("remove /etc/resolver/") })
+    }
+
+    func testDisarmRemovesResolverFilesBeforeFlushingTheAnchor() throws {
         let rig = try LayerRig(tunnelUp: true)
         try rig.controller.arm()
         rig.commands.discardLog()
         try rig.controller.disarm()
 
         let flush = try XCTUnwrap(rig.commands.invocations.firstIndex { $0.contains("-F all") })
-        let restore = try XCTUnwrap(
-            rig.commands.invocations.firstIndex { $0.contains("-setdnsservers Wi-Fi 192.0.2.1") }
-        )
         let remove = try XCTUnwrap(
             rig.commands.invocations.firstIndex { $0.hasPrefix("remove /etc/resolver/") }
         )
-        XCTAssertLessThan(restore, remove)
         XCTAssertLessThan(remove, flush)
-        let between = rig.commands.invocations[(restore + 1)..<flush]
-        XCTAssertTrue(between.contains { $0.contains("-getdnsservers Wi-Fi") })
-        XCTAssertTrue(rig.commands.invocations.contains(
-            "/usr/sbin/networksetup -setdnsservers Ethernet Empty"
-        ))
+        XCTAssertFalse(rig.commands.invocations.contains { $0.contains("-setdnsservers") })
 
         XCTAssertNil(rig.commands.anchorRules)
         XCTAssertNil(rig.commands.files["/etc/resolver/example.com"])
+        XCTAssertNil(rig.commands.files["/etc/resolver/example.org"])
         XCTAssertNil(rig.commands.guardPort)
         XCTAssertEqual(rig.servers("Wi-Fi"), ["192.0.2.1"])
         XCTAssertEqual(rig.servers("Ethernet"), [])
-        XCTAssertNil(rig.commands.files[rig.paths.snapshotPath])
         let observed = try rig.controller.observe()
         XCTAssertEqual(observed.dnsMode, AILayerState.system)
+        XCTAssertEqual(observed.aiLayer, AILayerState.system)
+        XCTAssertFalse(observed.resolverFilesPresent)
         XCTAssertFalse(observed.anchorLoaded)
 
         try rig.controller.disarm()
@@ -249,9 +295,12 @@ final class AILayerControllerTests: XCTestCase {
         XCTAssertEqual(rig.servers("Wi-Fi"), ["192.0.2.1"])
     }
 
-    func testKernelDeathKeepsTheLayerOnTheGuard() throws {
+    func testKernelDeathFlipsToGuardFilesWithNoGap() throws {
         let rig = try LayerRig(tunnelUp: true)
         try rig.controller.arm()
+        let kernelBody = LayerRig.resolverBody(port: LayerRig.kernelPort)
+        let guardBody = LayerRig.resolverBody(port: AILayerPaths.defaultGuardPort)
+        XCTAssertEqual(rig.commands.files["/etc/resolver/example.com"], kernelBody)
         rig.kernel.snap = KernelSnapshot(
             state: "stopped",
             pid: nil,
@@ -264,12 +313,24 @@ final class AILayerControllerTests: XCTestCase {
         let rules = try XCTUnwrap(rig.commands.anchorRules)
         XCTAssertFalse(rules.contains("utun"))
         XCTAssertTrue(rules.contains("segue-ai-0"))
-        XCTAssertNotNil(rig.commands.files["/etc/resolver/example.com"])
+        XCTAssertEqual(rig.commands.files["/etc/resolver/example.com"], guardBody)
+        XCTAssertEqual(rig.commands.files["/etc/resolver/example.org"], guardBody)
         XCTAssertEqual(rig.commands.guardPort, 5354)
         XCTAssertEqual(rig.servers("Wi-Fi"), ["192.0.2.1"])
         XCTAssertEqual(rig.servers("Ethernet"), [])
+        for suffix in LayerRig.suffixes {
+            let path = "/etc/resolver/\(suffix)"
+            let writes = rig.commands.fileWrites.filter { $0.path == path }.map(\.contents)
+            XCTAssertEqual(writes, [kernelBody, guardBody], suffix)
+            let first = try XCTUnwrap(rig.commands.invocations.firstIndex(of: "write \(path)"))
+            let second = try XCTUnwrap(rig.commands.invocations.lastIndex(of: "write \(path)"))
+            XCTAssertGreaterThan(second, first)
+            let between = rig.commands.invocations[first...second]
+            XCTAssertFalse(between.contains("remove \(path)"), suffix)
+        }
         let observed = try rig.controller.observe()
         XCTAssertEqual(observed.dnsMode, AILayerState.guardMode)
+        XCTAssertEqual(observed.aiLayer, AILayerState.guardMode)
         XCTAssertTrue(observed.anchorLoaded)
         XCTAssertTrue(observed.resolverFilesPresent)
         XCTAssertTrue(observed.guardListening)
@@ -297,6 +358,34 @@ final class AILayerControllerTests: XCTestCase {
         XCTAssertFalse(rules.contains("utun"))
         XCTAssertTrue(rules.contains("block drop out quick"))
         XCTAssertEqual(try restarted.observe().dnsMode, AILayerState.guardMode)
+        XCTAssertEqual(
+            rig.commands.files["/etc/resolver/example.com"],
+            LayerRig.resolverBody(port: AILayerPaths.defaultGuardPort)
+        )
+    }
+
+    func testResolverWriteFailureIsDegradedNeverSystemWhileArmed() throws {
+        let directory = try temporaryDirectory("layer-write-fail")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let rig = try LayerRig(tunnelUp: true)
+        rig.commands.failResolverWrites = true
+        let session = HelperSession(
+            store: IntentStore(fileURL: directory.appendingPathComponent("ai-lock.intent")),
+            kernel: rig.kernel,
+            layer: rig.controller,
+            tunnelTimeout: 0
+        )
+        let status = try XCTUnwrap(try session.handle(try armEnvelope()).status)
+        XCTAssertTrue(status.armed)
+        XCTAssertEqual(status.aiLayer, AILayerState.degraded)
+        XCTAssertNotEqual(status.aiLayer, AILayerState.system)
+        XCTAssertNotEqual(status.dnsMode, AILayerState.system)
+        XCTAssertEqual(status.dnsMode, AILayerState.guardMode)
+        XCTAssertNotEqual(status.resolverFilesPresent, true)
+        let observed = try rig.controller.observe()
+        XCTAssertEqual(observed.aiLayer, AILayerState.degraded)
+        XCTAssertNotEqual(observed.dnsMode, AILayerState.system)
+        XCTAssertNotEqual(observed.aiLayer, AILayerState.system)
     }
 
     func testClearIntentOnStartInstallsNothing() throws {
@@ -385,6 +474,9 @@ final class AILayerControllerTests: XCTestCase {
         let status = try XCTUnwrap(reply.status)
         XCTAssertTrue(status.armed)
         XCTAssertEqual(status.lastError, "command_failed")
+        XCTAssertEqual(status.aiLayer, AILayerState.degraded)
+        XCTAssertNotEqual(status.dnsMode, AILayerState.system)
+        XCTAssertNotEqual(status.aiLayer, AILayerState.system)
         XCTAssertEqual(status.anchorLoaded, false)
         XCTAssertEqual(
             try IntentStore(fileURL: directory.appendingPathComponent("ai-lock.intent")).load()?.armed,
@@ -404,9 +496,10 @@ final class AILayerControllerTests: XCTestCase {
             tunnelTimeout: 0
         )
         let armed = try XCTUnwrap(try session.handle(try armEnvelope()).status)
-        XCTAssertEqual(armed.dnsMode, AILayerState.tunnel)
+        XCTAssertEqual(armed.dnsMode, AILayerState.kernel)
         XCTAssertEqual(armed.tunInterface, "utun4")
         XCTAssertEqual(armed.aiLayer, "tunnel")
+        XCTAssertEqual(armed.resolverFilesPresent, true)
         XCTAssertTrue(armed.evidence.dnsReadback)
 
         rig.kernel.snap = KernelSnapshot(

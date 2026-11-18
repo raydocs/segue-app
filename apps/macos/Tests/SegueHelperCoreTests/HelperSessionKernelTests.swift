@@ -20,7 +20,7 @@ final class KernelRig {
     let configURL: URL
 
     /// The kernel DNS listen address written into the fake kernel.json.
-    /// An `ip:53` form is a valid system resolver once the port is stripped.
+    /// Resolver files name this port; per-service DNS is not rewritten.
     static let kernelDNS = "127.0.0.1:53"
 
     init(
@@ -114,10 +114,12 @@ final class KernelRig {
         commands.services.map(\.servers)
     }
 
+    func resolverText() -> String? {
+        commands.files[directory.appendingPathComponent("resolver/example.com").path]
+    }
+
     func resolverFilePresent() -> Bool {
-        commands.fileExists(
-            directory.appendingPathComponent("resolver/example.com").path
-        )
+        resolverText() != nil
     }
 }
 
@@ -138,10 +140,14 @@ final class HelperSessionKernelTests: XCTestCase {
         XCTAssertEqual(reply.status?.kernel?.pid, rig.launcher.latest.pid)
         XCTAssertEqual(reply.status?.kernel?.lastExit, nil)
         XCTAssertEqual(reply.status?.tunInterface, "utun4")
-        // Connected with a utun and a resolver-grade DNS address: every
-        // service now points at the kernel and the guard files are gone.
-        XCTAssertTrue(rig.serviceServers().allSatisfy { $0 == ["127.0.0.1"] })
-        XCTAssertFalse(rig.resolverFilePresent())
+        // Connected: resolver files name the kernel port. System DNS is
+        // left alone, so other names keep their servers.
+        XCTAssertEqual(rig.serviceServers(), [["192.0.2.1"], []])
+        XCTAssertTrue(rig.resolverFilePresent())
+        XCTAssertEqual(rig.resolverText(), "# managed by segue.ailock\nnameserver 127.0.0.1\nport 53\n")
+        XCTAssertEqual(reply.status?.dnsMode, AILayerState.kernel)
+        XCTAssertEqual(reply.status?.aiLayer, AILayerState.tunnel)
+        XCTAssertEqual(reply.status?.resolverFilesPresent, true)
     }
 
     func testArmHoldsTheGuardWhileTheCarrierComesUp() throws {
@@ -150,31 +156,47 @@ final class HelperSessionKernelTests: XCTestCase {
         _ = try rig.session.handle(rig.armEnvelope())
         XCTAssertEqual(rig.launcher.procs.count, 1)
         XCTAssertTrue(rig.resolverFilePresent(), "names are held before the carrier is up")
-        XCTAssertTrue(rig.serviceServers().allSatisfy { $0 != ["127.0.0.1"] })
+        XCTAssertEqual(rig.resolverText(), "# managed by segue.ailock\nnameserver 127.0.0.1\nport 5354\n")
+        XCTAssertEqual(rig.serviceServers(), [["192.0.2.1"], []])
         // A utun is open but the carrier is not connected: still the guard.
         rig.control.status = KernelControlStatus(state: "reconnecting", tunInterface: "utun5")
         _ = try rig.session.handle(HelperEnvelope.statusRead())
-        XCTAssertTrue(rig.resolverFilePresent())
+        XCTAssertEqual(rig.resolverText(), "# managed by segue.ailock\nnameserver 127.0.0.1\nport 5354\n")
         XCTAssertNil(rig.supervisor.snapshot().dnsAddress)
-        // Connected: the next converge moves DNS to the kernel.
+        // Connected: the next converge replaces the files with the kernel port.
         rig.control.status = KernelControlStatus(
             state: "connected", tunInterface: "utun5", routes: "installed"
         )
         _ = try rig.session.handle(HelperEnvelope.statusRead())
-        XCTAssertTrue(rig.serviceServers().allSatisfy { $0 == ["127.0.0.1"] })
-        XCTAssertFalse(rig.resolverFilePresent())
+        XCTAssertEqual(rig.serviceServers(), [["192.0.2.1"], []])
+        XCTAssertEqual(rig.resolverText(), "# managed by segue.ailock\nnameserver 127.0.0.1\nport 53\n")
+        XCTAssertFalse(rig.commands.invocations.contains { $0.hasPrefix("remove ") && $0.contains("/resolver/") })
     }
 
-    func testArmWithoutAResolverGradeAddressStaysOnTheGuard() throws {
-        // A kernel DNS on a port that is not 53 cannot be a system
-        // resolver; the layer keeps the guard (how the VM matrix runs).
+    func testArmWithANonStandardPortWritesThatPort() throws {
+        // Port 15353 cannot be a networksetup server. The resolver file
+        // carries it; system DNS stays put.
         let rig = try KernelRig(dnsListen: "127.0.0.1:15353")
         rig.control.status = KernelControlStatus(
             state: "connected", tunInterface: "utun4", routes: "installed"
         )
-        _ = try rig.session.handle(rig.armEnvelope())
-        XCTAssertTrue(rig.resolverFilePresent())
-        XCTAssertTrue(rig.serviceServers().allSatisfy { $0 != ["127.0.0.1"] })
+        let reply = try rig.session.handle(rig.armEnvelope())
+        XCTAssertEqual(rig.resolverText(), "# managed by segue.ailock\nnameserver 127.0.0.1\nport 15353\n")
+        XCTAssertEqual(rig.serviceServers(), [["192.0.2.1"], []])
+        XCTAssertEqual(reply.status?.dnsMode, AILayerState.kernel)
+        XCTAssertEqual(reply.status?.aiLayer, AILayerState.tunnel)
+    }
+
+    func testArmWithoutAPublishedDNSAddressStaysOnTheGuard() throws {
+        let rig = try KernelRig(dnsListen: nil)
+        rig.control.status = KernelControlStatus(
+            state: "connected", tunInterface: "utun4", routes: "installed"
+        )
+        let reply = try rig.session.handle(rig.armEnvelope())
+        XCTAssertEqual(rig.resolverText(), "# managed by segue.ailock\nnameserver 127.0.0.1\nport 5354\n")
+        XCTAssertEqual(reply.status?.dnsMode, AILayerState.guardMode)
+        XCTAssertEqual(reply.status?.aiLayer, AILayerState.guardMode)
+        XCTAssertNotEqual(reply.status?.aiLayer, AILayerState.system)
     }
 
     // MARK: disarm
@@ -185,18 +207,20 @@ final class HelperSessionKernelTests: XCTestCase {
             state: "connected", tunInterface: "utun4", routes: "installed"
         )
         _ = try rig.session.handle(rig.armEnvelope())
-        XCTAssertTrue(rig.serviceServers().allSatisfy { $0 == ["127.0.0.1"] })
-        // The hook records the machine state at the moment the kernel gets
-        // its SIGTERM: by then the restore must already have run.
+        XCTAssertEqual(rig.serviceServers(), [["192.0.2.1"], []])
+        // By SIGTERM the resolver files are gone. System DNS was never rewritten.
         var serversAtSignal: [[[String]]] = []
+        var filesAtSignal: [Bool] = []
         let proc = rig.launcher.latest
         rig.launcher.onSend = { _, _ in
             serversAtSignal.append(rig.commands.services.map(\.servers))
+            filesAtSignal.append(rig.resolverFilePresent())
         }
         _ = try rig.session.handle(rig.disarmEnvelope())
         XCTAssertEqual(proc.signals, [SIGTERM])
         XCTAssertEqual(serversAtSignal.count, 1)
-        XCTAssertEqual(serversAtSignal.first ?? [], [["192.0.2.1"], []], "DNS was restored first")
+        XCTAssertEqual(serversAtSignal.first ?? [], [["192.0.2.1"], []])
+        XCTAssertEqual(filesAtSignal, [false])
         XCTAssertFalse(rig.resolverFilePresent())
         XCTAssertEqual(rig.supervisor.snapshot().state, "stopped")
         XCTAssertEqual(rig.launcher.procs.count, 1, "a disarm does not relaunch")
@@ -211,7 +235,7 @@ final class HelperSessionKernelTests: XCTestCase {
             state: "connected", tunInterface: "utun4", routes: "installed"
         )
         _ = try rig.session.handle(rig.armEnvelope())
-        XCTAssertTrue(rig.serviceServers().allSatisfy { $0 == ["127.0.0.1"] })
+        XCTAssertEqual(rig.resolverText(), "# managed by segue.ailock\nnameserver 127.0.0.1\nport 53\n")
         // The tunnel dies with the process: the control API stops
         // answering before the crash lands.
         rig.control.status = nil
@@ -219,8 +243,12 @@ final class HelperSessionKernelTests: XCTestCase {
         XCTAssertEqual(rig.launcher.procs.count, 2, "a crash restarts inside the budget")
         XCTAssertEqual(rig.supervisor.snapshot().state, "running")
         XCTAssertEqual(rig.supervisor.snapshot().lastExit, "tun_setup_failed")
-        XCTAssertTrue(rig.resolverFilePresent(), "kernel down: names are held by the guard")
-        XCTAssertTrue(rig.serviceServers().allSatisfy { $0 != ["127.0.0.1"] })
+        XCTAssertEqual(
+            rig.resolverText(),
+            "# managed by segue.ailock\nnameserver 127.0.0.1\nport 5354\n",
+            "kernel down: names are held by the guard"
+        )
+        XCTAssertEqual(rig.serviceServers(), [["192.0.2.1"], []])
         XCTAssertNil(rig.supervisor.snapshot().tunInterface)
     }
 

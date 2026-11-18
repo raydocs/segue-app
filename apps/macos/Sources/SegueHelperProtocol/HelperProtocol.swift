@@ -24,14 +24,19 @@ public enum HelperErrorCode {
     public static let internalError = "internal"
 }
 
-/// DNS mode on a status read-back. `tunnel`, `guard`, and `system` are
-/// what the helper sends. `not_implemented` is the stage-0 sentinel; current
-/// replies do not use it, and older fixtures still decode it.
+/// Status strings for the AI layer. `ai_layer` is `tunnel` (resolver
+/// files name the live kernel DNS port), `guard`, `degraded` (armed, but
+/// the files are missing or a write failed), or `system` (not armed).
+/// `dns_mode` is `kernel`, `guard`, or `system`. `system` is never sent
+/// for either field while intent is armed. `not_implemented` is the
+/// stage-0 sentinel; current replies do not use it.
 public enum AILayerState {
     public static let notImplemented = "not_implemented"
     public static let tunnel = "tunnel"
     public static let guardMode = "guard"
     public static let system = "system"
+    public static let kernel = "kernel"
+    public static let degraded = "degraded"
 }
 
 public enum HelperMessageKind: String, Codable, Equatable, Sendable {
@@ -185,8 +190,9 @@ public struct HelperErrorBody: Codable, Equatable, Sendable {
 }
 
 /// Helper read-back. `tunInterface` is set only when the helper sees a utun.
-/// `aiLayer` is the DNS mode (`tunnel`, `guard`, or `system`). The anchor,
-/// resolver-file, and listener flags are omitted by older peers.
+/// `aiLayer` is `tunnel`, `guard`, `degraded`, or `system`. `dnsMode` is
+/// `kernel`, `guard`, or `system` (where the resolver files point). The
+/// anchor, resolver-file, and listener flags are omitted by older peers.
 public struct HelperStatus: Codable, Equatable, Sendable {
     public var armed: Bool
     public var generation: UInt64

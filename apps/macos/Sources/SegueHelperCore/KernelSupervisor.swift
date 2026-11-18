@@ -108,10 +108,10 @@ public struct KernelSnapshot: Equatable, Sendable {
     /// supervisor's child is running. Nil when the kernel is down or not
     /// answering.
     public var tunInterface: String?
-    /// Kernel DNS listen address (from the config), published only while
-    /// the control API reports a connected carrier. The layer treats an
-    /// address that is not a valid system resolver (an IP or `ip:53`) as
-    /// unpublished and keeps the guard.
+    /// Kernel DNS listen address (from the config, `dns.listen`), published
+    /// only while the control API reports a connected carrier. The layer
+    /// aims `/etc/resolver` at `127.0.0.1` and this port. An address that
+    /// is not loopback `host:port` is unpublished and the guard port is used.
     public var dnsAddress: String?
 
     public init(
@@ -228,8 +228,8 @@ public final class KernelSupervisor: KernelControlling {
             if let status = control.readStatus() {
                 tunInterface = status.tunInterface
                 // The kernel answers DNS as soon as it boots, but the
-                // carrier is what makes that resolver trustworthy; while
-                // it is coming up the layer stays on the guard.
+                // carrier is what makes that resolver the one armed names
+                // should use. Until then the layer keeps the guard port.
                 if status.state == "connected" { dnsAddress = dnsListen }
             }
         }
