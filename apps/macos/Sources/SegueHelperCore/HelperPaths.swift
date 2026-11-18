@@ -33,6 +33,10 @@ public struct HelperPaths: Equatable, Sendable {
     /// is what the daemon evaluates instead (the same escape the release
     /// daemon has) so an unsigned dev build can answer `status_read`.
     public var requirement: String
+    /// True when this process was started with `--requirement` or
+    /// `--paths-root`. Gates dev-only verbs (`kernel_pause`). Production
+    /// launchd sets neither, so the verb is refused.
+    public var devVerbs: Bool
 
     public init(
         socketPath: String,
@@ -48,7 +52,8 @@ public struct HelperPaths: Equatable, Sendable {
         pfConfPath: String = "/etc/pf.conf",
         resolverDirectory: String = "/etc/resolver",
         pfctlPath: String = "/sbin/pfctl",
-        requirement: String = ""
+        requirement: String = "",
+        devVerbs: Bool = false
     ) {
         self.socketPath = socketPath
         self.intentPath = intentPath
@@ -64,6 +69,7 @@ public struct HelperPaths: Equatable, Sendable {
         self.resolverDirectory = resolverDirectory
         self.pfctlPath = pfctlPath
         self.requirement = requirement
+        self.devVerbs = devVerbs
     }
 
     public static let production = HelperPaths(
@@ -89,6 +95,7 @@ public struct HelperPaths: Equatable, Sendable {
     ) -> HelperPaths {
         var paths = defaults
         var index = 1
+        var sawPathsRoot = false
         while index < arguments.count {
             let flag = arguments[index]
             let next = index + 1 < arguments.count ? arguments[index + 1] : nil
@@ -127,12 +134,18 @@ public struct HelperPaths: Equatable, Sendable {
             case "--paths-root":
                 if let next {
                     applyRoot(next, to: &paths)
+                    sawPathsRoot = true
                     index += 1
                 }
             default:
                 break
             }
             index += 1
+        }
+        // `--requirement` (even a non-default one) and `--paths-root` are
+        // the dev/test entries. Production plists pass neither.
+        if sawPathsRoot || !paths.requirement.isEmpty {
+            paths.devVerbs = true
         }
         return paths
     }
