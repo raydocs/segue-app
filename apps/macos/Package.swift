@@ -42,5 +42,15 @@ let package = Package(
             name: "SegueHelperCoreTests",
             dependencies: ["SegueHelperCore"]
         ),
+        // AI lock layer (stage 2 groundwork) — pure rendering and answering,
+        // no side effects. Own block so concurrent helper work merges cleanly.
+        .target(name: "SegueAILayer"),
+        .testTarget(
+            name: "SegueAILayerTests",
+            dependencies: ["SegueAILayer"],
+            resources: [
+                .copy("Fixtures"),
+            ]
+        ),
     ]
 )
