@@ -23,6 +23,9 @@ final class RecordingSystemCommands: SystemCommands {
     /// Throw from `writeTextFile` when the path is a resolver file, after
     /// the call is counted. The file is left unchanged.
     var failResolverWrites = false
+    /// When set, a resolver `writeTextFile` throws `SystemCommandError` with
+    /// this errno so status_read can be checked for the number.
+    var resolverWriteErrno: Int32?
     /// Fail every call, not just one index: a layer whose commands never
     /// succeed keeps its `last_error` instead of recovering on the retry.
     var failEveryCall = false
@@ -82,6 +85,9 @@ final class RecordingSystemCommands: SystemCommands {
 
     func writeTextFile(_ path: String, _ contents: String) throws {
         try check("write \(path)")
+        if let resolverWriteErrno, path.contains("/resolver/") {
+            throw SystemCommandError.io("errno \(resolverWriteErrno): Permission denied \(path)")
+        }
         if failResolverWrites && path.contains("/resolver/") {
             throw RecordingFault(label: "resolver write \(path)")
         }

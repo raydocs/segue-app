@@ -313,7 +313,8 @@ public final class HelperSession {
             anchorLoaded: observed.anchorLoaded,
             resolverFilesPresent: observed.resolverFilesPresent,
             guardListening: observed.guardListening,
-            dnsMode: dnsMode
+            dnsMode: dnsMode,
+            aiListError: intent.armed ? layer.listError() : nil
         )
     }
 }
