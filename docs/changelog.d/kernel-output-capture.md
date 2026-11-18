@@ -1,7 +1,7 @@
 # kernel output capture + matrix exit-via
 
 Matrix run 9 lost the cause of `last_exit=tun_setup_failed` — the helper's
-launcher sent the kernel child's stdout and stderr to `/dev/null.
+launcher sent the kernel child's stdout and stderr to `/dev/null`.
 
 - `KernelSupervisor` + `FoundationProcessLauncher` now append the child's
   stdout/stderr to `kernel.stdout` / `kernel.stderr` in the kernel log dir
