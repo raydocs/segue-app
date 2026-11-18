@@ -2,8 +2,8 @@ import Darwin
 import Foundation
 
 /// Execs the argument vector. Stdout and stderr go to `/dev/null` so a
-/// chatty child cannot fill a pipe and stall. The kernel's own log path is
-/// a later stage.
+/// chatty child cannot fill a pipe and stall; the kernel writes its own
+/// `--log` file.
 public final class FoundationProcessLauncher: ProcessLauncher {
     public init() {}
 

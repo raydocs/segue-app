@@ -29,10 +29,11 @@ final class KernelSupervisorTests: XCTestCase {
         XCTAssertEqual(launcher.requests, [[
             "/Library/PrivilegedHelperTools/segue-kernel",
             "run",
-            "--config",
-            "/Library/Application Support/Segue/kernel.json",
             "--state-dir",
             "/Library/Application Support/Segue/kernel",
+            "--log",
+            "/Library/Application Support/Segue/kernel.log",
+            "/Library/Application Support/Segue/kernel.json",
         ]])
         XCTAssertEqual(supervisor.snapshot().state, "running")
         XCTAssertEqual(supervisor.snapshot().pid, launcher.latest.pid)
@@ -134,6 +135,108 @@ final class KernelSupervisorTests: XCTestCase {
         XCTAssertEqual(launcher.procs.count, 1)
         XCTAssertEqual(supervisor.snapshot().state, "stopped")
         XCTAssertFalse(proc.isRunning)
+    }
+
+    func testSnapshotPublishesTheControlAPIView() throws {
+        let control = FakeControlClient()
+        let root = try temporaryDirectory("segue-snap")
+        let config = root.appendingPathComponent("kernel.json")
+        try Data(#"{"dns":{"listen":"127.0.0.1:53"}}"#.utf8).write(to: config)
+        let stateDir = root.appendingPathComponent("kernel").path
+        let launcher = FakeLauncher()
+        let supervisor = KernelSupervisor(
+            kernelPath: "/bin/segue-kernel",
+            configPath: config.path,
+            stateDir: stateDir,
+            launcher: launcher,
+            control: control
+        )
+        control.status = nil
+        try supervisor.start()
+        XCTAssertNil(supervisor.snapshot().tunInterface)
+        XCTAssertNil(supervisor.snapshot().dnsAddress)
+
+        control.status = KernelControlStatus(state: "reconnecting", tunInterface: "utun3")
+        XCTAssertEqual(supervisor.snapshot().tunInterface, "utun3")
+        XCTAssertNil(supervisor.snapshot().dnsAddress, "no carrier: no kernel DNS")
+
+        control.status = KernelControlStatus(state: "connected", tunInterface: "utun3", routes: "installed")
+        XCTAssertEqual(supervisor.snapshot().dnsAddress, "127.0.0.1:53")
+
+        control.status = nil
+        launcher.latest.finish(.code(0))
+        XCTAssertNil(supervisor.snapshot().tunInterface, "a dead kernel publishes nothing")
+    }
+
+    func testSnapshotWithoutControlClientKeepsProcessFactsOnly() throws {
+        let (supervisor, launcher, _) = try makeSupervisor()
+        try supervisor.start()
+        XCTAssertEqual(supervisor.snapshot().state, "running")
+        XCTAssertNil(supervisor.snapshot().tunInterface)
+        XCTAssertNil(supervisor.snapshot().dnsAddress)
+        launcher.latest.finish(.code(1))
+        XCTAssertEqual(launcher.procs.count, 2)
+    }
+
+    func testControlViewWithoutADNSConfigIsTunOnly() throws {
+        let control = FakeControlClient()
+        control.status = KernelControlStatus(state: "connected", tunInterface: "utun1", routes: "installed")
+        let root = try temporaryDirectory("segue-snap2")
+        let supervisor = KernelSupervisor(
+            kernelPath: "/bin/segue-kernel",
+            configPath: root.appendingPathComponent("missing.json").path,
+            stateDir: root.appendingPathComponent("kernel").path,
+            launcher: FakeLauncher(),
+            control: control
+        )
+        try supervisor.start()
+        XCTAssertEqual(supervisor.snapshot().tunInterface, "utun1")
+        XCTAssertNil(supervisor.snapshot().dnsAddress, "no dns.listen in the config")
+    }
+
+    func testPIDFileFollowsTheChild() throws {
+        let root = try temporaryDirectory("segue-pid")
+        let stateDir = root.appendingPathComponent("kernel").path
+        try FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+        let pidFile = stateDir + "/kernel.pid"
+        let launcher = FakeLauncher()
+        let supervisor = KernelSupervisor(
+            kernelPath: "/bin/segue-kernel",
+            configPath: root.appendingPathComponent("kernel.json").path,
+            stateDir: stateDir,
+            launcher: launcher
+        )
+        try supervisor.start()
+        let written = try String(contentsOfFile: pidFile, encoding: .utf8)
+        XCTAssertEqual(written.trimmingCharacters(in: .whitespacesAndNewlines), "\(launcher.latest.pid)")
+        supervisor.stop()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: pidFile))
+        // A crash relaunch rewrites the file with the new child.
+        try supervisor.start()
+        launcher.latest.finish(.code(1))
+        let relaunched = try String(contentsOfFile: pidFile, encoding: .utf8)
+        XCTAssertEqual(
+            relaunched.trimmingCharacters(in: .whitespacesAndNewlines),
+            "\(launcher.latest.pid)"
+        )
+        launcher.latest.finish(.signal(SIGKILL))
+        launcher.latest.finish(.code(0))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: pidFile))
+    }
+
+    func testExitsReportThroughOnStateChange() throws {
+        let (supervisor, launcher, _) = try makeSupervisor()
+        var reports = 0
+        supervisor.onStateChange = { reports += 1 }
+        try supervisor.start()
+        XCTAssertEqual(reports, 0, "a start is not a state-change report")
+        launcher.latest.finish(.code(1))
+        XCTAssertEqual(reports, 1, "the restart reported")
+        launcher.latest.finish(.code(0))
+        XCTAssertEqual(reports, 2, "the clean settle reported")
+        // A duplicate exit from an already-reaped pid is ignored.
+        launcher.procs[0].finish(.code(1))
+        XCTAssertEqual(reports, 2)
     }
 
     private func makeSupervisor() throws -> (KernelSupervisor, FakeLauncher, ManualClock) {

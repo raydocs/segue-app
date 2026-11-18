@@ -8,6 +8,12 @@ public struct HelperPaths: Equatable, Sendable {
     public var kernelPath: String
     public var configPath: String
     public var stateDir: String
+    /// The kernel's own log (`--log`), under the helper's directory.
+    public var kernelLogPath: String
+    /// Where the kernel writes `{"addr": "...", "token": "..."}` for its
+    /// control API: `control.token_file` from the config, resolved into
+    /// the state dir when it is relative.
+    public var controlTokenPath: String
     public var allowedUIDFile: String
     /// Built-in AI lock list (`suffix` / `cidr` lines). Missing means an
     /// empty list: the anchor passes everything and no resolver files exist.
@@ -30,6 +36,8 @@ public struct HelperPaths: Equatable, Sendable {
         kernelPath: String,
         configPath: String,
         stateDir: String,
+        kernelLogPath: String = "/Library/Application Support/Segue/kernel.log",
+        controlTokenPath: String = "/Library/Application Support/Segue/kernel/control.json",
         allowedUIDFile: String,
         aiLockPath: String,
         guardPort: UInt16 = 5354,
@@ -42,6 +50,8 @@ public struct HelperPaths: Equatable, Sendable {
         self.kernelPath = kernelPath
         self.configPath = configPath
         self.stateDir = stateDir
+        self.kernelLogPath = kernelLogPath
+        self.controlTokenPath = controlTokenPath
         self.allowedUIDFile = allowedUIDFile
         self.aiLockPath = aiLockPath
         self.guardPort = guardPort
@@ -56,6 +66,8 @@ public struct HelperPaths: Equatable, Sendable {
         kernelPath: "/Library/PrivilegedHelperTools/segue-kernel",
         configPath: "/Library/Application Support/Segue/kernel.json",
         stateDir: "/Library/Application Support/Segue/kernel",
+        kernelLogPath: "/Library/Application Support/Segue/kernel.log",
+        controlTokenPath: "/Library/Application Support/Segue/kernel/control.json",
         allowedUIDFile: "/Library/PrivilegedHelperTools/segue.allowed-uid",
         aiLockPath: "/Library/Application Support/Segue/ai-lock.txt",
         guardPort: 5354,
@@ -85,6 +97,10 @@ public struct HelperPaths: Equatable, Sendable {
                 if let next { paths.configPath = next; index += 1 }
             case "--state-dir":
                 if let next { paths.stateDir = next; index += 1 }
+            case "--kernel-log":
+                if let next { paths.kernelLogPath = next; index += 1 }
+            case "--control-token":
+                if let next { paths.controlTokenPath = next; index += 1 }
             case "--allowed-uids":
                 if let next { paths.allowedUIDFile = next; index += 1 }
             case "--ai-lock":
@@ -123,6 +139,8 @@ public struct HelperPaths: Equatable, Sendable {
         paths.kernelPath = base + "/bin/segue-kernel"
         paths.configPath = base + "/kernel.json"
         paths.stateDir = base + "/kernel"
+        paths.kernelLogPath = base + "/kernel.log"
+        paths.controlTokenPath = base + "/kernel/control.json"
         paths.allowedUIDFile = base + "/allowed-uid"
         paths.aiLockPath = base + "/ai-lock.txt"
         paths.pfConfPath = base + "/pf.conf"

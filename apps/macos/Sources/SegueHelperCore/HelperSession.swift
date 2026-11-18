@@ -3,42 +3,68 @@ import SegueHelperProtocol
 
 /// Arm, disarm, and status for one helper.
 ///
-/// Arm persists intent, then asks the AI layer to install. A failed install
-/// keeps the intent and reports `last_error`; it does not roll the bit back
-/// and it does not start the kernel. Disarm persists the clear bit, then
-/// releases the layer. Status while armed converges to the kernel: a dead
-/// tunnel switches to the guard and does not release the layer. A clear
-/// intent on start installs nothing, even if rule files are still around.
+/// Arm persists intent, asks the AI layer to install the narrow guard,
+/// then starts `segue-kernel` (taking over an orphan left by a dead
+/// helper first). The layer moves to the kernel's DNS only once the
+/// kernel's control API reports a connected carrier with a utun; a poll
+/// loop does that without holding the arm reply. A failed install keeps
+/// the intent and reports `last_error`; it does not roll the bit back.
+///
+/// Disarm persists the clear bit, releases the layer (DNS restored and
+/// read back before the anchor is flushed — the existing ordering), then
+/// stops the kernel: SIGTERM, `stopGrace`, SIGKILL.
+///
+/// A kernel crash restarts inside the supervisor's budget; whenever the
+/// kernel goes down while the intent is armed, the layer converges to the
+/// guard and is never released. Helper start with armed intent re-installs
+/// the narrow layer and starts the kernel again. A clear intent on start
+/// installs nothing, even if rule files are still around.
 public final class HelperSession {
     private let store: IntentStore
-    private let kernel: KernelSupervising
+    private let kernel: KernelControlling
     private let layer: AILayerController
+    private let control: KernelControlClient?
+    private let tunnelTimeout: TimeInterval
+    private let pollInterval: TimeInterval
     private let lock = NSLock()
     private var intent: StoredIntent
     private var layerError: String?
+    private var convergingTunnel = false
 
     /// `reconcileOnInit` is false for the real daemon: it binds the socket
     /// first, then calls `reconcileArmedIntent`. Otherwise a slow (or
     /// failing) anchor load keeps the socket absent for the whole arm.
+    /// `tunnelTimeout <= 0` disables the background poll loop (unit tests
+    /// drive the convergence by hand).
     public init(
         store: IntentStore,
-        kernel: KernelSupervising,
+        kernel: KernelControlling,
         layer: AILayerController,
-        reconcileOnInit: Bool = true
+        control: KernelControlClient? = nil,
+        reconcileOnInit: Bool = true,
+        tunnelTimeout: TimeInterval = 20,
+        pollInterval: TimeInterval = 0.25
     ) {
         self.store = store
         self.kernel = kernel
         self.layer = layer
+        self.control = control
+        self.tunnelTimeout = tunnelTimeout
+        self.pollInterval = pollInterval
         intent = (try? store.load()) ?? .disarmed
+        kernel.onStateChange = { [weak self] in self?.kernelStateChanged() }
         if reconcileOnInit, intent.armed {
             converge { try layer.reconcileOnLaunch() }
+            startKernel()
         }
     }
 
-    /// Armed intent re-installs the narrow layer. A clear intent does nothing.
+    /// Armed intent re-installs the narrow layer and starts the kernel
+    /// again. A clear intent does nothing.
     public func reconcileArmedIntent() {
         guard isArmed() else { return }
         converge { try layer.reconcileOnLaunch() }
+        startKernel()
     }
 
     public func handle(_ envelope: HelperEnvelope) throws -> HelperEnvelope {
@@ -51,6 +77,7 @@ public final class HelperSession {
                 name: arm.intent.rawValue
             ))
             converge { try layer.arm() }
+            startKernel()
         case .disarm:
             guard let disarm = envelope.disarm else { throw HelperProtocolError.malformed }
             try remember(StoredIntent(
@@ -58,16 +85,88 @@ public final class HelperSession {
                 generation: disarm.generation,
                 name: disarm.intent.rawValue
             ))
+            // Layer first: DNS restored and read back before the anchor
+            // flushes, then the tunnel it was protecting goes away.
             converge { try layer.disarm() }
+            kernel.stop()
         case .statusRead:
             if isArmed() {
-                converge { try layer.kernelChanged() }
+                convergeTowardTunnel()
             }
         case .status, .error:
             throw HelperProtocolError.malformed
         }
         return HelperEnvelope.status(currentStatus())
     }
+
+    // MARK: - kernel convergence
+
+    /// Best-effort start (an existing child is left alone; an orphan from
+    /// a dead helper is taken over first), one converge now — a kernel
+    /// that already answers the control API is switched to immediately —
+    /// then the background poll that follows a just-started kernel to
+    /// "connected with a utun".
+    private func startKernel() {
+        try? kernel.start()
+        convergeTowardTunnel()
+        scheduleTunnelConvergence()
+    }
+
+    /// Converge the layer to what the kernel reports right now: the
+    /// kernel's DNS while a carrier is connected and the kernel's listen
+    /// address is a valid system resolver, the guard in every other state.
+    /// Never called with a clear intent — a release only ever follows the
+    /// disarm envelope.
+    private func convergeTowardTunnel() {
+        guard isArmed() else { return }
+        converge { try layer.kernelChanged() }
+    }
+
+    /// The start returns before the kernel has a carrier. Nudge it with
+    /// `POST /v1/connect` (the kernel otherwise waits for the first
+    /// proxied flow), then poll `GET /v1/status` until it reports a
+    /// connected carrier with a utun, converging the layer on every pass:
+    /// guard while it comes up, kernel DNS after. The loop gives up after
+    /// `tunnelTimeout` and leaves the guard in place.
+    private func scheduleTunnelConvergence() {
+        guard tunnelTimeout > 0 else { return }
+        lock.lock()
+        if convergingTunnel {
+            lock.unlock()
+            return
+        }
+        convergingTunnel = true
+        lock.unlock()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            self.control?.connect()
+            let deadline = Date().addingTimeInterval(self.tunnelTimeout)
+            while Date() < deadline {
+                self.convergeTowardTunnel()
+                // `dnsAddress` is published only for a connected carrier,
+                // so both set is the kernel's own "tunnel up".
+                let snap = self.kernel.snapshot()
+                if snap.tunInterface != nil, snap.dnsAddress != nil { break }
+                Thread.sleep(forTimeInterval: self.pollInterval)
+            }
+            self.lock.lock()
+            self.convergingTunnel = false
+            self.lock.unlock()
+        }
+    }
+
+    /// The supervisor's exit report: crash, clean stop, or budget
+    /// exhaustion. While the intent is armed the layer never releases; it
+    /// converges to what the kernel reports now (the guard, while the
+    /// kernel is down or coming back) and the poll loop keeps watching a
+    /// restarted kernel.
+    private func kernelStateChanged() {
+        guard isArmed() else { return }
+        convergeTowardTunnel()
+        scheduleTunnelConvergence()
+    }
+
+    // MARK: - state
 
     private func converge(_ body: () throws -> Void) {
         do {

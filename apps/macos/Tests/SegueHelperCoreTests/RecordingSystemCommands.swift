@@ -17,6 +17,9 @@ final class RecordingSystemCommands: SystemCommands {
     private(set) var invocations: [String] = []
     private(set) var injected: [String] = []
     var failCallIndex: Int?
+    /// Fail every call, not just one index: a layer whose commands never
+    /// succeed keeps its `last_error` instead of recovering on the retry.
+    var failEveryCall = false
     private var callsSoFar = 0
 
     init() {
@@ -103,7 +106,7 @@ final class RecordingSystemCommands: SystemCommands {
         let index = callsSoFar
         callsSoFar += 1
         invocations.append(label)
-        if index == failCallIndex {
+        if failEveryCall || index == failCallIndex {
             injected.append(label)
             throw RecordingFault(label: label)
         }
