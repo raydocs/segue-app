@@ -5,14 +5,21 @@ import XCTest
 
 @testable import SegueHelperCore
 
-final class FakeKernel: KernelSupervising {
+final class FakeKernel: KernelControlling {
     var snap: KernelSnapshot
+    private(set) var starts = 0
+    private(set) var stops = 0
+    var onStateChange: (() -> Void)?
 
     init(_ snap: KernelSnapshot) {
         self.snap = snap
     }
 
     func snapshot() -> KernelSnapshot { snap }
+
+    func start() throws { starts += 1 }
+
+    func stop() { stops += 1 }
 }
 
 final class LayerRig {
@@ -336,7 +343,7 @@ final class AILayerControllerTests: XCTestCase {
         XCTAssertNil(status.lastError)
     }
 
-    func testSessionArmFailureKeepsIntent() throws {
+    func testSessionArmFailureIsRetriedAndKeepsIntent() throws {
         let directory = try temporaryDirectory("layer-fail-arm")
         defer { try? FileManager.default.removeItem(at: directory) }
         let rig = try LayerRig(tunnelUp: true)
@@ -344,14 +351,41 @@ final class AILayerControllerTests: XCTestCase {
         let session = HelperSession(
             store: IntentStore(fileURL: directory.appendingPathComponent("ai-lock.intent")),
             kernel: rig.kernel,
-            layer: rig.controller
+            layer: rig.controller,
+            tunnelTimeout: 0
+        )
+        let reply = try session.handle(try armEnvelope())
+        let status = try XCTUnwrap(reply.status)
+        XCTAssertTrue(status.armed)
+        XCTAssertNotEqual(status.aiLayer, AILayerState.notImplemented)
+        XCTAssertEqual(
+            try IntentStore(fileURL: directory.appendingPathComponent("ai-lock.intent")).load()?.armed,
+            true
+        )
+        // The arm's install threw, the intent stayed, and the converge
+        // that follows the kernel start (here the fake answers right
+        // away) recovered the layer on the spot.
+        XCTAssertNil(status.lastError)
+        XCTAssertEqual(status.anchorLoaded, true)
+        XCTAssertNotNil(rig.commands.anchorRules)
+    }
+
+    func testSessionPersistentArmFailureReportsLastError() throws {
+        let directory = try temporaryDirectory("layer-fail-persistent")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let rig = try LayerRig(tunnelUp: true)
+        rig.commands.failEveryCall = true
+        let session = HelperSession(
+            store: IntentStore(fileURL: directory.appendingPathComponent("ai-lock.intent")),
+            kernel: rig.kernel,
+            layer: rig.controller,
+            tunnelTimeout: 0
         )
         let reply = try session.handle(try armEnvelope())
         let status = try XCTUnwrap(reply.status)
         XCTAssertTrue(status.armed)
         XCTAssertEqual(status.lastError, "command_failed")
         XCTAssertEqual(status.anchorLoaded, false)
-        XCTAssertNotEqual(status.aiLayer, AILayerState.notImplemented)
         XCTAssertEqual(
             try IntentStore(fileURL: directory.appendingPathComponent("ai-lock.intent")).load()?.armed,
             true
@@ -366,7 +400,8 @@ final class AILayerControllerTests: XCTestCase {
         let session = HelperSession(
             store: IntentStore(fileURL: directory.appendingPathComponent("ai-lock.intent")),
             kernel: rig.kernel,
-            layer: rig.controller
+            layer: rig.controller,
+            tunnelTimeout: 0
         )
         let armed = try XCTUnwrap(try session.handle(try armEnvelope()).status)
         XCTAssertEqual(armed.dnsMode, AILayerState.tunnel)

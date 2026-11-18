@@ -9,8 +9,8 @@ do {
     exit(1)
 }
 
-/// Root helper. It listens, checks the peer, stores arm intent, and installs
-/// or releases the narrow AI layer. It does not start `segue-kernel`.
+/// Root helper. It listens, checks the peer, stores arm intent, installs
+/// or releases the narrow AI layer, and runs `segue-kernel` as a child.
 private func runHelper() throws {
     let paths = HelperPaths.parse(CommandLine.arguments)
     let uidText = (try? String(contentsOfFile: paths.allowedUIDFile, encoding: .utf8)) ?? ""
@@ -25,16 +25,20 @@ private func runHelper() throws {
     let requirement = paths.requirement.isEmpty ? SegueCodeSigning.requirement : paths.requirement
     let peers = try DarwinPeerCredentials(requirement: requirement)
     let policy = PeerPolicy(allowedUIDs: uids, requirement: requirement)
+    let control = LiveKernelControlClient(tokenFilePath: paths.controlTokenPath)
     let supervisor = KernelSupervisor(
         kernelPath: paths.kernelPath,
         configPath: paths.configPath,
         stateDir: paths.stateDir,
-        launcher: FoundationProcessLauncher()
+        launcher: FoundationProcessLauncher(),
+        logPath: paths.kernelLogPath,
+        control: control
     )
     let session = HelperSession(
         store: IntentStore(fileURL: URL(fileURLWithPath: paths.intentPath)),
         kernel: supervisor,
         layer: AILayerController.live(kernel: supervisor, paths: paths),
+        control: control,
         reconcileOnInit: false
     )
     let server = HelperSocketServer(

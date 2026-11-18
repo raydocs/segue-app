@@ -104,11 +104,14 @@ public struct KernelSnapshot: Equatable, Sendable {
     public var state: String
     public var pid: Int32?
     public var lastExit: String?
-    /// Set when a utun is up. This supervisor does not poll the kernel
-    /// control API, so its own snapshots leave the field nil; a stand-in
-    /// used by tests publishes the interface and the kernel DNS address.
+    /// The utun the kernel's control API names, published only while the
+    /// supervisor's child is running. Nil when the kernel is down or not
+    /// answering.
     public var tunInterface: String?
-    /// Kernel DNS listen address: an IP, or `ip:53`. Nil when unpublished.
+    /// Kernel DNS listen address (from the config), published only while
+    /// the control API reports a connected carrier. The layer treats an
+    /// address that is not a valid system resolver (an IP or `ip:53`) as
+    /// unpublished and keeps the guard.
     public var dnsAddress: String?
 
     public init(
@@ -130,48 +133,83 @@ public protocol KernelSupervising: AnyObject {
     func snapshot() -> KernelSnapshot
 }
 
+/// The session's handle on the kernel: the read-back plus the lifecycle.
+/// `onStateChange` runs after any transition (start aside), never while
+/// the supervisor holds its lock, so the handler may call `snapshot()`.
+public protocol KernelControlling: KernelSupervising {
+    var onStateChange: (() -> Void)? { get set }
+    /// Idempotent. Clears a previous `kernel_failed` and the budget.
+    func start() throws
+    /// SIGTERM, `stopGrace` seconds, then SIGKILL.
+    func stop()
+}
+
 public enum LaunchError: Error, Equatable {
     case emptyCommand
 }
 
-/// Owns one `segue-kernel run` child.
+/// Owns one `segue-kernel run` child and reports what its control API
+/// says about the tunnel.
 ///
 /// A crash (listener failure, tun setup failure, unknown status, or an
 /// uncaught signal) is restarted up to `restartLimit` times inside
 /// `restartWindow`. The next crash stays down and reports `kernel_failed`
 /// until `start()` is called again. Stop sends SIGTERM and, if the child
-/// is still alive after `stopGrace`, SIGKILL.
-public final class KernelSupervisor: KernelSupervising {
+/// is still alive after `stopGrace`, SIGKILL. The real CLI is
+/// `segue-kernel [run] [--state-dir DIR] [--log PATH] <kernel.json>` —
+/// the config path is positional and there is no `--config` flag.
+///
+/// The child's pid goes to `<stateDir>/kernel.pid`. A start that finds a
+/// live kernel named in a leftover pid file (a previous helper died
+/// without stopping it) takes that process over before spawning, because
+/// a fresh child could not bind the ports the orphan still holds.
+public final class KernelSupervisor: KernelControlling {
     public let kernelPath: String
     public let configPath: String
     public let stateDir: String
+    public let logPath: String
+
+    /// Set by the session; runs after exits and budget exhaustion, off
+    /// the internal lock.
+    public var onStateChange: (() -> Void)?
 
     private let launcher: ProcessLauncher
+    private let control: KernelControlClient?
     private let clock: SupervisorClock
     private let stopGrace: TimeInterval
+    private let externalProbe: (Int32, String) -> Bool
     private var budget: RestartBudget
     private let lock = NSLock()
     private var running: RunningProcess?
     private var phase: Phase = .stopped
     private var lastExit: KernelExitCode?
     private var stopRequested = false
+    /// `dns.listen` from the kernel config. Published only while the
+    /// control API reports a connected carrier.
+    private var dnsListen: String?
 
     public init(
         kernelPath: String,
         configPath: String,
         stateDir: String,
         launcher: ProcessLauncher,
+        logPath: String = "/Library/Application Support/Segue/kernel.log",
+        control: KernelControlClient? = nil,
         clock: SupervisorClock = SystemSupervisorClock(),
         restartLimit: Int = 10,
         restartWindow: TimeInterval = 600,
-        stopGrace: TimeInterval = 5
+        stopGrace: TimeInterval = 5,
+        externalProbe: @escaping (Int32, String) -> Bool = KernelSupervisor.probeExternalProcess
     ) {
         self.kernelPath = kernelPath
         self.configPath = configPath
         self.stateDir = stateDir
         self.launcher = launcher
+        self.logPath = logPath
+        self.control = control
         self.clock = clock
         self.stopGrace = stopGrace
+        self.externalProbe = externalProbe
         budget = RestartBudget(limit: restartLimit, window: restartWindow)
     }
 
@@ -184,16 +222,34 @@ public final class KernelSupervisor: KernelSupervising {
         } else {
             pid = nil
         }
-        return KernelSnapshot(state: phase.stateName, pid: pid, lastExit: lastExit?.stateName)
+        var tunInterface: String?
+        var dnsAddress: String?
+        if case .running = phase, let control {
+            if let status = control.readStatus() {
+                tunInterface = status.tunInterface
+                // The kernel answers DNS as soon as it boots, but the
+                // carrier is what makes that resolver trustworthy; while
+                // it is coming up the layer stays on the guard.
+                if status.state == "connected" { dnsAddress = dnsListen }
+            }
+        }
+        return KernelSnapshot(
+            state: phase.stateName,
+            pid: pid,
+            lastExit: lastExit?.stateName,
+            tunInterface: tunInterface,
+            dnsAddress: dnsAddress
+        )
     }
 
     /// An explicit start clears a previous `kernel_failed` and the budget.
-    /// It does not run unless something calls it. Stage 0's session does not.
     public func start() throws {
         try sync {
             guard running == nil else { return }
             stopRequested = false
             budget.reset()
+            dnsListen = Self.readDNSListen(configPath: configPath)
+            takeOverOrphanLocked()
             try launchLocked()
         }
     }
@@ -213,46 +269,141 @@ public final class KernelSupervisor: KernelSupervising {
             if running?.pid == proc.pid {
                 running = nil
                 phase = .stopped
+                Self.removePIDFile(pidFilePath)
             }
         }
     }
 
     private func handleExit(pid: Int32, exit: ProcessExit) {
+        var changed = false
         lock.lock()
-        defer { lock.unlock() }
-        guard let current = running, current.pid == pid else { return }
-        running = nil
-        let mapped = KernelExitCode(exit)
-        lastExit = mapped
-        if stopRequested {
-            phase = .stopped
-            return
+        if let current = running, current.pid == pid {
+            running = nil
+            Self.removePIDFile(pidFilePath)
+            let mapped = KernelExitCode(exit)
+            lastExit = mapped
+            if stopRequested {
+                phase = .stopped
+            } else if !mapped.restarts {
+                phase = .settled(mapped)
+            } else if !budget.consume(now: clock.now()) {
+                phase = .kernelFailed(mapped)
+            } else if !launchAfterExitLocked() {
+                phase = .kernelFailed(mapped)
+            }
+            changed = true
         }
-        guard mapped.restarts else {
-            phase = .settled(mapped)
-            return
-        }
-        guard budget.consume(now: clock.now()) else {
-            phase = .kernelFailed(mapped)
-            return
-        }
+        lock.unlock()
+        if changed { onStateChange?() }
+    }
+
+    /// Caller holds `lock`. A relaunch that throws must not escape
+    /// `handleExit` (it would drop the exit on the floor).
+    private func launchAfterExitLocked() -> Bool {
         do {
             try launchLocked()
+            return true
         } catch {
-            phase = .kernelFailed(mapped)
+            return false
         }
     }
 
     /// Caller holds `lock`.
     private func launchLocked() throws {
         let request = LaunchRequest(arguments: [
-            kernelPath, "run", "--config", configPath, "--state-dir", stateDir,
+            kernelPath, "run", "--state-dir", stateDir, "--log", logPath, configPath,
         ])
         let proc = try launcher.launch(request) { [weak self] pid, exit in
             self?.handleExit(pid: pid, exit: exit)
         }
         running = proc
         phase = .running(pid: proc.pid)
+        Self.writePIDFile(pidFilePath, pid: proc.pid)
+    }
+
+    /// Caller holds `lock`. An orphan is a leftover from a helper that
+    /// died (SIGKILL, crash) between launching the kernel and exiting
+    /// cleanly. Only a live process whose executable name matches the
+    /// kernel's is touched; a stale pid after a reboot points at another
+    /// process or nothing and is just cleared.
+    private func takeOverOrphanLocked() {
+        guard let pid = Self.readPIDFile(pidFilePath), pid > 0 else { return }
+        let name = (kernelPath as NSString).lastPathComponent
+        guard externalProbe(pid, name) else {
+            Self.removePIDFile(pidFilePath)
+            return
+        }
+        _ = Darwin.kill(pid, SIGTERM)
+        let deadline = Date().addingTimeInterval(stopGrace)
+        while Date() < deadline, externalProbe(pid, name) {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if externalProbe(pid, name) {
+            _ = Darwin.kill(pid, SIGKILL)
+            let killDeadline = Date().addingTimeInterval(1)
+            while Date() < killDeadline, externalProbe(pid, name) {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+        }
+        Self.removePIDFile(pidFilePath)
+    }
+
+    private var pidFilePath: String { stateDir + "/kernel.pid" }
+
+    // MARK: - files and process facts
+
+    private static func writePIDFile(_ path: String, pid: Int32) {
+        FileManager.default.createFile(
+            atPath: path,
+            contents: Data("\(pid)\n".utf8),
+            attributes: [.posixPermissions: 0o600]
+        )
+    }
+
+    private static func readPIDFile(_ path: String) -> Int32? {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8),
+              let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              pid > 0
+        else { return nil }
+        return pid
+    }
+
+    private static func removePIDFile(_ path: String) {
+        try? FileManager.default.removeItem(atPath: path)
+    }
+
+    /// `dns.listen` from the kernel config: where the kernel's DNS
+    /// answers. Nil when the config is unreadable or has none; the layer
+    /// then keeps the guard.
+    static func readDNSListen(configPath: String) -> String? {
+        guard let data = FileManager.default.contents(atPath: configPath),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let dns = object["dns"] as? [String: Any],
+              let listen = dns["listen"] as? String,
+              !listen.isEmpty
+        else { return nil }
+        return listen
+    }
+
+    /// True when `pid` is alive and its executable name is `name`
+    /// (`kern.proc.pid` `p_comm`, the short name `ps -o comm` prints).
+    public static func probeExternalProcess(pid: Int32, name: String) -> Bool {
+        if Darwin.kill(pid, 0) != 0, errno == ESRCH { return false }
+        guard let comm = processName(pid: pid) else { return false }
+        return comm == name
+    }
+
+    private static func processName(pid: Int32) -> String? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.size
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard mib.withUnsafeMutableBufferPointer({ buffer -> Int32 in
+            sysctl(buffer.baseAddress, 4, &info, &size, nil, 0)
+        }) == 0, size >= MemoryLayout<kinfo_proc>.size else { return nil }
+        return withUnsafeBytes(of: info.kp_proc.p_comm) { raw in
+            let bytes = raw.prefix(while: { $0 != 0 })
+            return String(bytes: bytes, encoding: .utf8)
+        }
     }
 
     private func sync(_ body: () throws -> Void) throws {

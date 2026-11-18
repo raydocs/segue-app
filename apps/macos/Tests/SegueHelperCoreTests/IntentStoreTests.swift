@@ -38,6 +38,14 @@ final class HelperPathsTests: XCTestCase {
             HelperPaths.production.intentPath,
             "/Library/Application Support/Segue/ai-lock.intent"
         )
+        XCTAssertEqual(
+            HelperPaths.production.kernelLogPath,
+            "/Library/Application Support/Segue/kernel.log"
+        )
+        XCTAssertEqual(
+            HelperPaths.production.controlTokenPath,
+            "/Library/Application Support/Segue/kernel/control.json"
+        )
     }
 
     func testParseOverridesFlags() {
@@ -48,6 +56,8 @@ final class HelperPathsTests: XCTestCase {
             "--kernel", "/tmp/segue-kernel",
             "--config", "/tmp/kernel.json",
             "--state-dir", "/tmp/state",
+            "--kernel-log", "/tmp/kernel.log",
+            "--control-token", "/tmp/control.json",
             "--allowed-uids", "/tmp/uids",
             "--unknown", "skip-me",
         ])
@@ -56,6 +66,8 @@ final class HelperPathsTests: XCTestCase {
         XCTAssertEqual(paths.kernelPath, "/tmp/segue-kernel")
         XCTAssertEqual(paths.configPath, "/tmp/kernel.json")
         XCTAssertEqual(paths.stateDir, "/tmp/state")
+        XCTAssertEqual(paths.kernelLogPath, "/tmp/kernel.log")
+        XCTAssertEqual(paths.controlTokenPath, "/tmp/control.json")
         XCTAssertEqual(paths.allowedUIDFile, "/tmp/uids")
         XCTAssertEqual(paths.guardPort, 5354)
         XCTAssertEqual(paths.pfConfPath, "/etc/pf.conf")
@@ -76,6 +88,8 @@ final class HelperPathsTests: XCTestCase {
         XCTAssertEqual(paths.kernelPath, "/tmp/segue-dev/bin/segue-kernel")
         XCTAssertEqual(paths.configPath, "/tmp/segue-dev/kernel.json")
         XCTAssertEqual(paths.stateDir, "/tmp/segue-dev/kernel")
+        XCTAssertEqual(paths.kernelLogPath, "/tmp/segue-dev/kernel.log")
+        XCTAssertEqual(paths.controlTokenPath, "/tmp/segue-dev/kernel/control.json")
         XCTAssertEqual(paths.allowedUIDFile, "/tmp/segue-dev/allowed-uid")
         XCTAssertEqual(paths.aiLockPath, "/tmp/segue-dev/ai-lock.txt")
         XCTAssertEqual(paths.pfConfPath, "/tmp/segue-dev/pf.conf")

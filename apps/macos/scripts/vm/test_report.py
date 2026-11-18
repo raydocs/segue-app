@@ -31,7 +31,7 @@ class ReportFailsTest(unittest.TestCase):
                 ),
                 0,
             )
-            self.assertEqual(_add(path, "armed-kernel-not-started", "PASS"), 0)
+            self.assertEqual(_add(path, "armed-kernel-not-running", "PASS"), 0)
             self.assertEqual(_add(path, "restore-via-release-daemon", "FAIL", "no restore"), 0)
             self.assertEqual(_add(path, "expected-leak-doh-quic", "FAIL", "timeout"), 0)
             self.assertEqual(_add(path, "reboot-armed", "SKIP"), 0)

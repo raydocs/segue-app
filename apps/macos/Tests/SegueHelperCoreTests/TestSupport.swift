@@ -54,6 +54,7 @@ final class FakeLauncher: ProcessLauncher {
         let pid: Int32
         let onExit: (Int32, ProcessExit) -> Void
         var ignoreTerminate = false
+        var observeSignal: ((Int32) -> Void)?
         private(set) var running = true
         private(set) var signals: [Int32] = []
         private(set) var waits: [TimeInterval] = []
@@ -67,6 +68,7 @@ final class FakeLauncher: ProcessLauncher {
 
         func send(signal: Int32) {
             signals.append(signal)
+            observeSignal?(signal)
             if signal == SIGKILL || (signal == SIGTERM && !ignoreTerminate) {
                 finish(.signal(signal))
             }
@@ -88,20 +90,38 @@ final class FakeLauncher: ProcessLauncher {
     private(set) var requests: [[String]] = []
     private var nextPid: Int32 = 400
     var ignoreTerminate = false
+    /// Fires inside `send`, before the exit callback, so a test can see
+    /// the machine state at the moment a signal goes out.
+    var onSend: ((Int32, Int32) -> Void)?
 
     func launch(
         _ request: LaunchRequest,
         onExit: @escaping (Int32, ProcessExit) -> Void
     ) throws -> RunningProcess {
         requests.append(request.arguments)
-        let proc = Proc(pid: nextPid, onExit: onExit)
+        let pid = nextPid
+        let proc = Proc(pid: pid, onExit: onExit)
         proc.ignoreTerminate = ignoreTerminate
+        proc.observeSignal = { [weak self] signal in
+            self?.onSend?(pid, signal)
+        }
         nextPid += 1
         procs.append(proc)
         return proc
     }
 
     var latest: Proc { procs[procs.count - 1] }
+}
+
+/// Stand-in for the kernel's control API. The supervisor publishes
+/// whatever it is told, so tests drive "connected with a utun" by hand.
+final class FakeControlClient: KernelControlClient {
+    var status: KernelControlStatus?
+    private(set) var connectCalls = 0
+
+    func readStatus() -> KernelControlStatus? { status }
+
+    func connect() { connectCalls += 1 }
 }
 
 final class StaticPeers: PeerCredentialSource {
@@ -205,10 +225,15 @@ final class HelperHarness {
                 guardPort: AILayerPaths.defaultGuardPort
             )
         )
+        // `tunnelTimeout: 0` keeps the background convergence loop out of
+        // these socket tests; the kernel here has no control API at all.
         let session = HelperSession(
             store: IntentStore(fileURL: intentURL),
             kernel: supervisor,
-            layer: layer
+            layer: layer,
+            control: nil,
+            reconcileOnInit: true,
+            tunnelTimeout: 0
         )
         let server = HelperSocketServer(
             path: socketPath,

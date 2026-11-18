@@ -37,8 +37,10 @@ final class HelperSocketServerTests: XCTestCase {
         XCTAssertEqual(armed.status?.anchorLoaded, true)
         XCTAssertEqual(armed.status?.resolverFilesPresent, true)
         XCTAssertEqual(armed.status?.guardListening, true)
-        XCTAssertEqual(armed.status?.kernel?.state, "stopped")
-        XCTAssertEqual(harness.launcher.procs.count, 0)
+        // Arm starts the kernel: the guard goes in first, then the child.
+        XCTAssertEqual(armed.status?.kernel?.state, "running")
+        XCTAssertEqual(armed.status?.kernel?.pid, harness.launcher.latest.pid)
+        XCTAssertEqual(harness.launcher.procs.count, 1)
         XCTAssertEqual(try posixMode(at: harness.intentURL), 0o600)
         let stored = try IntentStore(fileURL: harness.intentURL).load()
         XCTAssertEqual(stored, StoredIntent(armed: true, generation: 4, name: "user_connect"))
@@ -69,6 +71,11 @@ final class HelperSocketServerTests: XCTestCase {
             try IntentStore(fileURL: harness.intentURL).load()?.name,
             "user_disconnect"
         )
+        // The layer released before the kernel stopped: the child saw
+        // SIGTERM only after the restore ran, and nothing relaunched.
+        XCTAssertEqual(disarmed.status?.kernel?.state, "stopped")
+        XCTAssertEqual(harness.launcher.procs.count, 1)
+        XCTAssertEqual(harness.launcher.latest.signals, [SIGTERM])
     }
 
     func testDeniedPeerDoesNotPersist() throws {
