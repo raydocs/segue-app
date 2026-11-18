@@ -39,6 +39,71 @@ final class KernelSupervisorTests: XCTestCase {
         XCTAssertEqual(supervisor.snapshot().pid, launcher.latest.pid)
     }
 
+    func testLaunchRequestCarriesTheCapturePaths() throws {
+        let root = try temporaryDirectory("segue-capture")
+        let launcher = FakeLauncher()
+        let supervisor = KernelSupervisor(
+            kernelPath: "/bin/segue-kernel",
+            configPath: root.appendingPathComponent("kernel.json").path,
+            stateDir: root.appendingPathComponent("kernel").path,
+            launcher: launcher,
+            logPath: root.appendingPathComponent("logs/kernel.log").path
+        )
+        try supervisor.start()
+        XCTAssertEqual(launcher.launchRequests.count, 1)
+        XCTAssertEqual(launcher.launchRequests[0].stdoutPath, root.appendingPathComponent("logs/kernel.stdout").path)
+        XCTAssertEqual(launcher.launchRequests[0].stderrPath, root.appendingPathComponent("logs/kernel.stderr").path)
+    }
+
+    func testKernelFailedPublishesARedactedStderrTail() throws {
+        let root = try temporaryDirectory("segue-tail")
+        let launcher = FakeLauncher()
+        let supervisor = KernelSupervisor(
+            kernelPath: "/bin/segue-kernel",
+            configPath: root.appendingPathComponent("kernel.json").path,
+            stateDir: root.appendingPathComponent("kernel").path,
+            launcher: launcher,
+            logPath: root.appendingPathComponent("logs/kernel.log").path,
+            restartLimit: 1
+        )
+        try FileManager.default.createDirectory(
+            atPath: root.appendingPathComponent("logs").path,
+            withIntermediateDirectories: true
+        )
+        // Older than the tail window, then the last words: a bearer token
+        // and a keyed one, both of which diagnostics redaction must scrub.
+        let early = "EARLY-MARK\n" + String(repeating: "padding line\n", count: 500)
+        let lastWords = "tun setup failed: Bearer abcdefghijklmnop\n"
+            + #"{"token":"0123456789abcdef"}"#
+        try (early + lastWords).write(
+            to: root.appendingPathComponent("logs/kernel.stderr"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try supervisor.start()
+        launcher.latest.finish(.code(1))
+        launcher.latest.finish(.code(1))
+        XCTAssertEqual(supervisor.snapshot().state, "kernel_failed")
+        let tail = try XCTUnwrap(supervisor.snapshot().lastStderr)
+        XCTAssertNil(tail.range(of: "abcdefghijklmnop"), "the bearer token is scrubbed")
+        XCTAssertNil(tail.range(of: "0123456789abcdef"), "the keyed token is scrubbed")
+        XCTAssertTrue(tail.contains("tun setup failed"), "the cause text stays")
+        XCTAssertTrue(tail.utf8.count <= 2 * 1_024, "the tail is capped at 2 KiB")
+        XCTAssertFalse(tail.contains("EARLY"), "only the end of the file is read")
+    }
+
+    func testStderrTailIsOnlyForKernelFailed() throws {
+        let (supervisor, launcher, _) = try makeSupervisor()
+        try supervisor.start()
+        XCTAssertNil(supervisor.snapshot().lastStderr, "running: no tail")
+        launcher.latest.finish(.code(4))
+        XCTAssertNil(supervisor.snapshot().lastStderr, "restarted: no tail")
+        launcher.latest.finish(.code(0))
+        XCTAssertNil(supervisor.snapshot().lastStderr, "clean shutdown: no tail")
+        supervisor.stop()
+        XCTAssertNil(supervisor.snapshot().lastStderr, "stopped: no tail")
+    }
+
     func testNonCrashExitsStayDown() throws {
         let expectations: [(ProcessExit, String)] = [
             (.code(0), "clean_shutdown"),

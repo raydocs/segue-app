@@ -309,7 +309,12 @@ public final class HelperSession {
             lastError: lastError,
             aiLayer: aiLayer,
             helper: HelperProcessReport(state: "running"),
-            kernel: KernelReport(state: kernelSnap.state, pid: kernelSnap.pid, lastExit: kernelSnap.lastExit),
+            kernel: KernelReport(
+                state: kernelSnap.state,
+                pid: kernelSnap.pid,
+                lastExit: kernelSnap.lastExit,
+                lastStderr: kernelSnap.lastStderr
+            ),
             anchorLoaded: observed.anchorLoaded,
             resolverFilesPresent: observed.resolverFilesPresent,
             guardListening: observed.guardListening,

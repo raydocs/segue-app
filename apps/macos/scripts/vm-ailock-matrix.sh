@@ -19,7 +19,7 @@ usage: SEGUE_VM_MATRIX=throwaway $SCRIPT_PATH [--dry-run]
        [--core-rev REV] [--app-rev REV]
        [--core-repo URL] [--app-repo URL]
        [--work-dir DIR] [--json PATH] [--skip-build]
-       [--kernel-by-script]
+       [--kernel-by-script] [--exit-via loopback|alias]
 
 --dry-run prints the plan and exits 0. It still requires
 SEGUE_VM_MATRIX=throwaway. A real run also requires a VM
@@ -34,6 +34,11 @@ child and polls the kernel control API for the utun). --kernel-by-script
 is a debug fallback: the script execs the kernel itself and installs no
 kernel.json where the helper looks, so the helper's own start attempt
 settles config_rejected instead of fighting the script's kernel.
+
+--exit-via is where the kernel's AI exit dials segue-relay (127.0.0.1:17443):
+loopback (the default) points the exit straight at the relay on lo0;
+alias keeps the 192.0.2.10 forwarder on an alias of the physical NIC for
+comparison with older cores that cannot dial loopback from the carrier.
 
 Default JSON: <work-dir>/vm-ailock-matrix-<phase>[-<expect>].json
 Default work dir: /var/tmp/segue-vm-matrix
@@ -52,6 +57,7 @@ WORK=/var/tmp/segue-vm-matrix
 JSON=
 SKIP_BUILD=0
 KERNEL_BY_SCRIPT=0
+EXIT_VIA=loopback
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -67,6 +73,7 @@ while [[ $# -gt 0 ]]; do
     --json) JSON="${2:?}"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --kernel-by-script) KERNEL_BY_SCRIPT=1; shift ;;
+    --exit-via) EXIT_VIA="${2:?}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *)
       echo "unknown argument: $1" >&2
@@ -75,6 +82,14 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+case "$EXIT_VIA" in
+  loopback|alias) ;;
+  *)
+    echo "unknown exit-via: $EXIT_VIA (want loopback or alias)" >&2
+    exit 2
+    ;;
+esac
 
 case "$PHASE" in
   all|pre-reboot|post-reboot) ;;

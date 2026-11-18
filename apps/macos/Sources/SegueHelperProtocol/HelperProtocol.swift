@@ -165,17 +165,22 @@ public struct KernelReport: Codable, Equatable, Sendable {
     public var state: String
     public var pid: Int32?
     public var lastExit: String?
+    /// Tail of the captured `kernel.stderr` (≤2 KiB, redacted), present
+    /// only when `state` is `kernel_failed`. Omitted by older helpers.
+    public var lastStderr: String?
 
     enum CodingKeys: String, CodingKey {
         case state
         case pid
         case lastExit = "last_exit"
+        case lastStderr = "last_stderr"
     }
 
-    public init(state: String, pid: Int32?, lastExit: String?) {
+    public init(state: String, pid: Int32?, lastExit: String?, lastStderr: String? = nil) {
         self.state = state
         self.pid = pid
         self.lastExit = lastExit
+        self.lastStderr = lastStderr
     }
 }
 
