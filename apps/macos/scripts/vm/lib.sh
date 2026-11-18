@@ -689,8 +689,8 @@ arm_helper() {
     # pfctl -f flushed the anchor rules the arm just loaded. A second arm
     # refills them. start() is idempotent, so the kernel keeps its port.
     socket_arm >/dev/null || { arm_failed anchor_refill; return 1; }
-    arm_wait 20 socket_present socket_present_after_reload || return 1
-    arm_wait 20 resolver_present resolver_present_after_reload || return 1
+    arm_wait 20 socket_present_after_reload socket_present || return 1
+    arm_wait 20 resolver_present_after_reload resolver_present || return 1
   fi
   arm_wait 15 anchor_has_fixture anchor_has_fixture || return 1
   arm_wait 15 guard_answers guard_answers || return 1
