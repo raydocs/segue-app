@@ -27,18 +27,37 @@ def save(path, document):
     os.replace(temporary, path)
 
 
+def count_fails(document):
+    """How many rows have result FAIL. SKIP, PASS, DRY-RUN, and PREPARED are not fails."""
+    rows = document.get("rows") or []
+    total = 0
+    for row in rows:
+        if isinstance(row, dict) and row.get("result") == "FAIL":
+            total += 1
+    return total
+
+
+def dump_text(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        text = handle.read()
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return "BEGIN-MATRIX-JSON\n" + text + "END-MATRIX-JSON\n"
+
+
 def main(argv):
     if len(argv) < 2:
         return 2
     command = argv[1]
     if command == "init":
-        if len(argv) != 8:
+        if len(argv) != 9:
             return 2
-        path, dry_run, phase, hv, core_rev, app_rev = argv[2:8]
+        path, dry_run, phase, hv, core_rev, app_rev, host_kind = argv[2:9]
         document = {
             "version": 1,
             "dry_run": dry_run == "1",
             "phase": phase,
+            "host_kind": host_kind,
             "hv_vmm_present": hv,
             "core_rev": core_rev,
             "app_rev": app_rev,
@@ -64,6 +83,16 @@ def main(argv):
         )
         document["updated_at"] = utc_now()
         save(path, document)
+        return 0
+    if command == "fails":
+        if len(argv) != 3:
+            return 2
+        print(count_fails(load(argv[2])))
+        return 0
+    if command == "dump":
+        if len(argv) != 3:
+            return 2
+        sys.stdout.write(dump_text(argv[2]))
         return 0
     return 2
 

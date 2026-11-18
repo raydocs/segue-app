@@ -2,7 +2,9 @@
 
 This is the privileged self-test for `docs/design/macos.md` §5. It installs
 LaunchDaemons, loads PF anchor `segue.ailock`, and writes one resolver file.
-Run it only on a throwaway VM, then archive the Amp Satellite thread.
+Run it only on a throwaway volume. An Amp Satellite is one command and no
+reboots (the volume is deleted, not restarted). Reboot cycles run only on a
+persistent VM such as Tart.
 
 The script never reboots and never calls `shutdown`. `--dry-run` prints every
 privileged command and does not run it. A real run refuses unless
@@ -23,31 +25,42 @@ must be root.
 
 ## Commands
 
+### Satellite: one command, no reboots
+
 From a checkout of this repo, as root:
 
 ```bash
 export SEGUE_VM_MATRIX=throwaway
 bash apps/macos/scripts/vm-ailock-matrix.sh \
+  --host-kind satellite \
   --core-rev <segue-core git revision> \
   --app-rev <segue-app git revision> \
   --work-dir /var/tmp/segue-vm-matrix
 ```
 
-JSON lands at:
+`reboot-armed` and `reboot-clear` are `SKIP` with reason "Satellite is
+destroyed on reboot; run reboot rows on a Tart VM". Do not reboot the
+Satellite. JSON lands at:
 
 ```text
 /var/tmp/segue-vm-matrix/vm-ailock-matrix-all.json
 ```
 
-Copy that file out before archiving the thread. Each row is `PASS`, `FAIL`,
-or `SKIP` plus the evidence (dig text, pf counters, kernel log tail).
+The script prints `SUMMARY fails=<number of FAIL rows>` and then the whole
+JSON between `BEGIN-MATRIX-JSON` and `END-MATRIX-JSON`. Copy that block out
+before archiving the thread. Each row is `PASS`, `FAIL`, or `SKIP` plus the
+evidence (dig text, pf counters, kernel log tail).
 
-Reboot rows are two phases. The default run records them as `SKIP` and does
-not reboot. Armed, then clear, are separate cycles:
+### Persistent VM: reboot cycles
+
+`--host-kind vm` (the default) is a Tart or UTM volume that survives a
+reboot. The default phase does not reboot. Armed, then clear, are separate
+cycles:
 
 ```bash
 export SEGUE_VM_MATRIX=throwaway
 bash apps/macos/scripts/vm-ailock-matrix.sh \
+  --host-kind vm \
   --phase pre-reboot --expect armed \
   --core-rev <segue-core git revision> \
   --app-rev <segue-app git revision> \
@@ -61,6 +74,7 @@ before relying on the GUI:
 ```bash
 export SEGUE_VM_MATRIX=throwaway
 bash apps/macos/scripts/vm-ailock-matrix.sh \
+  --host-kind vm \
   --phase post-reboot --expect armed \
   --work-dir /var/tmp/segue-vm-matrix
 ```
@@ -94,9 +108,9 @@ plus the reboot the orchestrator performs. Armed and clear are two reboots.
 | `connected` | Kernel DNS returns a `198.18.0.0/15` fake-IP; connecting to it opens a TCP session to the fixture SOCKS exit; a non-AI address does not; loopback still works |
 | `kill-kernel` | That utun is gone; the armed name is still empty; example.com and loopback still work; the CIDR is still dropped |
 | `kill-helper` | During launchd's restart the armed name times out or is empty; example.com works before and after. A real answer for the armed name is a leak |
-| `restore-via-release-daemon` | `SKIP` when `segue-release` was not built. There is no release daemon in this tree |
-| `expected-leak-doh-quic` | The anchor blocks only `198.51.100.0/24`. TCP and UDP to `203.0.113.50:443` do not increment that rule. A broader block is `FAIL` |
-| `reboot-armed` / `reboot-clear` | post-reboot only. Armed: resolver file and fixture anchor are back, and the rules are not `block drop all`. Clear: resolver file absent, no fixture block |
+| `restore-via-release-daemon` | With the helper in `SIGSTOP`, `segue-release-ctl restore` (the same `ReleaseClient` envelope the app sends) clears the anchor rules, removes resolver files whose first line is `# managed by segue.ailock`, puts DNS back, and clears intent. `SKIP` if `segue-release` or `segue-release-ctl` was not built |
+| `expected-leak-doh-quic` | The anchor still blocks only `198.51.100.0/24`. TCP connect to `203.0.113.10:443` succeeds and UDP round-trips. That address is a second lo0 alias, not in the fixture CIDR — the expected leak to an unlisted IP. Do not "fix" this leak. A broader block is `FAIL` |
+| `reboot-armed` / `reboot-clear` | On `--host-kind satellite`, `SKIP` (a Satellite is destroyed on reboot). On a persistent VM, post-reboot only. Armed: resolver file and fixture anchor are back, and the rules are not `block drop all`. Clear: resolver file absent, no fixture block |
 
 The fixture suffix `ai-fixture.test` and CIDR `198.51.100.0/24` are not written
 into `ai-lock.txt`. The kernel gets them from a bundle signed with
@@ -109,7 +123,9 @@ fixture exit is the simplest server it can run: SOCKS on `127.0.0.1:18081`,
 freedom outbound. The kernel home outbound is that SOCKS server. A tiny TCP
 listener on `198.51.100.10` (lo0 alias) is the stand-in AI host. The drop
 probe removes the alias first, because the anchor passes `lo0` before the
-CIDR block.
+CIDR block. The expected-leak row adds a second alias, `203.0.113.10/32`,
+with a local TCP listener and a UDP echo on port 443, so that probe does
+not leave the machine.
 
 The helper does not publish a utun, and its supervisor argv passes `--config`,
 which `segue-kernel` rejects. The connected row starts

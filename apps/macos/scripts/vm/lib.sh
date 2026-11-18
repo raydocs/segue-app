@@ -1,5 +1,5 @@
 # Shared helpers for vm-ailock-matrix.sh. Bash 3.2 (macOS /bin/bash).
-# The entry script sets DRY_RUN, PHASE, EXPECT, WORK, JSON, repo revisions.
+# The entry script sets DRY_RUN, PHASE, EXPECT, HOST_KIND, WORK, JSON, repo revisions.
 
 FIXTURE_SUFFIX=ai-fixture.test
 FIXTURE_CIDR=198.51.100.0/24
@@ -11,6 +11,10 @@ KERNEL_SOCKS_PORT=18080
 GUARD_PORT=5354
 UNLISTED_HOST=203.0.113.50
 UNLISTED_PORT=443
+# Second lo0 alias, TEST-NET-3, not inside FIXTURE_CIDR. The leak row serves
+# TCP and UDP here so the expected leak does not need the internet.
+LEAK_HOST=203.0.113.10
+LEAK_PORT=443
 LOOPBACK_PORT=18099
 ANCHOR=segue.ailock
 HELPER_LABEL=com.segue.core-helper
@@ -19,6 +23,12 @@ HELPER_DST=/Library/PrivilegedHelperTools/segue-core-helper
 KERNEL_DST=/Library/PrivilegedHelperTools/segue-kernel
 SEGUE_DST=/Library/PrivilegedHelperTools/segue
 RELEASE_DST=/Library/PrivilegedHelperTools/segue-release
+RELEASE_CTL_DST=/Library/PrivilegedHelperTools/segue-release-ctl
+RELEASE_SOCK=/var/run/segue-release.sock
+# Ad-hoc identifier signed onto segue-release-ctl. The matrix daemon is
+# started with a matching identifier requirement because a throwaway VM has
+# no Developer ID. Production plists omit --requirement.
+RELEASE_CTL_ID=com.raydocs.segue.vm-matrix
 UID_DST=/Library/PrivilegedHelperTools/segue.allowed-uid
 HELPER_PLIST=/Library/LaunchDaemons/com.segue.core-helper.plist
 RELEASE_PLIST=/Library/LaunchDaemons/com.segue.release.plist
@@ -899,28 +909,36 @@ helper_running() {
   [[ -n "$(helper_pid)" ]]
 }
 
-row_restore() {
-  local name=restore-via-release-daemon
-  local built="${APP_SRC}/apps/macos/.build/release/segue-release"
-  if dry; then
-    note "SKIP when ${built} and ${RELEASE_DST} are absent"
-    priv /bin/cp "$built" "$RELEASE_DST"
-    priv /bin/launchctl bootstrap system "$RELEASE_PLIST"
-    priv /bin/kill -STOP '<helper-pid>'
-    plan /usr/bin/python3 "$PROBES" helper /var/run/segue-release.sock '<restore>'
-    priv /bin/kill -CONT '<helper-pid>'
-    record "$name" DRY-RUN "SKIP if no segue-release binary. If one is built, install it, SIGSTOP the helper, and ask /var/run/segue-release.sock. There is no release binary in this tree, and this script will not invent a wire message and call that a pass."
-    return 0
+release_socket_present() {
+  [[ -S "$RELEASE_SOCK" ]]
+}
+
+marked_resolver_count() {
+  local count=0 file first
+  count=0
+  if [[ -d /etc/resolver ]]; then
+    for file in /etc/resolver/*; do
+      [[ -f "$file" ]] || continue
+      first=$(/usr/bin/head -n 1 "$file" 2>/dev/null || true)
+      if [[ "$first" == "# managed by segue.ailock" ]]; then
+        count=$((count + 1))
+      fi
+    done
   fi
-  if [[ ! -x "$built" && ! -x "$RELEASE_DST" ]]; then
-    record "$name" SKIP "no segue-release at ${built} or ${RELEASE_DST}"
-    return 0
-  fi
-  local src="$built"
-  if [[ ! -x "$src" ]]; then
-    src="$RELEASE_DST"
-  fi
-  priv /bin/cp "$src" "$RELEASE_DST" || true
+  printf '%s\n' "$count"
+}
+
+intent_is_armed() {
+  [[ -f "$INTENT" ]] || return 1
+  /usr/bin/grep -Eq '"armed"[[:space:]]*:[[:space:]]*true' "$INTENT"
+}
+
+anchor_rules_present() {
+  printf '%s\n' "$1" | /usr/bin/grep -Eq '^(pass|block|match|scrub|nat|rdr|anchor)[[:space:]]|198\.51\.100\.0/24'
+}
+
+write_release_plist() {
+  mkdir -p "${WORK}/state" "${WORK}/logs"
   cat > "${WORK}/state/release.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -931,48 +949,185 @@ row_restore() {
 	<key>ProgramArguments</key>
 	<array>
 		<string>${RELEASE_DST}</string>
+		<string>--allowed-uids</string>
+		<string>${UID_DST}</string>
+		<string>--requirement</string>
+		<string>identifier "${RELEASE_CTL_ID}"</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
+	<key>StandardOutPath</key>
+	<string>${WORK}/logs/release.out</string>
+	<key>StandardErrorPath</key>
+	<string>${WORK}/logs/release.err</string>
 </dict>
 </plist>
 EOF
-  /bin/cp "${WORK}/state/release.plist" "$RELEASE_PLIST"
+}
+
+row_restore() {
+  local name=restore-via-release-daemon
+  local built="${APP_SRC}/apps/macos/.build/release/segue-release"
+  local built_ctl="${APP_SRC}/apps/macos/.build/release/segue-release-ctl"
+  write_release_plist
+  if dry; then
+    note "SKIP when ${built} or ${built_ctl} is absent"
+    priv /bin/cp "$built" "$RELEASE_DST"
+    priv /bin/cp "$built_ctl" "$RELEASE_CTL_DST"
+    priv /bin/chmod 755 "$RELEASE_DST" "$RELEASE_CTL_DST"
+    priv /usr/bin/codesign -s - -f -i "$RELEASE_CTL_ID" "$RELEASE_CTL_DST"
+    note "daemon --requirement is identifier \"${RELEASE_CTL_ID}\" so the ad-hoc ctl is admitted. Production plists omit --requirement."
+    priv /bin/cp "${WORK}/state/release.plist" "$RELEASE_PLIST"
+    priv /bin/launchctl bootout system "$RELEASE_PLIST"
+    priv /bin/launchctl bootstrap system "$RELEASE_PLIST"
+    priv /bin/kill -STOP '<helper-pid>'
+    plan "$RELEASE_CTL_DST" restore --socket "$RELEASE_SOCK"
+    priv /sbin/pfctl -a "$ANCHOR" -sr
+    plan /bin/cat "$INTENT"
+    plan /usr/bin/python3 "$PROBES" dns-match "${WORK}/state/dns.snapshot"
+    note "read-back while the helper stays stopped: anchor rules empty, no resolver file with the segue marker, DNS matches the pre-arm snapshot, intent not armed"
+    priv /bin/kill -CONT '<helper-pid>'
+    record "$name" DRY-RUN "SIGSTOP the helper, then segue-release-ctl restore (ReleaseClient's restore envelope) on ${RELEASE_SOCK}. PASS when the read-back shows an empty anchor, Segue resolver files gone, DNS restored, and intent cleared."
+    return 0
+  fi
+  if [[ ! -x "$built" || ! -x "$built_ctl" ]]; then
+    record "$name" SKIP "need both ${built} and ${built_ctl}"
+    return 0
+  fi
+  if ! /bin/cp "$built" "$RELEASE_DST"; then
+    record "$name" FAIL "could not install ${RELEASE_DST}"
+    return 0
+  fi
+  if ! /bin/cp "$built_ctl" "$RELEASE_CTL_DST"; then
+    record "$name" FAIL "could not install ${RELEASE_CTL_DST}"
+    return 0
+  fi
+  /bin/chmod 755 "$RELEASE_DST" "$RELEASE_CTL_DST" || true
+  local sign_err
+  sign_err=$(/usr/bin/codesign -s - -f -i "$RELEASE_CTL_ID" "$RELEASE_CTL_DST" 2>&1) || {
+    record "$name" FAIL "codesign -s - -i ${RELEASE_CTL_ID} failed for ${RELEASE_CTL_DST}: ${sign_err}"
+    return 0
+  }
+  /bin/cp "${WORK}/state/release.plist" "$RELEASE_PLIST" || {
+    record "$name" FAIL "could not install ${RELEASE_PLIST}"
+    return 0
+  }
+  /bin/chmod 644 "$RELEASE_PLIST" || true
   /bin/launchctl bootout system "$RELEASE_PLIST" >/dev/null 2>&1 || true
-  /bin/launchctl bootstrap system "$RELEASE_PLIST" || true
-  local pid
-  pid=$(helper_pid)
-  if [[ -n "$pid" ]]; then
-    kill -STOP "$pid" 2>/dev/null || true
+  local boot_err
+  boot_err=$(/bin/launchctl bootstrap system "$RELEASE_PLIST" 2>&1) || {
+    record "$name" FAIL "launchctl bootstrap of segue-release failed: ${boot_err}
+$(log_tail "${WORK}/logs/release.err")"
+    return 0
+  }
+  local paused=""
+  paused=$(helper_pid)
+  if [[ -n "$paused" ]]; then
+    kill -STOP "$paused" 2>/dev/null || true
   fi
-  sleep 2
-  local sock="absent"
-  if [[ -S /var/run/segue-release.sock ]]; then
-    sock="present"
+  local reply="" anchor_text="" dns_line="" marked="?" ok=1 why=""
+  if ! wait_until 10 release_socket_present; then
+    ok=0
+    why="${why} release socket did not appear."
+  else
+    reply=$("$RELEASE_CTL_DST" restore --socket "$RELEASE_SOCK" 2>&1 || true)
+    anchor_text=$(/sbin/pfctl -a "$ANCHOR" -sr 2>/dev/null || true)
+    if [[ -f "${WORK}/state/dns.snapshot" ]]; then
+      dns_line=$(/usr/bin/python3 "$PROBES" dns-match "${WORK}/state/dns.snapshot" 2>&1 || true)
+    else
+      dns_line="match=no
+services=no-snapshot"
+    fi
+    marked=$(marked_resolver_count)
+    if printf '%s\n' "$reply" | grep -q '^error='; then
+      ok=0
+      why="${why} release ctl failed."
+    fi
+    if ! printf '%s\n' "$reply" | grep -q '^intent_cleared=true$'; then
+      ok=0
+      why="${why} report intent not cleared."
+    fi
+    if ! printf '%s\n' "$reply" | grep -q '^dns_mode=system$'; then
+      ok=0
+      why="${why} report dns_mode is not system."
+    fi
+    if ! printf '%s\n' "$reply" | grep -q '^resolver_files_remaining=$'; then
+      ok=0
+      why="${why} report still lists resolver files."
+    fi
+    if ! printf '%s\n' "$reply" | grep -q '^failures=$'; then
+      ok=0
+      why="${why} report has failures."
+    fi
+    if anchor_rules_present "$anchor_text"; then
+      ok=0
+      why="${why} anchor still has rules."
+    fi
+    if [[ "$marked" != "0" ]]; then
+      ok=0
+      why="${why} marked resolver files remain."
+    fi
+    if intent_is_armed; then
+      ok=0
+      why="${why} intent file still armed."
+    fi
+    if ! printf '%s\n' "$dns_line" | grep -q '^match=yes$'; then
+      ok=0
+      why="${why} DNS does not match the pre-arm snapshot."
+    fi
   fi
-  if [[ -n "$pid" ]]; then
-    kill -CONT "$pid" 2>/dev/null || true
+  if [[ -n "$paused" ]]; then
+    kill -CONT "$paused" 2>/dev/null || true
   fi
-  record "$name" FAIL "segue-release exists (${src}) but this matrix has no restore message to send. socket=${sock}. Left the helper resumed (SIGCONT)."
+  local evidence="why:${why}
+paused=${paused}
+marked_resolvers=${marked}
+dns:${dns_line}
+--- ctl ---
+${reply}
+--- anchor rules ---
+${anchor_text}
+--- release.err ---
+$(log_tail "${WORK}/logs/release.err")"
+  if [[ "$ok" == 1 ]]; then
+    record "$name" PASS "$evidence"
+  else
+    record "$name" FAIL "$evidence"
+  fi
 }
 
 row_leak() {
   local name=expected-leak-doh-quic
+  # Do not "fix" this leak. Hard-coded DoH/QUIC to an IP outside the fixture
+  # CIDR must stay reachable. Blocking it here would make the row green by
+  # claiming a lock the anchor does not have.
   if dry; then
+    priv /sbin/ifconfig lo0 alias "$LEAK_HOST" netmask 255.255.255.255
+    plan /usr/bin/python3 "$PROBES" serve "$LEAK_HOST" "$LEAK_PORT" leak-ok
+    plan /usr/bin/python3 "$PROBES" udp-echo "$LEAK_HOST" "$LEAK_PORT"
     priv /sbin/pfctl -a "$ANCHOR" -sr
-    plan /usr/bin/python3 "$PROBES" tcp "$UNLISTED_HOST" "$UNLISTED_PORT" 1
-    plan /usr/bin/python3 "$PROBES" udp "$UNLISTED_HOST" "$UNLISTED_PORT"
-    record "$name" DRY-RUN "PASS only if the anchor blocks ${FIXTURE_CIDR} and does not block ${UNLISTED_HOST}:443 (TCP or UDP). An unlisted DoH/QUIC target staying reachable is the expected leak. A broad block, a UDP/443 block, or any block that is not the fixture CIDR is FAIL."
+    plan /usr/bin/python3 "$PROBES" tcp "$LEAK_HOST" "$LEAK_PORT" 2
+    plan /usr/bin/python3 "$PROBES" udp "$LEAK_HOST" "$LEAK_PORT" 1
+    record "$name" DRY-RUN "Do not fix this leak. PASS when the anchor still blocks only ${FIXTURE_CIDR}, TCP to ${LEAK_HOST}:${LEAK_PORT} connects, and UDP round-trips. That address is a lo0 alias in a different TEST-NET (expected leak to an unlisted IP). A broader block, a failed connect, or a fixture-rule packet increase is FAIL."
     return 0
   fi
+  if ! /sbin/ifconfig lo0 | grep -q '203\.0\.113\.10'; then
+    if ! /sbin/ifconfig lo0 alias "$LEAK_HOST" netmask 255.255.255.255; then
+      record "$name" FAIL "could not add lo0 alias ${LEAK_HOST}"
+      return 0
+    fi
+  fi
+  start_bg "${WORK}/state/leak-tcp.pid" /usr/bin/python3 "$PROBES" serve "$LEAK_HOST" "$LEAK_PORT" leak-ok
+  start_bg "${WORK}/state/leak-udp.pid" /usr/bin/python3 "$PROBES" udp-echo "$LEAK_HOST" "$LEAK_PORT"
+  sleep 0.3
   local rules verdict before after tcp udp bp ap be ae
   rules=$(/sbin/pfctl -a "$ANCHOR" -sr 2>&1 || true)
   verdict=$(printf '%s\n' "$rules" | /usr/bin/python3 "$PROBES" leak-rules || true)
   before=$(/sbin/pfctl -a "$ANCHOR" -sr -v 2>&1 || true)
-  tcp=$(/usr/bin/python3 "$PROBES" tcp "$UNLISTED_HOST" "$UNLISTED_PORT" 1 2>&1 || true)
-  udp=$(/usr/bin/python3 "$PROBES" udp "$UNLISTED_HOST" "$UNLISTED_PORT" 2>&1 || true)
+  tcp=$(/usr/bin/python3 "$PROBES" tcp "$LEAK_HOST" "$LEAK_PORT" 2 2>&1 || true)
+  udp=$(/usr/bin/python3 "$PROBES" udp "$LEAK_HOST" "$LEAK_PORT" 1 2>&1 || true)
   after=$(/sbin/pfctl -a "$ANCHOR" -sr -v 2>&1 || true)
   bp=$(num "$(kv packets "$(printf '%s\n' "$before" | /usr/bin/python3 "$PROBES" counter)")")
   ap=$(num "$(kv packets "$(printf '%s\n' "$after" | /usr/bin/python3 "$PROBES" counter)")")
@@ -984,7 +1139,13 @@ udp:${udp}
 fixture-counter packets ${bp}->${ap} evaluations ${be}->${ae}
 --- rules ---
 ${rules}"
-  if printf '%s\n' "$verdict" | grep -q 'ok=yes' && [[ "$ap" == "$bp" && "$ae" == "$be" ]]; then
+  # Evaluations may move for unrelated packets. Packets on the fixture rule
+  # must not: lo0 is passed before that rule, so this leak is not a drop.
+  # Do not "fix" this leak.
+  if printf '%s\n' "$verdict" | grep -q 'ok=yes' \
+    && printf '%s\n' "$tcp" | grep -q 'connect=ok' \
+    && printf '%s\n' "$udp" | grep -q 'recv=1' \
+    && [[ "$ap" == "$bp" ]]; then
     record "$name" PASS "$evidence"
   else
     record "$name" FAIL "$evidence"
@@ -997,7 +1158,7 @@ REBOOT_REQUEST expect=${1}
 The orchestrator should reboot this VM now. This script does not reboot.
 Then, as root, with SEGUE_VM_MATRIX=throwaway:
   bash ${SCRIPT_PATH} --phase post-reboot --expect ${1} --work-dir ${WORK} --json ${WORK}/vm-ailock-matrix-post-reboot-${1}.json
-Archive the Amp Satellite thread only after that JSON is copied out.
+Copy the JSON out before this volume is reused or destroyed.
 EOF
 }
 
@@ -1108,26 +1269,30 @@ $(log_tail "${WORK}/logs/helper.err")"
   row_connected
   row_kill_kernel
   row_kill_helper
-  row_restore
+  # Leak while the anchor is still armed. Restore flushes it.
   row_leak
+  row_restore
 }
 
 print_cleanup() {
   printf '\nPLAN cleanup on exit (not run after a successful pre-reboot)\n'
   priv /bin/launchctl bootout system "$HELPER_PLIST"
   priv /bin/launchctl bootout system "$RELEASE_PLIST"
-  priv /bin/rm -f "$HELPER_PLIST" "$RELEASE_PLIST" "$HELPER_DST" "$KERNEL_DST" "$SEGUE_DST" "$RELEASE_DST" "$UID_DST"
+  priv /bin/rm -f "$HELPER_PLIST" "$RELEASE_PLIST" "$HELPER_DST" "$KERNEL_DST" "$SEGUE_DST" "$RELEASE_DST" "$RELEASE_CTL_DST" "$UID_DST"
   priv /sbin/pfctl -a "$ANCHOR" -F all
   priv /bin/cp "${WORK}/state/pf.conf.bak" /etc/pf.conf
   priv /sbin/pfctl -f /etc/pf.conf
   priv /bin/rm -f "$RESOLVER_FILE" "$INTENT" "$FIXTURE_LIST" "${SUPPORT}/kernel.json" "${SUPPORT}/policy.bundle" "${SUPPORT}/dns-snapshot.json"
   priv /bin/rm -rf "${SUPPORT}/kernel"
   priv /sbin/ifconfig lo0 -alias "$FIXTURE_HOST"
+  priv /sbin/ifconfig lo0 -alias "$LEAK_HOST"
   restore_dns
   priv /sbin/pfctl -X '<pf-token>'
   priv /bin/kill -TERM '<kernel-pid>'
   priv /bin/kill -TERM '<fixture-server-pid>'
   priv /bin/kill -TERM '<ai-host-pid>'
+  priv /bin/kill -TERM '<leak-tcp-pid>'
+  priv /bin/kill -TERM '<leak-udp-pid>'
 }
 
 cleanup() {
@@ -1145,9 +1310,11 @@ cleanup() {
   kill_pidfile "${WORK}/state/fixture.pid" segue
   kill_pidfile "${WORK}/state/ai-host.pid" probes.py
   kill_pidfile "${WORK}/state/loopback.pid" probes.py
+  kill_pidfile "${WORK}/state/leak-tcp.pid" probes.py
+  kill_pidfile "${WORK}/state/leak-udp.pid" probes.py
   /bin/launchctl bootout system "$HELPER_PLIST" >/dev/null 2>&1 || true
   /bin/launchctl bootout system "$RELEASE_PLIST" >/dev/null 2>&1 || true
-  /bin/rm -f "$HELPER_PLIST" "$RELEASE_PLIST" "$HELPER_DST" "$KERNEL_DST" "$SEGUE_DST" "$RELEASE_DST" "$UID_DST"
+  /bin/rm -f "$HELPER_PLIST" "$RELEASE_PLIST" "$HELPER_DST" "$KERNEL_DST" "$SEGUE_DST" "$RELEASE_DST" "$RELEASE_CTL_DST" "$UID_DST"
   /sbin/pfctl -a "$ANCHOR" -F all >/dev/null 2>&1 || true
   if [[ -f "${WORK}/state/pf.conf.bak" ]]; then
     /bin/cp "${WORK}/state/pf.conf.bak" /etc/pf.conf || true
@@ -1156,6 +1323,7 @@ cleanup() {
   /bin/rm -f "$RESOLVER_FILE" "$INTENT" "$FIXTURE_LIST" "${SUPPORT}/kernel.json" "${SUPPORT}/policy.bundle" "${SUPPORT}/dns-snapshot.json"
   /bin/rm -rf "${SUPPORT}/kernel"
   /sbin/ifconfig lo0 -alias "$FIXTURE_HOST" >/dev/null 2>&1 || true
+  /sbin/ifconfig lo0 -alias "$LEAK_HOST" >/dev/null 2>&1 || true
   restore_dns
   if [[ -f "${WORK}/state/pf.token" ]]; then
     /sbin/pfctl -X "$(cat "${WORK}/state/pf.token")" >/dev/null 2>&1 || true
@@ -1163,7 +1331,18 @@ cleanup() {
   /bin/rm -f "${WORK}/state/policy.key"
 }
 
+skip_reboot_rows() {
+  local why="Satellite is destroyed on reboot; run reboot rows on a Tart VM"
+  record reboot-armed SKIP "$why"
+  record reboot-clear SKIP "$why"
+}
+
 show_reboot_plan() {
+  if [[ "${HOST_KIND:-vm}" == "satellite" ]]; then
+    note "reboot rows are SKIP on a Satellite"
+    skip_reboot_rows
+    return 0
+  fi
   local saved="$EXPECT"
   EXPECT=armed
   printf '\nPLAN --phase pre-reboot --expect armed\n'

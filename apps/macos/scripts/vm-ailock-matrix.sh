@@ -15,6 +15,7 @@ usage() {
   cat <<EOF
 usage: SEGUE_VM_MATRIX=throwaway $SCRIPT_PATH [--dry-run]
        [--phase all|pre-reboot|post-reboot] [--expect armed|clear]
+       [--host-kind satellite|vm]
        [--core-rev REV] [--app-rev REV]
        [--core-repo URL] [--app-repo URL]
        [--work-dir DIR] [--json PATH] [--skip-build]
@@ -22,6 +23,10 @@ usage: SEGUE_VM_MATRIX=throwaway $SCRIPT_PATH [--dry-run]
 --dry-run prints the plan and exits 0. It still requires
 SEGUE_VM_MATRIX=throwaway. A real run also requires a VM
 (sysctl kern.hv_vmm_present = 1) and root.
+
+--host-kind satellite skips reboot rows (a Satellite is destroyed on
+reboot). --host-kind vm (the default) is a persistent VM such as Tart,
+where reboot cycles are separate pre/post phases.
 
 Default JSON: <work-dir>/vm-ailock-matrix-<phase>[-<expect>].json
 Default work dir: /var/tmp/segue-vm-matrix
@@ -31,6 +36,7 @@ EOF
 DRY_RUN=0
 PHASE=all
 EXPECT=
+HOST_KIND=vm
 CORE_REV=
 APP_REV=
 CORE_REPO=https://github.com/raydocs/segue-core.git
@@ -44,6 +50,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=1; shift ;;
     --phase) PHASE="${2:?}"; shift 2 ;;
     --expect) EXPECT="${2:?}"; shift 2 ;;
+    --host-kind) HOST_KIND="${2:?}"; shift 2 ;;
     --core-rev) CORE_REV="${2:?}"; shift 2 ;;
     --app-rev) APP_REV="${2:?}"; shift 2 ;;
     --core-repo) CORE_REPO="${2:?}"; shift 2 ;;
@@ -64,6 +71,14 @@ case "$PHASE" in
   all|pre-reboot|post-reboot) ;;
   *)
     echo "unknown phase: $PHASE" >&2
+    exit 2
+    ;;
+esac
+
+case "$HOST_KIND" in
+  satellite|vm) ;;
+  *)
+    echo "unknown host-kind: $HOST_KIND (want satellite or vm)" >&2
     exit 2
     ;;
 esac
@@ -125,14 +140,41 @@ fi
 mkdir -p "${WORK}/state" "${WORK}/logs" "${WORK}/src"
 # shellcheck source=vm/lib.sh
 source "${VM_DIR}/lib.sh"
-/usr/bin/python3 "$REPORT" init "$JSON" "$DRY_RUN" "$PHASE" "$HV_PRESENT" "${CORE_REV:-}" "${APP_REV:-}"
-trap cleanup EXIT
+/usr/bin/python3 "$REPORT" init "$JSON" "$DRY_RUN" "$PHASE" "$HV_PRESENT" "${CORE_REV:-}" "${APP_REV:-}" "$HOST_KIND"
+
+on_exit() {
+  local status=$?
+  cleanup
+  if [[ ! -f "$JSON" ]]; then
+    if [[ "$status" != "0" ]]; then
+      exit "$status"
+    fi
+    return
+  fi
+  local fails
+  fails=$(/usr/bin/python3 "$REPORT" fails "$JSON" 2>/dev/null | /usr/bin/tr -cd '0-9')
+  if [[ -z "$fails" ]]; then
+    fails=0
+  fi
+  printf '\nSUMMARY fails=%s json=%s\n' "$fails" "$JSON"
+  /usr/bin/python3 "$REPORT" dump "$JSON" || true
+  if [[ "$fails" != "0" ]]; then
+    exit 1
+  fi
+  if [[ "$status" != "0" ]]; then
+    exit "$status"
+  fi
+}
+trap on_exit EXIT
 
 if [[ "$DRY_RUN" == 1 ]]; then
-  note "a real run of this process would execute phase ${PHASE} expect=${EXPECT:-n/a}. The plan below is the whole matrix, including both reboot phases."
+  if [[ "$HOST_KIND" == "satellite" ]]; then
+    note "host-kind satellite: one command, no reboot. Reboot rows are SKIP."
+  else
+    note "a real run of this process would execute phase ${PHASE} expect=${EXPECT:-n/a}. The plan below is the whole matrix, including both reboot phases."
+  fi
   run_all
   show_reboot_plan
-  printf '\nSUMMARY dry-run json=%s\n' "$JSON"
   exit 0
 fi
 
@@ -144,9 +186,14 @@ fi
 case "$PHASE" in
   all)
     run_all
+    if [[ "$HOST_KIND" == "satellite" ]]; then
+      skip_reboot_rows
+    fi
     ;;
   pre-reboot)
-    if ! run_pre; then
+    if [[ "$HOST_KIND" == "satellite" ]]; then
+      record "reboot-${EXPECT}" SKIP "Satellite is destroyed on reboot; run reboot rows on a Tart VM"
+    elif ! run_pre; then
       if ! seen "reboot-${EXPECT}"; then
         record "reboot-${EXPECT}" FAIL "pre-reboot setup failed"
       fi
@@ -154,9 +201,12 @@ case "$PHASE" in
     fi
     ;;
   post-reboot)
-    run_post
+    if [[ "$HOST_KIND" == "satellite" ]]; then
+      record "reboot-${EXPECT}" SKIP "Satellite is destroyed on reboot; run reboot rows on a Tart VM"
+    else
+      run_post
+    fi
     ;;
 esac
 
-printf '\nSUMMARY fails=%s json=%s\n' "$EXIT_CODE" "$JSON"
-exit "$EXIT_CODE"
+exit 0
