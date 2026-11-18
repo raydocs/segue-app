@@ -74,6 +74,15 @@ final class RecordingSystemCommands: SystemCommands {
         files[path] != nil
     }
 
+    func listDirectory(_ path: String) throws -> [String] {
+        try check("list \(path)")
+        let prefix = path.hasSuffix("/") ? path : path + "/"
+        return files.keys
+            .filter { $0.hasPrefix(prefix) }
+            .map { String($0.dropFirst(prefix.count)) }
+            .sorted()
+    }
+
     func startGuardListener(address: String, port: UInt16, responder: GuardResponder) throws {
         try check("guard-start \(address):\(port)")
         guardPort = port

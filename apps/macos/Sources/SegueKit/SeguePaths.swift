@@ -17,6 +17,10 @@ public enum SeguePaths {
     /// not create the socket and it does not install the helper.
     public static let helperSocketPath = "/var/run/segue/service.sock"
 
+    /// Release daemon socket (`docs/design/macos.md` §3), the escape hatch a
+    /// stuck helper cannot block. Connected only for Restore network.
+    public static let releaseSocketPath = "/var/run/segue-release.sock"
+
     /// Stage A default for a token file the caller placed in the user config
     /// folder. The production token stays in the helper runtime directory;
     /// this menu does not install a helper and does not look there.

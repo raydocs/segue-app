@@ -21,3 +21,14 @@ public typealias KernelReport = SegueHelperProtocol.KernelReport
 public typealias HelperErrorBody = SegueHelperProtocol.HelperErrorBody
 public typealias HelperStatus = SegueHelperProtocol.HelperStatus
 public typealias HelperEnvelope = SegueHelperProtocol.HelperEnvelope
+
+// Release-daemon wire types (`ReleaseProtocol.swift`), same arrangement: the
+// menu and the release daemon share one contract; these aliases are the
+// SegueKit surface.
+public typealias ReleaseProtocolVersion = SegueHelperProtocol.ReleaseProtocolVersion
+public typealias ReleaseProtocolError = SegueHelperProtocol.ReleaseProtocolError
+public typealias ReleaseOutcome = SegueHelperProtocol.ReleaseOutcome
+public typealias ReleaseMessageKind = SegueHelperProtocol.ReleaseMessageKind
+public typealias ReleaseErrorBody = SegueHelperProtocol.ReleaseErrorBody
+public typealias ReleaseReport = SegueHelperProtocol.ReleaseReport
+public typealias ReleaseEnvelope = SegueHelperProtocol.ReleaseEnvelope

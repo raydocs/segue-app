@@ -6,14 +6,25 @@ final class ResolverFilesTests: XCTestCase {
     func testRendersOneFilePerSuffixWithTheGuardPort() throws {
         let files = try ResolverFiles.render(suffixes: ["api.example", "chat.example"], port: 5354)
         XCTAssertEqual(files.count, 2)
-        XCTAssertEqual(files["api.example"], "nameserver 127.0.0.1\nport 5354\n")
-        XCTAssertEqual(files["chat.example"], "nameserver 127.0.0.1\nport 5354\n")
+        XCTAssertEqual(files["api.example"], "# managed by segue.ailock\nnameserver 127.0.0.1\nport 5354\n")
+        XCTAssertEqual(files["chat.example"], "# managed by segue.ailock\nnameserver 127.0.0.1\nport 5354\n")
     }
 
     func testSuffixesAreNormalizedIntoFilenames() throws {
         let files = try ResolverFiles.render(suffixes: ["API.Example."], port: 53)
         XCTAssertEqual(Set(files.keys), ["api.example"])
-        XCTAssertEqual(files["api.example"], "nameserver 127.0.0.1\nport 53\n")
+        XCTAssertEqual(files["api.example"], "# managed by segue.ailock\nnameserver 127.0.0.1\nport 53\n")
+    }
+
+    func testCarriesMarkerAcceptsOnlyFirstLineMarker() throws {
+        let files = try ResolverFiles.render(suffixes: ["api.example"], port: 5354)
+        let ours = try XCTUnwrap(files["api.example"])
+        XCTAssertTrue(ResolverFiles.carriesMarker(ours))
+        // Same servers, no marker: a foreign file the release daemon leaves alone.
+        XCTAssertFalse(ResolverFiles.carriesMarker("nameserver 127.0.0.1\nport 5354\n"))
+        // The marker must lead; a file that merely mentions it is not ours.
+        XCTAssertFalse(ResolverFiles.carriesMarker("nameserver 127.0.0.1\n# managed by segue.ailock\n"))
+        XCTAssertFalse(ResolverFiles.carriesMarker(""))
     }
 
     func testKernelListSuffixesAllRender() throws {

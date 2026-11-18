@@ -145,7 +145,7 @@ final class AILayerControllerTests: XCTestCase {
         XCTAssertFalse(rules.contains("user "))
         XCTAssertEqual(
             rig.commands.files["/etc/resolver/example.com"],
-            "nameserver 127.0.0.1\nport 5354\n"
+            "# managed by segue.ailock\nnameserver 127.0.0.1\nport 5354\n"
         )
         XCTAssertNotNil(rig.commands.files["/etc/resolver/example.org"])
         XCTAssertEqual(rig.commands.guardPort, 5354)

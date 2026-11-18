@@ -13,10 +13,12 @@ struct SegueApp: App {
         let folder = SeguePaths.userConfigFolder()
         let client = ResolvingKernelControlClient(tokenFile: SeguePaths.defaultTokenFile())
         let helper = HelperClient.connectedToHelperSocket()
+        let release = ReleaseClient.connectedToReleaseSocket()
         let model = ConnectionModel(
             client: client,
             configFolder: folder,
             helper: helper,
+            release: release,
             clock: SystemPollClock(),
             startsPolling: true
         )

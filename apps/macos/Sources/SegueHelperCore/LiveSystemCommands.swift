@@ -91,6 +91,22 @@ public final class LiveSystemCommands: SystemCommands {
         FileManager.default.fileExists(atPath: path)
     }
 
+    public func listDirectory(_ path: String) throws -> [String] {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            return []
+        }
+        let names: [String]
+        do {
+            names = try FileManager.default.contentsOfDirectory(atPath: path)
+        } catch {
+            throw SystemCommandError.io("list \(path)")
+        }
+        return names.sorted()
+    }
+
     public func startGuardListener(address: String, port: UInt16, responder: GuardResponder) throws {
         lock.lock()
         defer { lock.unlock() }
