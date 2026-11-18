@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "kind": "status",
+  "status": {
+    "armed": true,
+    "generation": 4,
+    "held": true,
+    "tun_interface": "utun4",
+    "rules_digest": "abc123",
+    "evidence": {"tcp_proof_ms": 12, "dns_readback": true},
+    "last_error": null
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "state": "reconnecting",
+  "posture": "connecting",
+  "exit_choice": "auto",
+  "current_exit": "la",
+  "exits": ["la", "ny"],
+  "revoked": false,
+  "control_refused": [],
+  "policy": {
+    "source": "inline",
+    "valid": true,
+    "version": null,
+    "expires_at": null,
+    "high_water": 0
+  },
+  "tun": {
+    "interface": null,
+    "routes": "absent"
+  }
+}
