@@ -125,15 +125,307 @@ final class HelperStartupTests: XCTestCase {
         return body()
     }
 
-    private static func roundTrip(socket: String, line: String) throws -> String {
+    private static func roundTrip(socket: String, line: String, timeout: Int = 3) throws -> String {
         let fd = try unixSocket()
         defer { _ = Darwin.close(fd) }
         try connectUnixSocket(fd: fd, path: socket)
-        setReceiveTimeout(fd, seconds: 3)
+        setReceiveTimeout(fd, seconds: timeout)
         try LineIO.writeLine(fd: fd, payload: Data(line.utf8))
         let data = try XCTUnwrap(try LineIO.readLine(fd: fd))
         return String(decoding: data, as: UTF8.self)
     }
+
+    /// A real helper, a fake kernel. The kernel writes `control.json` only
+    /// after a delay and stays `disconnected` with no utun until
+    /// `POST /v1/connect`. Killing it (SIGKILL, so the supervisor restarts
+    /// it) binds a new port and a new token. The helper must reach
+    /// `tun_interface=utun9` both times — which it cannot do if connect is
+    /// fired once before the token file exists, or if the token is cached.
+    func testFakeKernelArmConnectsAcrossRestart() throws {
+        guard let binary = Self.builtHelper() else {
+            XCTFail("segue-core-helper was not built; run swift build before swift test")
+            return
+        }
+        let requirement = try XCTUnwrap(
+            Self.ownRequirement(),
+            "this process has no designated requirement to admit itself"
+        )
+        let root = URL(fileURLWithPath: "/tmp/segue-ka-\(UInt32.random(in: 0...UInt32.max))", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let kernelDir = root.appendingPathComponent("kernel")
+        let binDir = root.appendingPathComponent("bin")
+        try FileManager.default.createDirectory(at: kernelDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+        let script = binDir.appendingPathComponent("segue-kernel")
+        try Data(Self.fakeKernelScript.utf8).write(to: script)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o755))],
+            ofItemAtPath: script.path
+        )
+        let config: [String: Any] = ["dns": ["listen": "127.0.0.1:53"]]
+        try JSONSerialization.data(withJSONObject: config).write(to: root.appendingPathComponent("kernel.json"))
+        try Data("\(getuid())\n".utf8).write(to: root.appendingPathComponent("allowed-uid"))
+        try Data("suffix arm-fixture.example\n".utf8).write(to: root.appendingPathComponent("ai-lock.txt"))
+
+        let port = Self.freeUDPPort()
+        let socket = root.appendingPathComponent("run/service.sock").path
+        let errURL = root.appendingPathComponent("helper.err")
+        FileManager.default.createFile(atPath: errURL.path, contents: nil)
+        let errHandle = try FileHandle(forWritingTo: errURL)
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: binary)
+        process.arguments = [
+            "--paths-root", root.path,
+            "--kernel", script.path,
+            "--guard-port", String(port),
+            "--requirement", requirement,
+        ]
+        var env = ProcessInfo.processInfo.environment
+        env["SEGUE_FAKE_KERNEL_DELAY"] = "0.8"
+        process.environment = env
+        process.standardError = errHandle
+        process.standardOutput = errHandle
+        process.standardInput = FileHandle.nullDevice
+        try process.run()
+        defer {
+            if process.isRunning {
+                process.terminate()
+                process.waitUntilExit()
+            }
+            try? errHandle.close()
+        }
+
+        let appeared = Self.waitUntil(seconds: 8) {
+            FileManager.default.fileExists(atPath: socket) || !process.isRunning
+        }
+        XCTAssertTrue(appeared)
+        guard FileManager.default.fileExists(atPath: socket), process.isRunning else {
+            XCTFail("socket missing; helper stderr:\n\(Self.textFile(errURL))\nfake:\n\(Self.textFile(kernelDir.appendingPathComponent("fake.log")))")
+            return
+        }
+
+        // Armed only after the helper is listening, so the intent watch
+        // (not startup reconcile) is what starts the kernel.
+        let intent = "{\"armed\":true,\"generation\":1,\"name\":\"user_connect\"}\n"
+        try Data(intent.utf8).write(to: root.appendingPathComponent("ai-lock.intent"))
+
+        let first = try Self.waitForTun(socket: socket, seconds: 20)
+        if first == nil {
+            XCTFail("helper did not report utun9; stderr:\n\(Self.textFile(errURL))\nfake:\n\(Self.textFile(kernelDir.appendingPathComponent("fake.log")))\nconnects:\n\(Self.textFile(kernelDir.appendingPathComponent("connects.log")))\nlast:\n\(Self.lastStatus)")
+            return
+        }
+        let firstInstances = Self.connectInstances(kernelDir.appendingPathComponent("connects.log"))
+        XCTAssertEqual(firstInstances.count, 1, "connect should hit the first control port: \(firstInstances)")
+
+        let killed = Darwin.kill(pid_t(first?.pid ?? -1), SIGKILL)
+        XCTAssertEqual(killed, 0, "SIGKILL kernel pid \(first?.pid ?? -1)")
+
+        let second = try Self.waitForTun(socket: socket, seconds: 20) { status in
+            guard let pid = Self.kernelPID(status), pid != first?.pid else { return false }
+            let instances = Self.connectInstances(kernelDir.appendingPathComponent("connects.log"))
+            return instances.count >= 2
+        }
+        if second == nil {
+            XCTFail("helper did not reconnect after restart; stderr:\n\(Self.textFile(errURL))\nfake:\n\(Self.textFile(kernelDir.appendingPathComponent("fake.log")))\nconnects:\n\(Self.textFile(kernelDir.appendingPathComponent("connects.log")))\nlast:\n\(Self.lastStatus)")
+            return
+        }
+        XCTAssertNotEqual(second?.pid, first?.pid)
+        XCTAssertGreaterThanOrEqual(
+            Self.connectInstances(kernelDir.appendingPathComponent("connects.log")).count,
+            2
+        )
+    }
+
+    private static var lastStatus = ""
+
+    /// `status_read` until `tun_interface` is utun9 and the kernel pid is set.
+    /// `ready` can demand a new pid or a second connect.
+    private static func waitForTun(
+        socket: String,
+        seconds: TimeInterval,
+        ready: (([String: Any]) -> Bool)? = nil
+    ) throws -> (pid: Int, status: [String: Any])? {
+        var found: (pid: Int, status: [String: Any])?
+        let ok = waitUntil(seconds: seconds) {
+            let line: String
+            do {
+                line = try roundTrip(socket: socket, line: #"{"version":1,"kind":"status_read"}"#, timeout: 10)
+            } catch {
+                lastStatus = "roundTrip \(error)"
+                return false
+            }
+            lastStatus = line
+            guard let status = statusBody(line),
+                  status["tun_interface"] as? String == "utun9",
+                  let pid = kernelPID(status)
+            else { return false }
+            if let ready, !ready(status) { return false }
+            found = (pid, status)
+            return true
+        }
+        return ok ? found : nil
+    }
+
+    private static func statusBody(_ line: String) -> [String: Any]? {
+        guard let data = line.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return obj["status"] as? [String: Any]
+    }
+
+    private static func kernelPID(_ status: [String: Any]) -> Int? {
+        guard let kernel = status["kernel"] as? [String: Any] else { return nil }
+        if let pid = kernel["pid"] as? Int, pid > 0 { return pid }
+        if let pid = kernel["pid"] as? NSNumber, pid.intValue > 0 { return pid.intValue }
+        return nil
+    }
+
+    /// One line per accepted `POST /v1/connect`: `<instance> <port>`.
+    private static func connectInstances(_ url: URL) -> Set<String> {
+        let text = textFile(url)
+        var ids = Set<String>()
+        for line in text.split(separator: "\n") {
+            let id = line.split(separator: " ").first.map(String.init) ?? ""
+            if !id.isEmpty { ids.insert(id) }
+        }
+        return ids
+    }
+
+    private static func textFile(_ url: URL) -> String {
+        (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+    }
+
+    private static func freeUDPPort() -> UInt16 {
+        let fd = Darwin.socket(AF_INET, SOCK_DGRAM, 0)
+        if fd < 0 { return 35355 }
+        defer { _ = Darwin.close(fd) }
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = 0
+        addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let bound = withUnsafePointer(to: &addr) { pointer -> Int32 in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if bound != 0 { return 35355 }
+        var latest = addr
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let named = withUnsafeMutablePointer(to: &latest) { pointer -> Int32 in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.getsockname(fd, $0, &length)
+            }
+        }
+        if named != 0 { return 35355 }
+        return UInt16(bigEndian: latest.sin_port)
+    }
+
+    /// Fake `segue-kernel`. Delay, then serve the control API. `state` stays
+    /// `disconnected` and `tun.interface` stays null until `POST /v1/connect`.
+    /// Each launch binds a new port and appends `<instance> <port>` when that
+    /// port accepts connect.
+    private static let fakeKernelScript = """
+    #!/usr/bin/python3
+    import json, os, socket, sys, time
+    args = sys.argv[1:]
+    state = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--state-dir" and i + 1 < len(args):
+            state = args[i + 1]
+            i += 2
+            continue
+        i += 1
+    if not state:
+        sys.exit(2)
+    os.makedirs(state, exist_ok=True)
+    instance = os.urandom(4).hex()
+    def trace(msg):
+        with open(os.path.join(state, "fake.log"), "a") as fh:
+            fh.write("%s %s\\n" % (instance, msg))
+    trace("start")
+    time.sleep(float(os.environ.get("SEGUE_FAKE_KERNEL_DELAY", "0.8")))
+    token = os.urandom(8).hex()
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(16)
+    host, port = srv.getsockname()
+    body = json.dumps({"addr": "%s:%d" % (host, port), "token": token})
+    tmp = os.path.join(state, "control.json.tmp")
+    final = os.path.join(state, "control.json")
+    with open(tmp, "w") as fh:
+        fh.write(body)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, final)
+    os.chmod(final, 0o600)
+    trace("listen %s:%d" % (host, port))
+    connected = False
+    def status():
+        if connected:
+            return {"state": "connected", "tun": {"interface": "utun9", "routes": "installed"}}
+        return {"state": "disconnected", "tun": {"interface": None, "routes": "absent"}}
+    def handle(conn):
+        global connected
+        data = b""
+        conn.settimeout(5)
+        while b"\\r\\n\\r\\n" not in data and len(data) < 8192:
+            chunk = conn.recv(1024)
+            if not chunk:
+                break
+            data += chunk
+        text = data.decode("utf-8", "replace")
+        head = text.split("\\r\\n\\r\\n", 1)[0]
+        lines = head.split("\\r\\n")
+        req = lines[0] if lines else ""
+        headers = {}
+        for line in lines[1:]:
+            if ":" in line:
+                key, value = line.split(":", 1)
+                headers[key.strip().lower()] = value.strip()
+        parts = req.split(" ")
+        method = parts[0] if parts else ""
+        path = parts[1] if len(parts) > 1 else ""
+        auth = headers.get("authorization", "")
+        if auth != "Bearer " + token:
+            code, payload = 401, {"error": "bad token"}
+        elif method == "GET" and path == "/v1/status":
+            code, payload = 200, status()
+        elif method == "POST" and path == "/v1/connect":
+            connected = True
+            with open(os.path.join(state, "connects.log"), "a") as fh:
+                fh.write("%s %d\\n" % (instance, port))
+                fh.flush()
+            code, payload = 200, status()
+        else:
+            code, payload = 404, {"error": "not found"}
+        raw = json.dumps(payload).encode("utf-8")
+        reason = {200: "OK", 401: "Unauthorized", 404: "Not Found"}.get(code, "Error")
+        resp = (
+            "HTTP/1.1 %d %s\\r\\nContent-Type: application/json\\r\\nContent-Length: %d\\r\\nConnection: close\\r\\n\\r\\n"
+            % (code, reason, len(raw))
+        ).encode("utf-8") + raw
+        conn.sendall(resp)
+        conn.close()
+    while True:
+        try:
+            client, _addr = srv.accept()
+        except OSError:
+            break
+        try:
+            handle(client)
+        except Exception as exc:
+            trace("err %s" % exc)
+            try:
+                client.close()
+            except Exception:
+                pass
+    """
 
     private static func queryGuard(port: UInt16, name: String, qtype: UInt16) throws -> (rcode: Int, ancount: Int) {
         let query = dnsQuery(name: name, qtype: qtype)

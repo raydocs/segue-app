@@ -59,6 +59,9 @@ private func runHelper() throws {
     // Socket is up before the anchor load. Reconcile can spend seconds in
     // pfctl; the matrix used to probe during that window and record a missing socket.
     session.reconcileArmedIntent()
+    // An intent written after bootstrap (the matrix does this) is picked
+    // up here. Restarting the helper to notice it SIGTERMs the kernel.
+    session.startIntentWatch()
 
     signal(SIGPIPE, SIG_IGN)
     signal(SIGTERM, SIG_IGN)

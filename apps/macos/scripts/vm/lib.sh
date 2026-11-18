@@ -30,6 +30,12 @@ RELEASE_SOCK=/var/run/segue-release.sock
 # no Developer ID. Production plists omit --requirement.
 RELEASE_CTL_ID=com.raydocs.segue.vm-matrix
 UID_DST=/Library/PrivilegedHelperTools/segue.allowed-uid
+# The matrix probe is /usr/bin/python3, which execs Xcode's interpreter
+# (identifier com.apple.python3, anchor apple). The production helper has
+# no --requirement and only admits the Developer ID app. Without this,
+# status_read is "peer denied: code_signing" and helper_kernel_up never
+# sees the utun, even when the kernel is up.
+HELPER_PROBE_REQUIREMENT='identifier "com.apple.python3" and anchor apple'
 HELPER_PLIST=/Library/LaunchDaemons/com.segue.core-helper.plist
 RELEASE_PLIST=/Library/LaunchDaemons/com.segue.release.plist
 INTENT="${SUPPORT}/ai-lock.intent"
@@ -396,6 +402,8 @@ write_helper_plist() {
 		<string>/var/run/segue/service.sock</string>
 		<string>--allowed-uids</string>
 		<string>${UID_DST}</string>
+		<string>--requirement</string>
+		<string>${HELPER_PROBE_REQUIREMENT}</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -414,6 +422,7 @@ install_daemons() {
   note "segue has no VLESS inbound (socks, http, tun, tproxy). The fixture exit is a loopback SOCKS server."
   note "fixture AI suffix and CIDR are added by a signed policy bundle. The product ai-lock.txt is not edited."
   note "arm starts segue-kernel via the helper: it supervises the child, restarts it on crash, and polls /v1/status (control section in kernel.json, token under ${SUPPORT}/kernel) for the utun. --kernel-by-script execs the kernel here instead, for debugging."
+  note "helper --requirement admits ${HELPER_PROBE_REQUIREMENT} so the python probe can status_read and re-arm. Production plists omit --requirement."
   write_helper_plist
   printf '0\n' > "${WORK}/state/allowed-uid"
   priv /bin/mkdir -p /Library/PrivilegedHelperTools /Library/LaunchDaemons /var/run/segue "$SUPPORT" "${SUPPORT}/kernel" "${WORK}/logs" || return 1
@@ -493,56 +502,162 @@ try_socket_arm() {
   /usr/bin/python3 "$PROBES" helper /var/run/segue/service.sock "$payload" 2>&1 || true
 }
 
+# True when the helper accepted the arm (a status envelope). An error
+# envelope — peer denied, malformed — is a failure. The reply is also
+# appended to the socket-arm log the step dump prints.
+socket_arm() {
+  local out
+  if dry; then
+    try_socket_arm
+    return 0
+  fi
+  out=$(try_socket_arm)
+  mkdir -p "${WORK}/state"
+  printf '%s\n' "$out" >> "${WORK}/state/socket-arm.txt"
+  printf '%s\n' "$out" | grep -q '"kind"[[:space:]]*:[[:space:]]*"status"'
+}
+
+# Set by arm_helper when a step fails. run_all puts both into the row.
+ARM_FAIL_STEP=""
+ARM_FAIL_DUMP=""
+
+# What an arm failure needs and the row previously lacked: which wait
+# died, and the helper/kernel/PF state at that moment.
+arm_state_dump() {
+  local step="$1" token="${SUPPORT}/kernel/control.json" payload
+  payload='{"version":1,"kind":"status_read"}'
+  {
+    printf 'arm_step=%s\n' "$step"
+    printf '%s\n' "--- status_read ---"
+    /usr/bin/python3 "$PROBES" helper /var/run/segue/service.sock "$payload" 2>&1 || true
+    printf '%s\n' "--- status_parsed ---"
+    helper_kernel_status || true
+    printf '%s\n' "--- socket-arm ---"
+    if [[ -f "${WORK}/state/socket-arm.txt" ]]; then
+      /bin/cat "${WORK}/state/socket-arm.txt" 2>&1 || true
+    else
+      printf 'no socket-arm reply\n'
+    fi
+    printf '%s\n' "--- control.json ---"
+    if [[ -f "$token" ]]; then
+      /bin/cat "$token" 2>&1 || true
+    else
+      printf 'missing %s\n' "$token"
+    fi
+    printf '%s\n' "--- intent ---"
+    if [[ -f "$INTENT" ]]; then
+      /bin/cat "$INTENT" 2>&1 || true
+    else
+      printf 'missing %s\n' "$INTENT"
+    fi
+    printf '%s\n' "--- resolver files ---"
+    /bin/ls -l /etc/resolver 2>&1 || true
+    if [[ -f "$RESOLVER_FILE" ]]; then
+      printf '%s\n' "--- ${RESOLVER_FILE} ---"
+      /bin/cat "$RESOLVER_FILE" 2>&1 || true
+    else
+      printf 'missing %s\n' "$RESOLVER_FILE"
+    fi
+    printf '%s\n' "--- pfctl -a ${ANCHOR} -s rules ---"
+    /sbin/pfctl -a "$ANCHOR" -s rules 2>&1 || true
+    printf '%s\n' "--- guard dig ---"
+    /usr/bin/dig +time=1 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A 2>&1 || true
+  } 2>&1 || true
+  return 0
+}
+
+arm_failed() {
+  ARM_FAIL_STEP="$1"
+  if dry; then
+    note "arm failed at step ${1}"
+    plan_arm_evidence
+    ARM_FAIL_DUMP="dry-run step ${1}"
+    return 1
+  fi
+  ARM_FAIL_DUMP=$(arm_state_dump "$1")
+  return 1
+}
+
+# wait_until, and on timeout record the step name plus arm_state_dump.
+arm_wait() {
+  local tries="$1" step="$2"
+  shift 2
+  if wait_until "$tries" "$@"; then
+    return 0
+  fi
+  arm_failed "$step"
+}
+
+# Commands a dry-run lists for the step dump, so the plan shows the
+# evidence a failed arm row would carry.
+plan_arm_evidence() {
+  note "arm steps, in order: socket_present, socket_arm, resolver_present, pf_reload (only if the main ruleset does not reference the anchor), anchor_refill, anchor_has_fixture, guard_answers, helper_kernel_up"
+  note "a failed step records its name plus this evidence: status_read reply, parsed kernel_state/pid/tun, socket-arm reply, control.json, the intent file, resolver files, pfctl -a ${ANCHOR} -s rules, guard dig"
+  plan /usr/bin/python3 "$PROBES" helper /var/run/segue/service.sock '<status_read>'
+  plan /bin/cat "${SUPPORT}/kernel/control.json"
+  plan /bin/cat "$INTENT"
+  plan /bin/ls -l /etc/resolver
+  plan /bin/cat "$RESOLVER_FILE"
+  plan /sbin/pfctl -a "$ANCHOR" -s rules
+  plan /usr/bin/dig +time=1 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A
+}
+
 arm_helper() {
-  copy_fixture_list || return 1
+  ARM_FAIL_STEP=""
+  ARM_FAIL_DUMP=""
+  copy_fixture_list || { arm_failed copy_fixture; return 1; }
   # The stack the kernel needs goes in before the intent: the helper reads
   # kernel.json the moment it arms. In --kernel-by-script the script execs
   # the kernel first, so the helper's own start settles config_rejected
   # and leaves the script's kernel the ports.
-  prepare_kernel_stack || return 1
+  prepare_kernel_stack || { arm_failed prepare_kernel; return 1; }
   if kernel_by_script; then
-    start_kernel_process || return 1
+    start_kernel_process || { arm_failed start_kernel_process; return 1; }
   fi
-  write_intent true user_connect 1 || return 1
-  note "same-boot PF: the helper writes the anchor line into /etc/pf.conf but does not reload it. The harness runs pfctl -f /etc/pf.conf so the anchor is referenced, then restarts the helper to refill the anchor. A reboot loads that file itself."
-  note "arm waits until the helper socket exists and dig @127.0.0.1 -p ${GUARD_PORT} is empty NOERROR. A resolver file alone is written before the listener and survives a crash."
+  write_intent true user_connect 1 || { arm_failed write_intent; return 1; }
+  note "same-boot PF: the helper writes the anchor line into /etc/pf.conf but does not reload it. The harness runs pfctl -f /etc/pf.conf so the anchor is referenced. That reload flushes anchor contents, so the harness sends arm again on the socket to refill them. It does not kickstart the helper: a kickstart SIGTERMs the kernel, and the new process binds a new control port."
+  note "the helper polls the intent file, so the arm is noticed without a restart. The helper was started before this file existed."
+  note "arm steps: socket_present, socket_arm, resolver_present, anchor_has_fixture, guard_answers, helper_kernel_up. dig @127.0.0.1 -p ${GUARD_PORT} must be empty NOERROR. A resolver file alone is written before the listener and survives a crash."
   if dry; then
-    priv /bin/launchctl kickstart -k "system/${HELPER_LABEL}"
     plan test -S /var/run/segue/service.sock
-    try_socket_arm >/dev/null
+    socket_arm
+    plan test -f "$RESOLVER_FILE"
+    priv /sbin/pfctl -sr
+    priv /sbin/pfctl -f /etc/pf.conf
+    socket_arm
+    plan /sbin/pfctl -a "$ANCHOR" -s rules
+    plan /usr/bin/dig +time=1 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A
     if kernel_by_script; then
       note "kernel-by-script: the kernel above was exec'd by this script, not the helper."
     else
-      note "the helper starts ${KERNEL_DST} run --state-dir ${SUPPORT}/kernel --log ${WORK}/logs/kernel.log ${SUPPORT}/kernel.json at arm and reports it over status_read."
+      note "the helper starts ${KERNEL_DST} run --state-dir ${SUPPORT}/kernel --log ${WORK}/logs/kernel.log ${SUPPORT}/kernel.json at arm and reports it over status_read (kernel_state=running, kernel_pid, tun=utun<N>)."
       plan /usr/bin/python3 "$PROBES" helper /var/run/segue/service.sock '<status_read: kernel_state=running kernel_pid=<pid> tun=utun<N>>'
     fi
-    priv /sbin/pfctl -f /etc/pf.conf
-    priv /bin/launchctl kickstart -k "system/${HELPER_LABEL}"
-    plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A
+    plan_arm_evidence
     priv /usr/bin/dscacheutil -flushcache
     priv /usr/bin/killall -HUP mDNSResponder
     return 0
   fi
-  # The helper was started before the intent file existed. Restart so it
-  # reads the armed intent, then wait for the listener — not just the file.
-  /bin/launchctl kickstart -k "system/${HELPER_LABEL}" || return 1
-  wait_until 20 socket_present || return 1
-  try_socket_arm > "${WORK}/state/socket-arm.txt" || true
-  if ! wait_until 20 resolver_present; then
-    return 1
-  fi
+  # No kickstart. The running helper polls the intent file and the socket
+  # arm below installs the same generation. Restarting it would SIGTERM
+  # the kernel the first arm had just started.
+  arm_wait 20 socket_present socket_present || return 1
+  socket_arm >/dev/null || { arm_failed socket_arm; return 1; }
+  arm_wait 20 resolver_present resolver_present || return 1
   if ! main_has_anchor; then
-    /sbin/pfctl -f /etc/pf.conf || return 1
-    /bin/launchctl kickstart -k "system/${HELPER_LABEL}" || return 1
-    wait_until 20 socket_present || return 1
-    wait_until 20 resolver_present || return 1
+    /sbin/pfctl -f /etc/pf.conf || { arm_failed pf_reload; return 1; }
+    # pfctl -f flushed the anchor rules the arm just loaded. A second arm
+    # refills them. start() is idempotent, so the kernel keeps its port.
+    socket_arm >/dev/null || { arm_failed anchor_refill; return 1; }
+    arm_wait 20 socket_present socket_present_after_reload || return 1
+    arm_wait 20 resolver_present resolver_present_after_reload || return 1
   fi
-  wait_until 15 anchor_has_fixture || return 1
-  wait_until 15 guard_answers || return 1
+  arm_wait 15 anchor_has_fixture anchor_has_fixture || return 1
+  arm_wait 15 guard_answers guard_answers || return 1
   if ! kernel_by_script; then
     # The kernel the helper started: running, with a utun its control API
     # reports. Its pid lands in the file the kill rows use.
-    wait_until 30 helper_kernel_up || return 1
+    arm_wait 30 helper_kernel_up helper_kernel_up || return 1
   fi
   /usr/bin/dscacheutil -flushcache >/dev/null 2>&1 || true
   /usr/bin/killall -HUP mDNSResponder >/dev/null 2>&1 || true
@@ -750,11 +865,16 @@ except Exception:
     sys.exit(0)
 body = obj.get("status") or {}
 kernel = body.get("kernel") or {}
+err = obj.get("error") or {}
+print("kind=%s" % obj.get("kind", ""))
 print("kernel_state=%s" % kernel.get("state", "missing"))
 print("kernel_pid=%s" % (kernel.get("pid") or ""))
 print("kernel_last_exit=%s" % (kernel.get("last_exit") or ""))
 print("tun=%s" % (body.get("tun_interface") or ""))
 print("armed=%s" % body.get("armed"))
+if isinstance(err, dict) and err.get("code"):
+    print("error=%s" % err.get("code"))
+    print("error_message=%s" % err.get("message", ""))
 '
 }
 
@@ -1488,7 +1608,8 @@ run_all() {
   fi
   start_bg "${WORK}/state/loopback.pid" /usr/bin/python3 "$PROBES" serve 127.0.0.1 "$LOOPBACK_PORT" non-ai-ok
   if ! arm_helper; then
-    record armed-kernel-not-running FAIL "helper did not arm
+    record armed-kernel-not-running FAIL "helper did not arm (step ${ARM_FAIL_STEP:-unknown})
+${ARM_FAIL_DUMP}
 $(log_tail "${WORK}/logs/helper.err")"
     skip_pending "arm failed"
     return 0
