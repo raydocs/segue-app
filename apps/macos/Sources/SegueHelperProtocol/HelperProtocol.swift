@@ -43,6 +43,12 @@ public enum HelperMessageKind: String, Codable, Equatable, Sendable {
     case arm
     case disarm
     case statusRead = "status_read"
+    /// Dev-only. Stops the kernel the way `disarm` does (SIGTERM, then
+    /// SIGKILL) but does not release the layer: the anchor and the guard
+    /// resolver stay. Production (no `--requirement` and no `--paths-root`)
+    /// rejects it. An external kill is not this — that exit is the kernel's
+    /// own clean shutdown, and the supervisor does not restart it.
+    case kernelPause = "kernel_pause"
     case status
     case error
 }
@@ -405,7 +411,7 @@ public struct HelperEnvelope: Codable, Equatable, Sendable {
             return disarm != nil && arm == nil && status == nil && error == nil
         case .status:
             return status != nil && arm == nil && disarm == nil && error == nil
-        case .statusRead:
+        case .statusRead, .kernelPause:
             return arm == nil && disarm == nil && status == nil && error == nil
         case .error:
             return error != nil && arm == nil && disarm == nil && status == nil

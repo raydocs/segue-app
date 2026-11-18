@@ -28,6 +28,10 @@ public final class HelperSession {
     private let control: KernelControlClient?
     private let tunnelTimeout: TimeInterval
     private let pollInterval: TimeInterval
+    /// `kernel_pause` is refused unless the daemon was started with
+    /// `--requirement` or `--paths-root`. Disarm remains the only way a
+    /// production helper stops the kernel, and that path releases the layer.
+    private let allowDevVerbs: Bool
     private let lock = NSLock()
     private var intent: StoredIntent
     private var layerError: String?
@@ -51,7 +55,8 @@ public final class HelperSession {
         control: KernelControlClient? = nil,
         reconcileOnInit: Bool = true,
         tunnelTimeout: TimeInterval = 20,
-        pollInterval: TimeInterval = 0.25
+        pollInterval: TimeInterval = 0.25,
+        allowDevVerbs: Bool = false
     ) {
         self.store = store
         self.kernel = kernel
@@ -59,6 +64,7 @@ public final class HelperSession {
         self.control = control
         self.tunnelTimeout = tunnelTimeout
         self.pollInterval = pollInterval
+        self.allowDevVerbs = allowDevVerbs
         intent = (try? store.load()) ?? .disarmed
         kernel.onStateChange = { [weak self] in self?.kernelStateChanged() }
         if reconcileOnInit, intent.armed {
@@ -125,6 +131,21 @@ public final class HelperSession {
             // tunnel it was protecting goes away.
             converge { try layer.disarm() }
             kernel.stop()
+        case .kernelPause:
+            // Dev verb. `stop` sets the supervisor's stop flag, so this
+            // clean exit is not restarted. The layer stays armed and
+            // converges to the guard (no utun, resolver on the guard port).
+            // Disarm is the wrong tool: it releases the anchor and the files.
+            guard allowDevVerbs else {
+                return HelperEnvelope.failure(
+                    code: HelperErrorCode.unauthorized,
+                    message: "kernel_pause requires --requirement or --paths-root"
+                )
+            }
+            kernel.stop()
+            if isArmed() {
+                convergeTowardTunnel()
+            }
         case .statusRead:
             if isArmed() {
                 convergeTowardTunnel()

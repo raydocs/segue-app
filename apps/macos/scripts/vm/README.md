@@ -126,10 +126,10 @@ plus the reboot the orchestrator performs. Armed and clear are two reboots.
 
 | Row | Pass |
 | --- | --- |
-| `connected` | Arm started the kernel (through the helper) and `GET /v1/status` is `state: connected`: the resolver file is `nameserver 127.0.0.1` port `15353`; kernel DNS returns a `198.18.0.0/15` fake-IP; connecting to it increments `segue_relay_connects_home`; a non-AI address increments neither `connects_home` nor `connects_overseas`; loopback still works |
-| `kill-kernel` | After SIGTERM (SIGKILL only if it is still alive): a clean shutdown is not restarted, so the utun is gone, the pid is dead, and the helper has converged the layer to the guard; the armed name is still empty NOERROR from `127.0.0.1`; example.com and loopback still work; the CIDR is still dropped |
-| `armed-kernel-not-running` | Runs after `kill-kernel`, with the kernel down: no `segue-kernel` process; system `dig www.ailock-fixture.example.com` is empty NOERROR from `127.0.0.1`, and `dig @127.0.0.1 -p 5354` is empty NOERROR; `dig example.com` has an answer; TCP to `198.51.100.10` is dropped; TCP to `127.0.0.1` works |
-| `kill-helper` | During launchd's restart the armed name times out or is empty NOERROR from `127.0.0.1`; an upstream NXDOMAIN is a leak. example.com works before and after. After restart the armed name is empty NOERROR from the guard again, and the helper has taken the kernel back over (the orphan's pid file named it) and restarted it |
+| `connected` | Arm started the kernel (through the helper) and `GET /v1/status` is `state: connected`: the resolver file is `nameserver 127.0.0.1` port `15353`; `dig @127.0.0.1 -p 15353` and the system resolver (`dscacheutil` / `getaddrinfo`, not bare `dig`) both return a `198.18.0.0/15` fake-IP; connecting to it increments `segue_relay_connects_home`; a non-AI address increments neither `connects_home` nor `connects_overseas`; loopback still works. The metrics read is the HTTP/1.0 body the relay writes on accept — it does not read a request, and sending one is reset |
+| `kill-kernel` | SIGTERM the kernel (SIGKILL only if that pid is still alive). The killed pid is gone. During the gap the system resolver returns no real address (nothing, or a fake-IP) and the fixture CIDR is not reachable on the physical NIC. A clean SIGTERM is exit 0 (`SIGTERM, stopped` in the kernel log) and the supervisor does **not** restart it: the utun stays gone, the resolver file is the guard port, `getaddrinfo` returns nothing, `dig @127.0.0.1 -p 5354` is empty NOERROR, example.com is a real address, and the CIDR is a PF drop because the tunnel is down. A crash restart (any other exit) is the other pass: a **new** pid, posture `connected`, fake-IP again, and the CIDR route is a utun rather than a PF drop |
+| `armed-kernel-not-running` | Sends `kernel_pause` (dev verb, accepted only when the helper was started with `--requirement` or `--paths-root` — the matrix plist passes `--requirement`). That stops the kernel the way disarm does, but does **not** release the layer. Then: no `segue-kernel` process; the resolver file is the guard port; `getaddrinfo` of the armed name returns nothing (never a real address) and `dig @127.0.0.1 -p 5354` is empty NOERROR; example.com is a real address; the tunnel is down so TCP to `198.51.100.10` is a PF drop; TCP to `127.0.0.1` works. The row pauses the kernel itself. It does not depend on `kill-kernel` leaving it down, and it does not disarm |
+| `kill-helper` | SIGKILL the helper; launchd brings it back and it starts the kernel again. During the gap the armed name does not resolve to a real address, and example.com still does. After the new kernel is `connected`, the system resolver and `dig @127.0.0.1 -p 15353` are a fake-IP. example.com is not required once the tunnel is up (split-default routes capture port 53, and the lab domestic resolver is TEST-NET) |
 | `restore-via-release-daemon` | With the helper in `SIGSTOP`, `segue-release-ctl restore` returns `outcome=restored` and `anchor_loaded=false`, removes resolver files whose first line is `# managed by segue.ailock`, puts DNS back, and clears intent. `partial` is FAIL. `SKIP` if `segue-release` or `segue-release-ctl` was not built |
 | `expected-leak-doh-quic` | The anchor still blocks only `198.51.100.0/24`. TCP connect to `203.0.113.10:443` succeeds and UDP round-trips. That address is a second lo0 alias, not in the fixture CIDR — the expected leak to an unlisted IP. Do not "fix" this leak. A broader block is `FAIL` |
 | `reboot-armed` / `reboot-clear` | On `--host-kind satellite`, `SKIP` (a Satellite is destroyed on reboot). On a persistent VM, post-reboot only. Armed: resolver file and fixture anchor are back, and the rules are not `block drop all`. Clear: resolver file absent, no fixture block |
@@ -138,6 +138,37 @@ The fixture suffix `ailock-fixture.example.com` and CIDR `198.51.100.0/24` are n
 into `ai-lock.txt`. `.test` is a reserved TLD: the Satellite VPC resolver answers it
 itself, so an empty NOERROR there is not the guard. `example.com` is a real zone and
 this label is NXDOMAIN upstream; empty NOERROR from `127.0.0.1` is the guard.
+
+System-resolver checks do not use bare `dig name`. That reads `/etc/resolv.conf`
+(on a Satellite, `10.0.0.98`) and ignores macOS `/etc/resolver` scoped files, so
+an armed name looks like an upstream SOA even while the guard is holding it.
+The rows call `dscacheutil -q host -a name` and `probes.py resolve`
+(`socket.getaddrinfo`), which honour `/etc/resolver`. `dig @127.0.0.1 -p <port>`
+stays the direct check of the guard or the kernel DNS. The cache is flushed
+first (`dscacheutil -flushcache`, `killall -HUP mDNSResponder`) so a fake-IP
+from the tunnel is not scored after the kernel is gone. Connected means
+getaddrinfo returns a `198.18.0.0/15` address. Kernel down means it returns
+nothing (the guard's empty NOERROR, or a dead listener) — never a real address.
+
+`kernel_pause` is a dev-only helper verb (`{"version":1,"kind":"kernel_pause"}`).
+The helper accepts it only when started with `--requirement` or `--paths-root`.
+It is `KernelSupervisor.stop` (SIGTERM, then SIGKILL if needed) followed by
+the same converge disarm does **not** get: the intent stays armed, the anchor
+stays loaded, and the resolver file is pointed back at the guard port. Disarm
+is the wrong tool for `armed-kernel-not-running` because it releases the layer.
+Production launchd passes neither flag, so the verb is `unauthorized` there.
+An external SIGTERM is not a pause: the kernel exits 0, the supervisor's
+`stopRequested` flag is clear, and a clean exit is not restarted (a crash
+still is). Run 10's `gone=no` on the kill-kernel row is that variable's
+"utun still present? no", and the kernel log is one `SIGTERM, stopped`.
+
+The fixture-CIDR probe follows the tunnel. Tunnel down: the anchor's
+`block drop` must move its counter, the connect must fail, and the route
+must not be `utun` or `lo0`. A counter that goes backwards is the helper
+reloading the anchor; the probe retries. Tunnel up: traffic to the CIDR
+enters the utun (kernel AI tier, then the relay), so a PF drop is **not**
+expected — the route interface has to be a utun. The gap sample fails only
+a connect that succeeds on a physical NIC.
 The kernel gets the suffix and CIDR from a bundle signed with
 `segue-kernel policy-keygen` / `sign-bundle` (a key generated on the VM).
 The helper does not merge a bundle yet, so it is pointed at a generated

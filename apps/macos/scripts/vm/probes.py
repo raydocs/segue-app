@@ -7,6 +7,7 @@ resolver files, or launchd.
 
 import json
 import os
+import signal
 import socket
 import struct
 import subprocess
@@ -220,13 +221,45 @@ def http_exchange(host, port, method, path, extra_headers, timeout):
     return status, body
 
 
-def metric_value(port, name):
-    """segue_relay_<name> from the relay's metrics port, or None."""
+def fetch_metrics_body(port):
+    """Body of the relay's metrics banner, or None.
+
+    segue-relay writes `HTTP/1.0 200` and the counters as soon as the
+    socket is accepted, then closes. It does not read a request. Sending
+    one first races that close: the kernel RSTs, and the body is lost
+    (run 10: ConnectionResetError, ai_home_delta=missing).
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(2.0)
     try:
-        status, body = http_exchange("127.0.0.1", port, "GET", "/", [], 1.0)
+        sock.connect(("127.0.0.1", int(port)))
+        chunks = []
+        while True:
+            try:
+                block = sock.recv(8192)
+            except socket.timeout:
+                break
+            if not block:
+                break
+            chunks.append(block)
     except OSError:
         return None
-    if status != 200:
+    finally:
+        sock.close()
+    raw = b"".join(chunks)
+    head, sep, body = raw.partition(b"\r\n\r\n")
+    if not sep:
+        return None
+    first = head.split(b"\r\n", 1)[0].split(b" ")
+    if len(first) < 2 or not first[1].isdigit() or int(first[1]) != 200:
+        return None
+    return body
+
+
+def metric_value(port, name):
+    """segue_relay_<name> from the relay's metrics port, or None."""
+    body = fetch_metrics_body(port)
+    if body is None:
         return None
     prefix = ("segue_relay_%s " % name).encode("ascii")
     for line in body.splitlines():
@@ -235,6 +268,82 @@ def metric_value(port, name):
             if rest.isdigit():
                 return int(rest)
     return None
+
+
+def _is_fake_ip(ip):
+    """198.18.0.0/15, the kernel fake-IP range. IPv6 is never fake."""
+    try:
+        packed = socket.inet_aton(ip)
+    except OSError:
+        return False
+    value = struct.unpack("!I", packed)[0]
+    return (value & 0xFFFE0000) == 0xC6120000
+
+
+def _lookup(name):
+    """getaddrinfo with a 2s alarm. Returns (addresses, error_name)."""
+
+    def _alarm(_signum, _frame):
+        raise TimeoutError("resolve-timeout")
+
+    previous = signal.signal(signal.SIGALRM, _alarm)
+    signal.alarm(2)
+    try:
+        infos = socket.getaddrinfo(name, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except TimeoutError:
+        return [], "timeout"
+    except socket.gaierror:
+        return [], "gaierror"
+    except OSError as exc:
+        return [], exc.__class__.__name__
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+    addresses = []
+    for info in infos:
+        ip = info[4][0]
+        if ip not in addresses:
+            addresses.append(ip)
+    return addresses, ""
+
+
+def cmd_resolve(argv):
+    """System resolver, which honours /etc/resolver. Bare dig does not.
+
+    Prints key=value from getaddrinfo, then `dscache:` lines from
+    dscacheutil (same path, kept so a dry-run and a FAIL can show both).
+    fake=yes means an address in 198.18.0.0/15. real=yes means any other
+    address. resolved=no is the guard's empty NOERROR (or a dead listener).
+    """
+    name = argv[0]
+    addresses, error = _lookup(name)
+    fake = False
+    real = False
+    for ip in addresses:
+        if _is_fake_ip(ip):
+            fake = True
+        else:
+            real = True
+    print("resolved=%s" % ("yes" if addresses else "no"))
+    print("addresses=%s" % ",".join(addresses))
+    print("fake=%s" % ("yes" if fake else "no"))
+    print("real=%s" % ("yes" if real else "no"))
+    print("error=%s" % error)
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/dscacheutil", "-q", "host", "-a", "name", name],
+            timeout=2,
+            capture_output=True,
+            text=True,
+        )
+        text = proc.stdout or ""
+        if proc.returncode and not text:
+            text = "error=exit-%s" % proc.returncode
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        text = "error=%s" % exc.__class__.__name__
+    for line in text.splitlines():
+        print("dscache:%s" % line)
+    return 0
 
 
 def cmd_kernel_status(argv):
@@ -275,16 +384,15 @@ def cmd_kernel_status(argv):
 
 def cmd_relay_metrics(argv):
     port = argv[0]
-    try:
-        status, body = http_exchange("127.0.0.1", port, "GET", "/", [], 1.0)
-    except OSError as exc:
-        print("error=%s" % exc.__class__.__name__)
+    body = fetch_metrics_body(port)
+    if body is None:
+        print("error=metrics-unavailable")
         return 1
     text = body.decode("utf-8", "replace")
     sys.stdout.write(text)
     if not text.endswith("\n"):
         sys.stdout.write("\n")
-    return 0 if status == 200 else 1
+    return 0
 
 
 def _pump(src, dst):
@@ -549,6 +657,7 @@ def main(argv):
         "forward": (4, cmd_forward),
         "kernel-status": (1, cmd_kernel_status),
         "relay-metrics": (1, cmd_relay_metrics),
+        "resolve": (1, cmd_resolve),
         "egress": (6, cmd_egress),
         "counter": (0, cmd_counter),
         "leak-rules": (0, cmd_leak_rules),

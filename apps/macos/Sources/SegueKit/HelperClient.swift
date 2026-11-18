@@ -108,7 +108,7 @@ public final class HelperClient: HelperControlling, @unchecked Sendable {
                 throw HelperClientError.malformed
             }
             throw HelperClientError.rejected(code: code)
-        case .arm, .disarm, .statusRead:
+        case .arm, .disarm, .statusRead, .kernelPause:
             throw HelperClientError.malformed
         }
     }

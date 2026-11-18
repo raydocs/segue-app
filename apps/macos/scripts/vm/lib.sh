@@ -294,38 +294,72 @@ utun_list() {
   /sbin/ifconfig -l 2>/dev/null | tr ' ' '\n' | grep '^utun' | tr '\n' ' ' || true
 }
 
-dig_query() {
-  /usr/bin/dig +time=2 +tries=1 "$1" A 2>&1 || true
-}
-
 dig_empty_noerror() {
   printf '%s\n' "$1" | grep -q 'status: NOERROR' || return 1
   printf '%s\n' "$1" | grep -Eq 'ANSWER: 0(,|[[:space:]]|$)' || return 1
   return 0
 }
 
-# System dig of an armed name: empty NOERROR, and the answer came from the
-# helper's loopback guard rather than the VPC resolver.
-dig_held_by_guard() {
-  dig_empty_noerror "$1" || return 1
-  printf '%s\n' "$1" | grep -Eq 'SERVER: 127\.0\.0\.1#'
+# System resolver. Bare `dig name` reads /etc/resolv.conf and ignores the
+# /etc/resolver files the helper writes, so on a Satellite it answers from
+# 10.0.0.98. getaddrinfo and dscacheutil honour those files. The probe
+# prints fake=/real=/resolved=; dscache: lines are evidence only.
+system_resolve() {
+  local name="$1"
+  if dry; then
+    plan /usr/bin/dscacheutil -q host -a name "$name"
+    plan /usr/bin/python3 "$PROBES" resolve "$name"
+    return 0
+  fi
+  /usr/bin/python3 "$PROBES" resolve "$name" 2>&1 || true
+}
+
+# Drop a cached fake-IP before scoring the system resolver. mDNSResponder
+# will otherwise return the tunnel's answer after the kernel is gone.
+flush_resolver_cache() {
+  if dry; then
+    priv /usr/bin/dscacheutil -flushcache
+    priv /usr/bin/killall -HUP mDNSResponder
+    return 0
+  fi
+  /usr/bin/dscacheutil -flushcache >/dev/null 2>&1 || true
+  /usr/bin/killall -HUP mDNSResponder >/dev/null 2>&1 || true
+}
+
+resolve_has_fake() {
+  printf '%s\n' "$1" | grep -qx 'fake=yes'
+}
+
+resolve_has_real() {
+  printf '%s\n' "$1" | grep -qx 'real=yes'
+}
+
+resolve_empty() {
+  printf '%s\n' "$1" | grep -qx 'resolved=no' || return 1
+  resolve_has_real "$1" && return 1
+  resolve_has_fake "$1" && return 1
+  return 0
+}
+
+# Dev verb. Stops the kernel without disarming: the anchor and the guard
+# resolver stay. Refused unless the helper was started with --requirement
+# or --paths-root (the matrix plist passes --requirement).
+kernel_pause() {
+  local payload='{"version":1,"kind":"kernel_pause"}'
+  if dry; then
+    plan /usr/bin/python3 "$PROBES" helper /var/run/segue/service.sock "$payload"
+    return 0
+  fi
+  /usr/bin/python3 "$PROBES" helper /var/run/segue/service.sock "$payload" 2>&1 || true
 }
 
 dig_at_guard() {
   /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "$1" A 2>&1 || true
 }
 
-dig_has_answer() {
-  printf '%s\n' "$1" | grep -Eq 'ANSWER: [1-9]'
-}
-
 # An A answer in 198.18.0.0/15 (the kernel's fake-IP range).
 dig_fake_ip() {
   printf '%s\n' "$1" | grep -Eq '198\.1[89]\.[0-9]+\.[0-9]+'
-}
-
-dig_timed_out() {
-  printf '%s\n' "$1" | grep -Eq 'timed out|no servers could be reached'
 }
 
 log_tail() {
@@ -1273,15 +1307,15 @@ kernel_dns_up() {
   printf '%s\n' "$out" | grep -Eq 'rcode=[0-9]'
 }
 
-cidr_drop_probe() {
-  local before after route tcp bp ap be ae
-  if dry; then
-    priv /sbin/ifconfig lo0 -alias "$FIXTURE_HOST"
-    plan /sbin/route -n get "$FIXTURE_HOST"
-    priv /sbin/pfctl -a "$ANCHOR" -sr -v
-    plan /usr/bin/python3 "$PROBES" tcp "$FIXTURE_HOST" "$FIXTURE_TCP_PORT" 1.5
-    return 0
-  fi
+route_iface() {
+  printf '%s\n' "$1" | awk '/interface:/{print $2; exit}'
+}
+
+# One sample of the fixture host. Sets CIDR_EVIDENCE. The lo0 alias is
+# removed first: the anchor passes lo0 before the CIDR block, so a local
+# listener would hide both a drop and a tunnel.
+cidr_sample() {
+  local route tcp before after bp ap be ae
   kill_pidfile "${WORK}/state/ai-host.pid" probes.py
   /sbin/ifconfig lo0 -alias "$FIXTURE_HOST" >/dev/null 2>&1 || true
   route=$(/sbin/route -n get "$FIXTURE_HOST" 2>&1 || true)
@@ -1292,60 +1326,142 @@ cidr_drop_probe() {
   ap=$(num "$(kv packets "$(printf '%s\n' "$after" | /usr/bin/python3 "$PROBES" counter)")")
   be=$(num "$(kv evaluations "$(printf '%s\n' "$before" | /usr/bin/python3 "$PROBES" counter)")")
   ae=$(num "$(kv evaluations "$(printf '%s\n' "$after" | /usr/bin/python3 "$PROBES" counter)")")
+  CIDR_IFACE=$(route_iface "$route")
+  CIDR_TCP="$tcp"
+  CIDR_PACKETS_BEFORE="$bp"
+  CIDR_PACKETS_AFTER="$ap"
+  CIDR_EVALS_BEFORE="$be"
+  CIDR_EVALS_AFTER="$ae"
   CIDR_EVIDENCE="route:
 ${route}
 tcp: ${tcp}
+iface: ${CIDR_IFACE}
 packets ${bp} -> ${ap}
 evaluations ${be} -> ${ae}"
-  if printf '%s\n' "$route" | grep -q 'interface: lo0'; then
-    return 1
-  fi
-  if printf '%s\n' "$tcp" | grep -q 'connect=ok'; then
-    return 1
-  fi
-  if [[ "$ap" -gt "$bp" || "$ae" -gt "$be" ]]; then
+}
+
+# Fixture-CIDR expectation depends on the tunnel.
+#   down       — tunnel down. PF drop: connect fails, route is not utun/lo0,
+#                and the segue-ai counter moves. A counter that goes
+#                backwards is an anchor reload (the helper converges when
+#                the kernel dies); retry.
+#   up         — tunnel up. The flow enters the utun (kernel AI tier, then
+#                the relay). A PF drop is not expected. Pass when the route
+#                interface is a utun.
+#   not-direct — gap sample. Fail only when the connect succeeds on a
+#                physical NIC. utun (relayed) and a failed connect are both
+#                "not reachable directly".
+cidr_probe() {
+  local mode="$1" tries iface
+  if dry; then
+    priv /sbin/ifconfig lo0 -alias "$FIXTURE_HOST"
+    plan /sbin/route -n get "$FIXTURE_HOST"
+    priv /sbin/pfctl -a "$ANCHOR" -sr -v
+    plan /usr/bin/python3 "$PROBES" tcp "$FIXTURE_HOST" "$FIXTURE_TCP_PORT" 1.5
+    note "fixture CIDR mode=${mode}: down = PF drop (counter moves, connect fails, route not utun/lo0; retry if the anchor reload resets the counter); up = route interface is a utun, PF drop not required; not-direct = connect must not succeed on a physical NIC"
     return 0
   fi
+  tries=0
+  while [[ "$tries" -lt 4 ]]; do
+    tries=$((tries + 1))
+    cidr_sample
+    iface="$CIDR_IFACE"
+    case "$mode" in
+      up)
+        case "$iface" in
+          utun*) return 0 ;;
+        esac
+        return 1
+        ;;
+      not-direct)
+        if printf '%s\n' "$CIDR_TCP" | grep -q 'connect=ok'; then
+          case "$iface" in
+            utun*) return 0 ;;
+            *) return 1 ;;
+          esac
+        fi
+        return 0
+        ;;
+      down|*)
+        if [[ "$CIDR_PACKETS_AFTER" -lt "$CIDR_PACKETS_BEFORE" || "$CIDR_EVALS_AFTER" -lt "$CIDR_EVALS_BEFORE" ]]; then
+          sleep 0.4
+          continue
+        fi
+        # A utun route in the first sample is the tunnel still going away
+        # (split defaults). Give it the same retry as a counter reset.
+        case "$iface" in
+          utun*)
+            sleep 0.4
+            continue
+            ;;
+          lo0) return 1 ;;
+        esac
+        if printf '%s\n' "$CIDR_TCP" | grep -q 'connect=ok'; then
+          return 1
+        fi
+        if [[ "$CIDR_PACKETS_AFTER" -gt "$CIDR_PACKETS_BEFORE" || "$CIDR_EVALS_AFTER" -gt "$CIDR_EVALS_BEFORE" ]]; then
+          return 0
+        fi
+        sleep 0.4
+        ;;
+    esac
+  done
   return 1
 }
 
 row_armed() {
   local name=armed-kernel-not-running
   if dry; then
+    kernel_pause || true
+    flush_resolver_cache || true
     plan /usr/bin/pgrep -x segue-kernel
     plan grep -qx "nameserver 127.0.0.1" "$RESOLVER_FILE"
     plan grep -qx "port ${GUARD_PORT}" "$RESOLVER_FILE"
-    plan /usr/bin/dig +time=2 +tries=1 "www.${FIXTURE_SUFFIX}" A
+    system_resolve "www.${FIXTURE_SUFFIX}" || true
     plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A
-    plan /usr/bin/dig +time=2 +tries=1 example.com A
+    system_resolve example.com || true
     plan /usr/bin/python3 "$PROBES" dns 127.0.0.1 "$GUARD_PORT" "www.${FIXTURE_SUFFIX}"
     plan /usr/bin/python3 "$PROBES" tcp 127.0.0.1 "$LOOPBACK_PORT" 2
-    cidr_drop_probe || true
-    note "this row runs after kill-kernel: the SIGTERM was a clean shutdown, so the supervisor does not restart it, and the helper replaced the resolver file in place with the guard port"
-    record "$name" DRY-RUN "armed, kernel not running: no segue-kernel process; resolver file nameserver 127.0.0.1 port ${GUARD_PORT}; system dig of www.${FIXTURE_SUFFIX} is empty NOERROR from 127.0.0.1; dig @127.0.0.1 -p ${GUARD_PORT} is empty NOERROR; dig example.com is a real answer; TCP to ${FIXTURE_CIDR} is dropped; TCP to 127.0.0.1 works"
+    cidr_probe down || true
+    note "kernel_pause is the dev verb (--requirement / --paths-root). It stops the kernel without disarming, so the anchor stays and the resolver file goes back to the guard port. Disarm is not used: that releases the layer. A clean SIGTERM from outside also leaves the kernel down, but this row does not depend on that — it pauses itself."
+    record "$name" DRY-RUN "armed, kernel paused: kernel_pause then no segue-kernel process; resolver file nameserver 127.0.0.1 port ${GUARD_PORT}; getaddrinfo/dscacheutil of www.${FIXTURE_SUFFIX} returns nothing (guard empty NOERROR, never a real address); dig @127.0.0.1 -p ${GUARD_PORT} is empty NOERROR; getaddrinfo of example.com is a real address; tunnel is down so TCP to ${FIXTURE_CIDR} is a PF drop; TCP to 127.0.0.1 works"
     return 0
   fi
-  local dig_ai dig_ex guard loop rules leak guard_dig
-  dig_ai=$(dig_query "www.${FIXTURE_SUFFIX}")
+  local pause_reply sys_ai sys_ex guard loop rules leak guard_dig
+  pause_reply=$(kernel_pause)
+  # The reply is the status after stop. Give the guard port a moment if
+  # the listener was still coming back from an earlier flap.
+  wait_until 15 kernel_process_down || true
+  wait_until 15 resolver_guard_port || true
+  flush_resolver_cache
+  sys_ai=$(system_resolve "www.${FIXTURE_SUFFIX}")
   guard_dig=$(dig_at_guard "www.${FIXTURE_SUFFIX}")
-  dig_ex=$(dig_query example.com)
+  sys_ex=$(system_resolve example.com)
   guard=$(/usr/bin/python3 "$PROBES" dns 127.0.0.1 "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" 2>&1 || true)
   loop=$(/usr/bin/python3 "$PROBES" tcp 127.0.0.1 "$LOOPBACK_PORT" 2 2>&1 || true)
   rules=$(/sbin/pfctl -a "$ANCHOR" -sr 2>&1 || true)
   leak=$(printf '%s\n' "$rules" | /usr/bin/python3 "$PROBES" leak-rules || true)
   CIDR_EVIDENCE=""
   local dropped=0
-  if cidr_drop_probe; then
+  if cidr_probe down; then
     dropped=1
   fi
   local ok=1 why=""
+  if ! printf '%s\n' "$pause_reply" | grep -q '"kind"[[:space:]]*:[[:space:]]*"status"'; then
+    ok=0
+    why="${why} kernel_pause was not accepted."
+  fi
   if ! resolver_guard_port; then
     ok=0
     why="${why} resolver file is not nameserver 127.0.0.1 port ${GUARD_PORT}."
   fi
-  if ! dig_held_by_guard "$dig_ai"; then
+  if ! resolve_empty "$sys_ai"; then
     ok=0
-    why="${why} armed dig was not empty NOERROR from 127.0.0.1."
+    why="${why} system resolver did not return nothing for the armed name."
+  fi
+  if resolve_has_real "$sys_ai"; then
+    ok=0
+    why="${why} system resolver returned a real address for the armed name."
   fi
   if ! dig_empty_noerror "$guard_dig"; then
     ok=0
@@ -1355,9 +1471,9 @@ row_armed() {
     ok=0
     why="${why} guard DNS was not rcode=0 ancount=0."
   fi
-  if ! dig_has_answer "$dig_ex"; then
+  if ! resolve_has_real "$sys_ex" || resolve_has_fake "$sys_ex"; then
     ok=0
-    why="${why} example.com had no answer."
+    why="${why} example.com did not resolve to a real address."
   fi
   if ! printf '%s\n' "$loop" | grep -q 'connect=ok'; then
     ok=0
@@ -1365,30 +1481,29 @@ row_armed() {
   fi
   if [[ "$dropped" != 1 ]]; then
     ok=0
-    why="${why} fixture CIDR was not dropped."
+    why="${why} fixture CIDR was not PF-dropped (tunnel is down)."
   fi
   if ! printf '%s\n' "$leak" | grep -q 'ok=yes'; then
     ok=0
     why="${why} anchor rules are not the narrow fixture block."
   fi
-  if pgrep -x segue-kernel >/dev/null 2>&1; then
+  if ! kernel_process_down; then
     ok=0
     why="${why} a segue-kernel process is still running."
   fi
-  local evidence socket_reply
-  socket_reply=$(cat "${WORK}/state/socket-arm.txt" 2>/dev/null || true)
+  local evidence
   evidence="why:${why}
-socket:${socket_reply}
+pause:${pause_reply}
 guard:${guard}
 --- dig @127.0.0.1 guard ---
 ${guard_dig}
 loop:${loop}
 leak:${leak}
 ${CIDR_EVIDENCE}
---- armed dig ---
-${dig_ai}
---- example.com ---
-${dig_ex}
+--- system resolver armed ---
+${sys_ai}
+--- system resolver example.com ---
+${sys_ex}
 --- rules ---
 ${rules}"
   if [[ "$ok" == 1 ]]; then
@@ -1398,20 +1513,26 @@ ${rules}"
   fi
 }
 
+kernel_process_down() {
+  ! pgrep -x segue-kernel >/dev/null 2>&1
+}
+
 row_connected() {
   local name=connected
   if dry; then
     plan grep -qx "nameserver 127.0.0.1" "$RESOLVER_FILE"
     plan grep -qx "port ${KERNEL_DNS_PORT}" "$RESOLVER_FILE"
-    plan /usr/bin/dig +time=2 +tries=1 "www.${FIXTURE_SUFFIX}" A
+    flush_resolver_cache || true
+    system_resolve "www.${FIXTURE_SUFFIX}" || true
     plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/python3 "$PROBES" dns 127.0.0.1 "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}"
     plan /usr/bin/python3 "$PROBES" egress 198.18.0.1 "$FIXTURE_TCP_PORT" "$RELAY_METRICS_PORT" "$UNLISTED_HOST" "$UNLISTED_PORT" "$LOOPBACK_PORT"
     plan /usr/bin/python3 "$PROBES" relay-metrics "$RELAY_METRICS_PORT"
+    note "relay metrics: the relay writes HTTP/1.0 200 on accept and does not read a request. The probe reads that banner; sending a request first is reset and the counter is missing."
     if [[ -n "${ARM_BLOCK:-}" ]]; then
       note "blocked_by=${ARM_BLOCK}: the arm failed, so this row re-sends the socket arm and waits for the kernel itself; if it never comes up the row is FAIL with blocked_by=${ARM_BLOCK}, not SKIP"
     fi
-    record "$name" DRY-RUN "the kernel arm started is up: resolver file is nameserver 127.0.0.1 port ${KERNEL_DNS_PORT}; system dig of www.${FIXTURE_SUFFIX} is a 198.18.0.0/15 fake-IP; dig @127.0.0.1 -p ${KERNEL_DNS_PORT} is the same fake-IP; a TCP connection to that address increments segue_relay_connects_home; a non-AI address does not increment connects_home or connects_overseas; loopback still connects."
+    record "$name" DRY-RUN "the kernel arm started is up: resolver file is nameserver 127.0.0.1 port ${KERNEL_DNS_PORT}; getaddrinfo/dscacheutil of www.${FIXTURE_SUFFIX} is a 198.18.0.0/15 fake-IP; dig @127.0.0.1 -p ${KERNEL_DNS_PORT} is the same fake-IP; a TCP connection to that address increments segue_relay_connects_home (metrics banner read on accept, no request); a non-AI address does not increment connects_home or connects_overseas; loopback still connects."
     return 0
   fi
   if ! kernel_pidfile_alive; then
@@ -1427,9 +1548,10 @@ $(log_tail "${WORK}/logs/fixture.pid.log")
 $(log_tail "${WORK}/logs/relay.pid.log")"
     return 0
   fi
-  local dns ip egress utun sys_dig kern_dig
+  local dns ip egress utun sys_res kern_dig
   dns=$(/usr/bin/python3 "$PROBES" dns 127.0.0.1 "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}" 2>&1 || true)
-  sys_dig=$(dig_query "www.${FIXTURE_SUFFIX}")
+  flush_resolver_cache
+  sys_res=$(system_resolve "www.${FIXTURE_SUFFIX}")
   kern_dig=$(/usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}" A 2>&1 || true)
   ip="${dns#*answers=}"
   ip="${ip%%,*}"
@@ -1439,12 +1561,12 @@ $(log_tail "${WORK}/logs/relay.pid.log")"
 $(log_tail "${WORK}/logs/kernel.log")"
     return 0
   fi
-  if ! resolver_kernel_port || ! dig_fake_ip "$sys_dig" || ! dig_fake_ip "$kern_dig"; then
-    record "$name" FAIL "resolver file or system dig was not a kernel fake-IP utun=${utun}
+  if ! resolver_kernel_port || ! resolve_has_fake "$sys_res" || resolve_has_real "$sys_res" || ! dig_fake_ip "$kern_dig"; then
+    record "$name" FAIL "resolver file or system resolver was not a kernel fake-IP utun=${utun}
 resolver:
 $(cat "$RESOLVER_FILE" 2>&1 || true)
---- system dig ---
-${sys_dig}
+--- system resolver ---
+${sys_res}
 --- dig @127.0.0.1 -p ${KERNEL_DNS_PORT} ---
 ${kern_dig}
 dns:${dns}"
@@ -1473,16 +1595,23 @@ row_kill_kernel() {
   local name=kill-kernel
   if dry; then
     priv /bin/kill -TERM '<kernel-pid>'
-    plan /sbin/ifconfig -l
-    plan grep -qx "port ${GUARD_PORT}" "$RESOLVER_FILE"
-    plan /usr/bin/dig +time=2 +tries=1 "www.${FIXTURE_SUFFIX}" A
+    flush_resolver_cache || true
+    system_resolve "www.${FIXTURE_SUFFIX}" || true
+    cidr_probe not-direct || true
+    plan /usr/bin/python3 "$PROBES" kernel-status "${SUPPORT}/kernel/control.json"
+    plan /usr/bin/pgrep -x segue-kernel
+    system_resolve "www.${FIXTURE_SUFFIX}" || true
+    plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A
-    plan /usr/bin/dig +time=2 +tries=1 example.com A
-    cidr_drop_probe || true
+    cidr_probe up || true
+    cidr_probe down || true
+    system_resolve example.com || true
+    plan /usr/bin/python3 "$PROBES" tcp 127.0.0.1 "$LOOPBACK_PORT" 2
     if [[ -n "${ARM_BLOCK:-}" ]]; then
       note "blocked_by=${ARM_BLOCK}: no kernel pid file means the arm never brought one up; this row retries that itself and is FAIL with blocked_by=${ARM_BLOCK} if there is still no kernel to kill"
     fi
-    record "$name" DRY-RUN "after SIGTERM to segue-kernel only, waiting for it to exit before SIGKILL: a SIGTERM is a clean shutdown (exit 0), so the supervisor does not restart it and replaces the resolver file in place with port ${GUARD_PORT} (no gap without a file); its utun is gone and the pid is dead; armed name is still empty NOERROR from 127.0.0.1; dig @127.0.0.1 -p ${GUARD_PORT} is empty NOERROR; example.com still answers; fixture CIDR still dropped; non-AI loopback still connects"
+    note "SIGTERM is the kernel's clean shutdown (exit 0, log line 'SIGTERM, stopped'). The supervisor does not restart that. Run 10's utun field 'gone=no' means the interface was not still present. A crash (non-zero, or a signal other than SIGTERM/SIGINT) does restart: utun coming back is then expected, and the row scores the new pid instead of the guard."
+    record "$name" DRY-RUN "SIGTERM the kernel. The killed pid is gone. During the gap getaddrinfo/dscacheutil returns no real address (guard empty, or a 198.18.0.0/15 fake-IP) and the fixture CIDR is not reachable on the physical NIC. Clean SIGTERM is not restarted: steady state is the guard (resolution returns nothing, dig @127.0.0.1 -p ${GUARD_PORT} empty NOERROR, tunnel down so the CIDR is a PF drop, example.com is a real address). If a new pid appears, posture is connected again, the system resolver is a fake-IP, dig @127.0.0.1 -p ${KERNEL_DNS_PORT} is that fake-IP, and the CIDR route is a utun (not a PF drop)."
     return 0
   fi
   if [[ ! -f "${WORK}/state/kernel.pid" ]]; then
@@ -1494,73 +1623,156 @@ $(helper_kernel_status)
 $(log_tail "${WORK}/logs/helper.err")"
     return 0
   fi
-  local pid utun dig_ai dig_ex loop dropped=0 dead=no guard_dig
+  local pid utun i dead=no gap_res gap_direct=0 gap_real=0
   pid=$(cat "${WORK}/state/kernel.pid")
   utun=$(cat "${WORK}/state/utun.name" 2>/dev/null || true)
-  kill_pidfile "${WORK}/state/kernel.pid" segue-kernel
-  if ! ps -p "$pid" >/dev/null 2>&1; then
-    dead=yes
+  kill -TERM "$pid" 2>/dev/null || true
+  i=0
+  while [[ "$i" -lt 20 ]]; do
+    if ! ps -p "$pid" >/dev/null 2>&1; then
+      dead=yes
+      break
+    fi
+    sleep 0.25
+    i=$((i + 1))
+  done
+  if [[ "$dead" != "yes" ]]; then
+    kill -KILL "$pid" 2>/dev/null || true
+    sleep 0.5
+    if ! ps -p "$pid" >/dev/null 2>&1; then
+      dead=yes
+    fi
   fi
-  sleep 1
-  dig_ai=$(dig_query "www.${FIXTURE_SUFFIX}")
-  guard_dig=$(dig_at_guard "www.${FIXTURE_SUFFIX}")
-  dig_ex=$(dig_query example.com)
-  loop=$(/usr/bin/python3 "$PROBES" tcp 127.0.0.1 "$LOOPBACK_PORT" 2 2>&1 || true)
-  if cidr_drop_probe; then
-    dropped=1
+  rm -f "${WORK}/state/kernel.pid"
+  flush_resolver_cache
+  gap_res=$(system_resolve "www.${FIXTURE_SUFFIX}")
+  if resolve_has_real "$gap_res"; then
+    gap_real=1
   fi
-  local still=""
-  if [[ -n "$utun" ]]; then
-    case " $(utun_list) " in
-      *" $utun "*) still="yes" ;;
-      *) still="no" ;;
-    esac
-  else
-    still="unknown"
+  CIDR_EVIDENCE=""
+  if ! cidr_probe not-direct; then
+    gap_direct=1
   fi
-  local ok=1 why=""
+  local gap_cidr="$CIDR_EVIDENCE"
+  # A crash restart is immediate. A clean SIGTERM stays down; a few
+  # seconds is enough to tell the two apart.
+  local newpid="" waited=0
+  while [[ "$waited" -lt 5 ]]; do
+    if helper_kernel_up; then
+      newpid=$(cat "${WORK}/state/kernel.pid" 2>/dev/null || true)
+      if [[ -n "$newpid" && "$newpid" != "$pid" ]]; then
+        break
+      fi
+    fi
+    newpid=""
+    sleep 1
+    waited=$((waited + 1))
+  done
+  local ok=1 why="" evidence after_res kern_dig guard_dig loop sys_ex posture=no
   if [[ "$dead" != "yes" ]]; then
     ok=0
-    why="${why} segue-kernel pid ${pid} still alive."
+    why="${why} killed pid ${pid} still alive."
   fi
-  if [[ "$still" != "no" ]]; then
+  if [[ "$gap_real" == 1 ]]; then
     ok=0
-    why="${why} utun ${utun} still present (${still})."
+    why="${why} armed name resolved to a real address during the gap."
   fi
-  if ! resolver_guard_port; then
+  if [[ "$gap_direct" == 1 ]]; then
     ok=0
-    why="${why} resolver file is not nameserver 127.0.0.1 port ${GUARD_PORT}."
+    why="${why} fixture CIDR was reachable directly during the gap."
   fi
-  if ! dig_held_by_guard "$dig_ai"; then
-    ok=0
-    why="${why} armed name was not empty NOERROR from 127.0.0.1."
-  fi
-  if ! dig_empty_noerror "$guard_dig"; then
-    ok=0
-    why="${why} dig @127.0.0.1 -p ${GUARD_PORT} was not empty NOERROR."
-  fi
-  if ! dig_has_answer "$dig_ex"; then
-    ok=0
-    why="${why} example.com had no answer."
-  fi
-  if ! printf '%s\n' "$loop" | grep -q 'connect=ok'; then
-    ok=0
-    why="${why} non-AI TCP failed."
-  fi
-  if [[ "$dropped" != 1 ]]; then
-    ok=0
-    why="${why} fixture CIDR was not dropped."
-  fi
-  local evidence="why:${why}
-pid=${pid} dead=${dead} utun=${utun} gone=${still}
+  if [[ -n "$newpid" ]]; then
+    if kernel_posture_connected; then
+      posture=yes
+    else
+      ok=0
+      why="${why} restarted kernel posture was not connected."
+    fi
+    flush_resolver_cache
+    after_res=$(system_resolve "www.${FIXTURE_SUFFIX}")
+    kern_dig=$(/usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}" A 2>&1 || true)
+    if ! resolve_has_fake "$after_res" || resolve_has_real "$after_res"; then
+      ok=0
+      why="${why} system resolver was not a fake-IP after restart."
+    fi
+    if ! dig_fake_ip "$kern_dig"; then
+      ok=0
+      why="${why} dig @127.0.0.1 -p ${KERNEL_DNS_PORT} was not a fake-IP after restart."
+    fi
+    if ! cidr_probe up; then
+      ok=0
+      why="${why} fixture CIDR was not routed into the utun after restart."
+    fi
+    evidence="why:${why}
+path=restarted
+pid=${pid} dead=${dead} newpid=${newpid} posture=${posture} utun=${utun}
+--- gap resolver ---
+${gap_res}
+--- gap cidr ---
+${gap_cidr}
+--- after resolver ---
+${after_res}
+--- dig @ kernel ---
+${kern_dig}
+${CIDR_EVIDENCE}"
+  else
+    flush_resolver_cache
+    after_res=$(system_resolve "www.${FIXTURE_SUFFIX}")
+    guard_dig=$(dig_at_guard "www.${FIXTURE_SUFFIX}")
+    sys_ex=$(system_resolve example.com)
+    loop=$(/usr/bin/python3 "$PROBES" tcp 127.0.0.1 "$LOOPBACK_PORT" 2 2>&1 || true)
+    if ! kernel_process_down; then
+      ok=0
+      why="${why} a segue-kernel process is running after a clean stop."
+    fi
+    if [[ -n "$utun" ]]; then
+      case " $(utun_list) " in
+        *" $utun "*)
+          ok=0
+          why="${why} utun ${utun} still present after a clean stop."
+          ;;
+      esac
+    fi
+    if ! resolver_guard_port; then
+      ok=0
+      why="${why} resolver file is not nameserver 127.0.0.1 port ${GUARD_PORT}."
+    fi
+    if ! resolve_empty "$after_res"; then
+      ok=0
+      why="${why} system resolver did not return nothing after the clean stop."
+    fi
+    if ! dig_empty_noerror "$guard_dig"; then
+      ok=0
+      why="${why} dig @127.0.0.1 -p ${GUARD_PORT} was not empty NOERROR."
+    fi
+    if ! resolve_has_real "$sys_ex" || resolve_has_fake "$sys_ex"; then
+      ok=0
+      why="${why} example.com did not resolve to a real address."
+    fi
+    if ! printf '%s\n' "$loop" | grep -q 'connect=ok'; then
+      ok=0
+      why="${why} non-AI loopback TCP failed."
+    fi
+    if ! cidr_probe down; then
+      ok=0
+      why="${why} fixture CIDR was not PF-dropped with the tunnel down."
+    fi
+    evidence="why:${why}
+path=clean-stop
+pid=${pid} dead=${dead} utun=${utun}
 loop:${loop}
-${CIDR_EVIDENCE}
---- armed dig ---
-${dig_ai}
+--- gap resolver ---
+${gap_res}
+--- gap cidr ---
+${gap_cidr}
+--- after resolver ---
+${after_res}
 --- dig @127.0.0.1 guard ---
 ${guard_dig}
 --- example.com ---
-${dig_ex}"
+${sys_ex}
+${CIDR_EVIDENCE}"
+  fi
   if [[ "$ok" == 1 ]]; then
     record "$name" PASS "$evidence"
   else
@@ -1572,14 +1784,20 @@ row_kill_helper() {
   local name=kill-helper
   if dry; then
     priv /bin/kill -9 '<helper-pid>'
-    plan /usr/bin/dig +time=2 +tries=1 "www.${FIXTURE_SUFFIX}" A
-    plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A
-    plan /usr/bin/dig +time=2 +tries=1 example.com A
-    record "$name" DRY-RUN "SIGKILL the helper. launchd KeepAlive restarts it. During the gap the armed name times out or is empty NOERROR from 127.0.0.1 (an upstream NXDOMAIN or SOA is a leak). After the helper is back, system dig and dig @127.0.0.1 -p ${GUARD_PORT} are empty NOERROR from the guard. example.com still answers."
+    flush_resolver_cache || true
+    system_resolve example.com || true
+    system_resolve "www.${FIXTURE_SUFFIX}" || true
+    system_resolve example.com || true
+    plan /usr/bin/python3 "$PROBES" kernel-status "${SUPPORT}/kernel/control.json"
+    flush_resolver_cache || true
+    system_resolve "www.${FIXTURE_SUFFIX}" || true
+    plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}" A
+    record "$name" DRY-RUN "SIGKILL the helper. launchd KeepAlive restarts it and the kernel. During the gap getaddrinfo/dscacheutil of the armed name returns nothing or a fake-IP, never a real address, and example.com still resolves. After the kernel is connected again the armed name is a 198.18.0.0/15 fake-IP (dig @127.0.0.1 -p ${KERNEL_DNS_PORT} too). example.com is not required once the tunnel is up: split-default routes capture port 53 and the lab domestic resolver is TEST-NET."
     return 0
   fi
-  local pid before during during_ex after ex_after
-  before=$(dig_query example.com)
+  local pid before during during_ex after
+  flush_resolver_cache
+  before=$(system_resolve example.com)
   pid=$(helper_pid)
   if [[ -z "$pid" ]]; then
     # launchd KeepAlive owns this precondition; give it a window of this
@@ -1594,45 +1812,68 @@ $(log_tail "${WORK}/logs/helper.err")"
     return 0
   fi
   kill -9 "$pid" 2>/dev/null || true
-  during=$(dig_query "www.${FIXTURE_SUFFIX}")
-  during_ex=$(dig_query example.com)
-  local restarted=0
+  # Sample before launchd has the helper back. No flush here: it would
+  # eat the gap, and the cache from the pre-kill lookup is the right one
+  # while the tunnel is down.
+  during=$(system_resolve "www.${FIXTURE_SUFFIX}")
+  during_ex=$(system_resolve example.com)
+  local restarted=0 kernel_back=0
   if wait_until 20 helper_running; then
     restarted=1
-    # The process is back before the guard is. Do not score the restart
-    # against the gap where the listener is still coming up.
     wait_until 15 guard_answers || true
     if ! kernel_by_script; then
       # The restarted helper re-armed the narrow layer and took the kernel
       # back over (the orphan's pid file named it) or started it fresh.
-      wait_until 30 helper_kernel_up || true
+      if wait_until 30 helper_kernel_up; then
+        kernel_back=1
+        wait_until 20 kernel_posture_connected || true
+      fi
     fi
   fi
-  after=$(dig_query "www.${FIXTURE_SUFFIX}")
-  ex_after=$(dig_query example.com)
-  local ok=1 why=""
-  if dig_has_answer "$during"; then
-    ok=0
-    why="${why} armed name answered during the gap."
-  elif dig_held_by_guard "$during" || dig_timed_out "$during"; then
-    :
-  else
-    ok=0
-    why="${why} armed dig during the gap was neither empty NOERROR from 127.0.0.1 nor a timeout."
+  flush_resolver_cache
+  after=$(system_resolve "www.${FIXTURE_SUFFIX}")
+  local kern_dig=""
+  if [[ "$kernel_back" == 1 ]]; then
+    kern_dig=$(/usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}" A 2>&1 || true)
   fi
-  if ! dig_has_answer "$before" || ! dig_has_answer "$during_ex" || ! dig_has_answer "$ex_after"; then
+  local ok=1 why=""
+  if resolve_has_real "$during"; then
     ok=0
-    why="${why} example.com failed before, during, or after the restart."
+    why="${why} armed name resolved to a real address during the gap."
+  fi
+  if ! resolve_has_real "$before" || resolve_has_fake "$before"; then
+    ok=0
+    why="${why} example.com did not resolve before the restart."
+  fi
+  if ! resolve_has_real "$during_ex" || resolve_has_fake "$during_ex"; then
+    ok=0
+    why="${why} example.com did not resolve during the gap."
   fi
   if [[ "$restarted" != 1 ]]; then
     ok=0
     why="${why} helper did not restart."
-  elif ! dig_held_by_guard "$after"; then
+  elif [[ "$kernel_back" == 1 ]]; then
+    if ! kernel_posture_connected; then
+      ok=0
+      why="${why} kernel posture was not connected after the helper returned."
+    fi
+    if ! resolve_has_fake "$after" || resolve_has_real "$after"; then
+      ok=0
+      why="${why} system resolver was not a fake-IP after the kernel returned."
+    fi
+    if ! dig_fake_ip "$kern_dig"; then
+      ok=0
+      why="${why} dig @127.0.0.1 -p ${KERNEL_DNS_PORT} was not a fake-IP after the kernel returned."
+    fi
+  elif ! kernel_by_script; then
     ok=0
-    why="${why} armed name was not empty NOERROR from 127.0.0.1 after the helper returned."
+    why="${why} helper did not bring the kernel back."
+  elif resolve_has_real "$after"; then
+    ok=0
+    why="${why} armed name resolved to a real address after the helper returned."
   fi
   local evidence="why:${why}
-killed=${pid} restarted=$(helper_pid)
+killed=${pid} restarted=$(helper_pid) kernel_back=${kernel_back}
 --- example.com before ---
 ${before}
 --- armed during ---
@@ -1641,8 +1882,8 @@ ${during}
 ${during_ex}
 --- armed after ---
 ${after}
---- example.com after ---
-${ex_after}"
+--- dig @ kernel ---
+${kern_dig}"
   if [[ "$ok" == 1 ]]; then
     record "$name" PASS "$evidence"
   else
@@ -1955,16 +2196,17 @@ run_pre() {
 run_post() {
   local name="reboot-${EXPECT}"
   if dry; then
-    plan /usr/bin/dig +time=2 +tries=1 "www.${FIXTURE_SUFFIX}" A
+    flush_resolver_cache || true
+    system_resolve "www.${FIXTURE_SUFFIX}" || true
     priv /sbin/pfctl -a "$ANCHOR" -sr
     priv /sbin/pfctl -sr
     plan /bin/cat "$RESOLVER_FILE"
     plan /bin/cat "$INTENT"
-    note "armed: resolver file and fixture block are back, main rules reference ${ANCHOR}, rules have no block drop all, kernel was not required"
+    note "armed: resolver file and fixture block are back, main rules reference ${ANCHOR}, rules have no block drop all. System resolver is recorded (getaddrinfo/dscacheutil); a real address for the armed name is a leak but reboot pass/fail stays on the file and the anchor."
     note "clear: resolver file absent, anchor has no fixture block, intent is not armed"
     return 0
   fi
-  local rules leak main intent
+  local rules leak main intent sys_ai
   if [[ "$EXPECT" == "armed" ]]; then
     wait_until 45 helper_running || true
     wait_until 20 resolver_present || true
@@ -1977,14 +2219,23 @@ run_post() {
   leak=$(printf '%s\n' "$rules" | /usr/bin/python3 "$PROBES" leak-rules || true)
   main=$(/sbin/pfctl -sr 2>&1 || true)
   intent=$(cat "$INTENT" 2>/dev/null || printf 'missing\n')
+  flush_resolver_cache
+  sys_ai=$(system_resolve "www.${FIXTURE_SUFFIX}")
   local evidence="intent:${intent}
 leak:${leak}
 resolver_present=$(resolver_present && echo yes || echo no)
+--- system resolver ---
+${sys_ai}
 --- anchor ---
 ${rules}
 --- main ---
 ${main}"
   if [[ "$EXPECT" == "armed" ]]; then
+    if resolve_has_real "$sys_ai"; then
+      record "$name" FAIL "armed name resolved to a real address after reboot
+${evidence}"
+      return 0
+    fi
     if resolver_present && anchor_has_fixture && printf '%s\n' "$leak" | grep -q 'ok=yes' && printf '%s\n' "$main" | grep -F "$ANCHOR" >/dev/null && printf '%s\n' "$intent" | grep -q '"armed":true'; then
       record "$name" PASS "$evidence"
     else

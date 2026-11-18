@@ -39,7 +39,8 @@ private func runHelper() throws {
         kernel: supervisor,
         layer: AILayerController.live(kernel: supervisor, paths: paths),
         control: control,
-        reconcileOnInit: false
+        reconcileOnInit: false,
+        allowDevVerbs: paths.devVerbs
     )
     let server = HelperSocketServer(
         path: paths.socketPath,
