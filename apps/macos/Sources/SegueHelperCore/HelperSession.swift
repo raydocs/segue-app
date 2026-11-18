@@ -30,6 +30,12 @@ public final class HelperSession {
     private var intent: StoredIntent
     private var layerError: String?
     private var convergingTunnel = false
+    /// Bumped every time a poll is requested, including when one is already
+    /// running. The in-flight loop adopts the new generation and extends
+    /// its deadline, so a restart that lands a new control port is not
+    /// forgotten when the loop later exits.
+    private var convergeGeneration: UInt64 = 0
+    private var intentWatch: DispatchSourceTimer?
 
     /// `reconcileOnInit` is false for the real daemon: it binds the socket
     /// first, then calls `reconcileArmedIntent`. Otherwise a slow (or
@@ -65,6 +71,33 @@ public final class HelperSession {
         guard isArmed() else { return }
         converge { try layer.reconcileOnLaunch() }
         startKernel()
+    }
+
+    /// Poll the intent file. The daemon is often started before the file
+    /// exists (the matrix writes it after `launchctl bootstrap`); without
+    /// this, the only way to notice the arm was to kill and restart the
+    /// helper, which SIGTERMs the kernel. A clear intent is not applied
+    /// here — a release still goes through the disarm envelope. `interval
+    /// <= 0` does not start the poll.
+    public func startIntentWatch(interval: TimeInterval = 0.5) {
+        guard interval > 0 else { return }
+        lock.lock()
+        if intentWatch != nil {
+            lock.unlock()
+            return
+        }
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        intentWatch = timer
+        lock.unlock()
+        timer.schedule(deadline: .now() + interval, repeating: interval)
+        timer.setEventHandler { [weak self] in
+            self?.reloadIntentFromDisk()
+        }
+        timer.resume()
+    }
+
+    deinit {
+        intentWatch?.cancel()
     }
 
     public func handle(_ envelope: HelperEnvelope) throws -> HelperEnvelope {
@@ -122,15 +155,19 @@ public final class HelperSession {
         converge { try layer.kernelChanged() }
     }
 
-    /// The start returns before the kernel has a carrier. Nudge it with
-    /// `POST /v1/connect` (the kernel otherwise waits for the first
-    /// proxied flow), then poll `GET /v1/status` until it reports a
-    /// connected carrier with a utun, converging the layer on every pass:
-    /// guard while it comes up, kernel DNS after. The loop gives up after
-    /// `tunnelTimeout` and leaves the guard in place.
+    /// The start returns before the kernel has a carrier. Poll until
+    /// `GET /v1/status` reports a connected carrier with a utun, and
+    /// `POST /v1/connect` on every pass that is not there yet. One shot
+    /// at the start is not enough: the token file is written after the
+    /// kernel binds, so the first call often finds no `control.json`,
+    /// and a restart replaces that file with a new port and token. The
+    /// control client re-reads the file on every call. The loop gives up
+    /// after `tunnelTimeout` (extended when a restart arrives mid-poll)
+    /// and leaves the guard in place.
     private func scheduleTunnelConvergence() {
         guard tunnelTimeout > 0 else { return }
         lock.lock()
+        convergeGeneration &+= 1
         if convergingTunnel {
             lock.unlock()
             return
@@ -138,21 +175,64 @@ public final class HelperSession {
         convergingTunnel = true
         lock.unlock()
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self else { return }
-            self.control?.connect()
-            let deadline = Date().addingTimeInterval(self.tunnelTimeout)
-            while Date() < deadline {
-                self.convergeTowardTunnel()
-                // `dnsAddress` is published only for a connected carrier,
-                // so both set is the kernel's own "tunnel up".
-                let snap = self.kernel.snapshot()
-                if snap.tunInterface != nil, snap.dnsAddress != nil { break }
-                Thread.sleep(forTimeInterval: self.pollInterval)
-            }
-            self.lock.lock()
-            self.convergingTunnel = false
-            self.lock.unlock()
+            self?.pollTunnel()
         }
+    }
+
+    private func pollTunnel() {
+        var deadline = Date().addingTimeInterval(tunnelTimeout)
+        var generation = currentConvergeGeneration()
+        while Date() < deadline {
+            let now = currentConvergeGeneration()
+            if now != generation {
+                // A restart asked for another poll while this one was
+                // in flight. The previous "up" belonged to the dead
+                // process; give the new control port a full window.
+                generation = now
+                deadline = Date().addingTimeInterval(tunnelTimeout)
+            }
+            let snap = kernel.snapshot()
+            // `dnsAddress` is published only for a connected carrier,
+            // so both set is the kernel's own "tunnel up".
+            if snap.tunInterface != nil, snap.dnsAddress != nil,
+               currentConvergeGeneration() == generation {
+                break
+            }
+            control?.connect()
+            convergeTowardTunnel()
+            Thread.sleep(forTimeInterval: pollInterval)
+        }
+        lock.lock()
+        let missed = convergeGeneration != generation
+        convergingTunnel = false
+        lock.unlock()
+        if missed {
+            scheduleTunnelConvergence()
+        }
+    }
+
+    private func currentConvergeGeneration() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return convergeGeneration
+    }
+
+    /// An intent file written after start. Armed and different from what
+    /// we already applied: persist it (no-op when the bytes match), install
+    /// the layer, and start the kernel. `start` leaves a live child alone.
+    private func reloadIntentFromDisk() {
+        guard let loaded = try? store.load(), loaded.armed else { return }
+        lock.lock()
+        let previous = intent
+        lock.unlock()
+        guard loaded != previous else { return }
+        do {
+            try remember(loaded)
+        } catch {
+            return
+        }
+        converge { try layer.arm() }
+        startKernel()
     }
 
     /// The supervisor's exit report: crash, clean stop, or budget
