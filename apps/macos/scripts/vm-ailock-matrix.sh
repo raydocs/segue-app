@@ -20,6 +20,7 @@ usage: SEGUE_VM_MATRIX=throwaway $SCRIPT_PATH [--dry-run]
        [--core-repo URL] [--app-repo URL]
        [--work-dir DIR] [--json PATH] [--skip-build]
        [--kernel-by-script] [--exit-via loopback|alias]
+       [--simulate-arm-fail <step>]
 
 --dry-run prints the plan and exits 0. It still requires
 SEGUE_VM_MATRIX=throwaway. A real run also requires a VM
@@ -40,6 +41,11 @@ loopback (the default) points the exit straight at the relay on lo0;
 alias keeps the 192.0.2.10 forwarder on an alias of the physical NIC for
 comparison with older cores that cannot dial loopback from the carrier.
 
+--simulate-arm-fail <step> is dry-run only: the plan behaves as if the
+arm died at that step, showing that every row is still planned and
+records FAIL with blocked_by=<step> instead of SKIP. A run without
+--dry-run refuses this flag (exit 2).
+
 Default JSON: <work-dir>/vm-ailock-matrix-<phase>[-<expect>].json
 Default work dir: /var/tmp/segue-vm-matrix
 EOF
@@ -58,6 +64,7 @@ JSON=
 SKIP_BUILD=0
 KERNEL_BY_SCRIPT=0
 EXIT_VIA=loopback
+SIMULATE_ARM_FAIL=
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -74,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --skip-build) SKIP_BUILD=1; shift ;;
     --kernel-by-script) KERNEL_BY_SCRIPT=1; shift ;;
     --exit-via) EXIT_VIA="${2:?}"; shift 2 ;;
+    --simulate-arm-fail) SIMULATE_ARM_FAIL="${2:?}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *)
       echo "unknown argument: $1" >&2
@@ -106,6 +114,11 @@ case "$HOST_KIND" in
     exit 2
     ;;
 esac
+
+if [[ -n "$SIMULATE_ARM_FAIL" && "$DRY_RUN" != 1 ]]; then
+  echo "refusing: --simulate-arm-fail is for --dry-run only; a real run cannot inject an arm failure." >&2
+  exit 2
+fi
 
 if [[ "$PHASE" == "pre-reboot" || "$PHASE" == "post-reboot" ]]; then
   case "$EXPECT" in
@@ -182,7 +195,9 @@ on_exit() {
   fi
   printf '\nSUMMARY fails=%s json=%s\n' "$fails" "$JSON"
   /usr/bin/python3 "$REPORT" dump "$JSON" || true
-  if [[ "$fails" != "0" ]]; then
+  # A dry run only plans, but --simulate-arm-fail deliberately plants FAIL
+  # rows in the plan JSON; those are not this machine's test result.
+  if [[ "$fails" != "0" && "$DRY_RUN" != "1" ]]; then
     exit 1
   fi
   if [[ "$status" != "0" ]]; then

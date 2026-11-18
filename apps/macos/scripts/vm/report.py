@@ -67,20 +67,24 @@ def main(argv):
         save(path, document)
         return 0
     if command == "add":
-        if len(argv) != 5:
+        if len(argv) not in (5, 6):
             return 2
         path, name, result = argv[2:5]
+        blocked_by = argv[5] if len(argv) == 6 else ""
         evidence = sys.stdin.read()
         if len(evidence) > 8000:
             evidence = evidence[:8000] + "\n...truncated\n"
+        row = {
+            "name": name,
+            "result": result,
+            "evidence": evidence.rstrip("\n"),
+        }
+        if blocked_by:
+            # The arm step whose failure removed this row's precondition.
+            # A blocked row still counts as a FAIL.
+            row["blocked_by"] = blocked_by
         document = load(path)
-        document["rows"].append(
-            {
-                "name": name,
-                "result": result,
-                "evidence": evidence.rstrip("\n"),
-            }
-        )
+        document["rows"].append(row)
         document["updated_at"] = utc_now()
         save(path, document)
         return 0

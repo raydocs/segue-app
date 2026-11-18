@@ -135,23 +135,60 @@ seen() {
   esac
 }
 
+mark_seen() {
+  case " $SEEN_ROWS " in
+    *" $1 "*) ;;
+    *) SEEN_ROWS="$SEEN_ROWS $1" ;;
+  esac
+}
+
+# record <name> <result> <evidence> [blocked_by]. blocked_by names the arm
+# step whose failure removed this row's precondition; it lands in the JSON
+# next to the result. A blocked row is a FAIL that counts in SUMMARY, never
+# a SKIP: the run keeps going so one bug does not hide the next one.
 record() {
-  local name="$1" result="$2" evidence="$3"
+  local name="$1" result="$2" evidence="$3" blocked_by="${4:-}"
   if seen "$name"; then
     return 0
   fi
-  SEEN_ROWS="$SEEN_ROWS $name"
+  mark_seen "$name"
   if [[ "$result" == "FAIL" ]] && ! dry; then
     evidence="${evidence}
 $(capture_fail_context)"
   fi
-  printf '\nROW %s %s\n%s\n' "$result" "$name" "$evidence"
-  printf '%s' "$evidence" | /usr/bin/python3 "$REPORT" add "$JSON" "$name" "$result"
+  if ! dry; then
+    # The marker outlives the subshell run_row kills on a row timeout, so
+    # a row that recorded just before its budget ran out is not recorded
+    # twice.
+    mkdir -p "${WORK}/state/rows" 2>/dev/null || true
+    touch "${WORK}/state/rows/${name}" 2>/dev/null || true
+  fi
+  if [[ -n "$blocked_by" ]]; then
+    printf '\nROW %s %s blocked_by=%s\n%s\n' "$result" "$name" "$blocked_by" "$evidence"
+  else
+    printf '\nROW %s %s\n%s\n' "$result" "$name" "$evidence"
+  fi
+  printf '%s' "$evidence" | /usr/bin/python3 "$REPORT" add "$JSON" "$name" "$result" "$blocked_by"
   if [[ "$result" == "FAIL" ]]; then
     EXIT_CODE=1
   fi
 }
 
+# FAIL, stamped blocked_by=<arm step> when a failed arm step is why this
+# row's precondition never came true. Without an arm failure it is a plain
+# FAIL: something this row owns is broken.
+blocked_fail() {
+  local name="$1" evidence="$2"
+  if [[ -n "${ARM_BLOCK:-}" ]]; then
+    record "$name" FAIL "$evidence" "$ARM_BLOCK"
+  else
+    record "$name" FAIL "$evidence"
+  fi
+}
+
+# SKIP is only for a missing binary (build or install failed: no row can
+# run its probes) and, in the entry script, for reboot rows on a Satellite.
+# A failed arm step or a failed row never skips a later row.
 skip_pending() {
   local why="$1" name
   for name in \
@@ -604,6 +641,9 @@ socket_arm() {
 # Set by arm_helper when a step fails. run_all puts both into the row.
 ARM_FAIL_STEP=""
 ARM_FAIL_DUMP=""
+# Set by run_all while the rows run when the arm failed. blocked_fail
+# stamps it on a row whose precondition that failure removed.
+ARM_BLOCK=""
 
 # What an arm failure needs and the row previously lacked: which wait
 # died, and the helper/kernel/PF state at that moment.
@@ -699,6 +739,14 @@ plan_arm_evidence() {
 arm_helper() {
   ARM_FAIL_STEP=""
   ARM_FAIL_DUMP=""
+  if [[ -n "${SIMULATE_ARM_FAIL:-}" ]]; then
+    # Dry-run only; the entry script refuses a real run with the flag.
+    # The plan then shows what a run does when the arm dies at this step:
+    # the row is FAIL with the step dump and every later row still runs.
+    note "simulating an arm failure at step ${SIMULATE_ARM_FAIL}"
+    arm_failed "$SIMULATE_ARM_FAIL"
+    return 1
+  fi
   copy_fixture_list || { arm_failed copy_fixture; return 1; }
   # The stack the kernel needs goes in before the intent: the helper reads
   # kernel.json the moment it arms. In --kernel-by-script the script execs
@@ -1166,6 +1214,27 @@ helper_kernel_up() {
   printf '%s\n' "$tun" > "${WORK}/state/utun.name"
 }
 
+kernel_pidfile_alive() {
+  [[ -f "${WORK}/state/kernel.pid" ]] && pgrep -x segue-kernel >/dev/null 2>&1
+}
+
+# A row's own bounded retry of what the arm waits for. Rows do not trust
+# the arm: after a failed step they re-send the idempotent socket arm (as
+# the arm itself does after pfctl -f flushed the anchor) and wait again,
+# then record PASS/FAIL on their own evidence. blocked_fail names the arm
+# step when the kernel still never comes up.
+row_wait_kernel_up() {
+  if kernel_by_script; then
+    wait_until 30 kernel_pidfile_alive
+    return
+  fi
+  if socket_present; then
+    socket_arm >/dev/null || true
+  fi
+  wait_until 30 helper_kernel_up || return 1
+  wait_until 20 kernel_posture_connected
+}
+
 # Full GET /v1/status body (or an error line). The token stays in control.json.
 kernel_status_text() {
   /usr/bin/python3 "$PROBES" kernel-status "${SUPPORT}/kernel/control.json" 2>&1 || true
@@ -1339,11 +1408,18 @@ row_connected() {
     plan /usr/bin/python3 "$PROBES" dns 127.0.0.1 "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}"
     plan /usr/bin/python3 "$PROBES" egress 198.18.0.1 "$FIXTURE_TCP_PORT" "$RELAY_METRICS_PORT" "$UNLISTED_HOST" "$UNLISTED_PORT" "$LOOPBACK_PORT"
     plan /usr/bin/python3 "$PROBES" relay-metrics "$RELAY_METRICS_PORT"
+    if [[ -n "${ARM_BLOCK:-}" ]]; then
+      note "blocked_by=${ARM_BLOCK}: the arm failed, so this row re-sends the socket arm and waits for the kernel itself; if it never comes up the row is FAIL with blocked_by=${ARM_BLOCK}, not SKIP"
+    fi
     record "$name" DRY-RUN "the kernel arm started is up: resolver file is nameserver 127.0.0.1 port ${KERNEL_DNS_PORT}; system dig of www.${FIXTURE_SUFFIX} is a 198.18.0.0/15 fake-IP; dig @127.0.0.1 -p ${KERNEL_DNS_PORT} is the same fake-IP; a TCP connection to that address increments segue_relay_connects_home; a non-AI address does not increment connects_home or connects_overseas; loopback still connects."
     return 0
   fi
-  if [[ ! -f "${WORK}/state/kernel.pid" ]] || ! pgrep -x segue-kernel >/dev/null 2>&1; then
-    record "$name" FAIL "the kernel arm started is not running
+  if ! kernel_pidfile_alive; then
+    # This row does not trust the arm: one bounded retry of its own.
+    row_wait_kernel_up || true
+  fi
+  if ! kernel_pidfile_alive; then
+    blocked_fail "$name" "the kernel the arm starts is not running
 $(helper_kernel_status)
 $(log_tail "${WORK}/logs/kernel.log")
 $(log_tail "${WORK}/logs/kernel.stdout")
@@ -1403,11 +1479,19 @@ row_kill_kernel() {
     plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/dig +time=2 +tries=1 example.com A
     cidr_drop_probe || true
+    if [[ -n "${ARM_BLOCK:-}" ]]; then
+      note "blocked_by=${ARM_BLOCK}: no kernel pid file means the arm never brought one up; this row retries that itself and is FAIL with blocked_by=${ARM_BLOCK} if there is still no kernel to kill"
+    fi
     record "$name" DRY-RUN "after SIGTERM to segue-kernel only, waiting for it to exit before SIGKILL: a SIGTERM is a clean shutdown (exit 0), so the supervisor does not restart it and replaces the resolver file in place with port ${GUARD_PORT} (no gap without a file); its utun is gone and the pid is dead; armed name is still empty NOERROR from 127.0.0.1; dig @127.0.0.1 -p ${GUARD_PORT} is empty NOERROR; example.com still answers; fixture CIDR still dropped; non-AI loopback still connects"
     return 0
   fi
   if [[ ! -f "${WORK}/state/kernel.pid" ]]; then
-    record "$name" SKIP "kernel was not started"
+    row_wait_kernel_up || true
+  fi
+  if [[ ! -f "${WORK}/state/kernel.pid" ]]; then
+    blocked_fail "$name" "no kernel pid file: the arm never brought the kernel up, and this row's own retry did not either
+$(helper_kernel_status)
+$(log_tail "${WORK}/logs/helper.err")"
     return 0
   fi
   local pid utun dig_ai dig_ex loop dropped=0 dead=no guard_dig
@@ -1498,7 +1582,15 @@ row_kill_helper() {
   before=$(dig_query example.com)
   pid=$(helper_pid)
   if [[ -z "$pid" ]]; then
-    record "$name" FAIL "helper is not running"
+    # launchd KeepAlive owns this precondition; give it a window of this
+    # row's own before judging.
+    wait_until 20 helper_running || true
+    pid=$(helper_pid)
+  fi
+  if [[ -z "$pid" ]]; then
+    blocked_fail "$name" "helper is not running and launchd did not restart it
+$(/bin/launchctl print "system/${HELPER_LABEL}" 2>&1 | /usr/bin/head -n 40 || true)
+$(log_tail "${WORK}/logs/helper.err")"
     return 0
   fi
   kill -9 "$pid" 2>/dev/null || true
@@ -1907,11 +1999,67 @@ ${main}"
   fi
 }
 
+# One row's time budget, in seconds. A hung row (a stuck probe, a command
+# missing its own timeout) is killed and recorded FAIL so it cannot eat the
+# run; the rows after it still run. 120 rather than 90 because kill-helper
+# legitimately holds ~85 s of waits and digs on a slow volume.
+: "${ROW_BUDGET:=120}"
+
+# Run one row under its budget. The row records its own PASS/FAIL; if it is
+# still alive when the budget ends it is killed with its children and, if it
+# never recorded, recorded FAIL for the timeout. Nothing here can skip a
+# later row, and the EXIT-trap cleanup still runs after the last one.
+run_row() {
+  local name="$1" func="$2" pid waited grace
+  if ! dry && seen "$name"; then
+    return 0
+  fi
+  if dry; then
+    "$func"
+    return 0
+  fi
+  ( "$func" ) &
+  pid=$!
+  waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [[ "$waited" -ge "$ROW_BUDGET" ]]; then
+      printf '\nrow %s: %ss budget spent, killing it\n' "$name" "$ROW_BUDGET"
+      /usr/bin/pkill -TERM -P "$pid" . >/dev/null 2>&1 || true
+      kill -TERM "$pid" 2>/dev/null || true
+      grace=0
+      while kill -0 "$pid" 2>/dev/null && [[ "$grace" -lt 10 ]]; do
+        sleep 0.5
+        grace=$((grace + 1))
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        /usr/bin/pkill -KILL -P "$pid" . >/dev/null 2>&1 || true
+        kill -KILL "$pid" 2>/dev/null || true
+        # No wait here: an unkillable row must not hang the harness too.
+        sleep 1
+      fi
+      if [[ ! -f "${WORK}/state/rows/${name}" ]]; then
+        record "$name" FAIL "row was still running ${ROW_BUDGET}s after it started, so the harness killed it (a hung probe or a command without its own timeout in this row)"
+      fi
+      mark_seen "$name"
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$pid" 2>/dev/null || true
+  mark_seen "$name"
+}
+
 run_all() {
   plan_fail_probes
+  # Row markers are per-run: a stale file from an earlier run on this work
+  # dir must not make run_row treat a hung row as already recorded.
+  if ! dry; then
+    rm -rf "${WORK}/state/rows" 2>/dev/null || true
+  fi
   if ! prepare_tree; then
     record build FAIL "fetch or build failed; see ${WORK}/logs"
-    skip_pending "build failed"
+    skip_pending "binaries are missing: the build failed (see ${WORK}/logs)"
     return 0
   fi
   backup_pf || true
@@ -1919,24 +2067,34 @@ run_all() {
   enable_pf || true
   if ! install_daemons; then
     record install FAIL "helper install failed"
-    skip_pending "install failed"
+    skip_pending "binaries are missing: the helper could not be installed"
     return 0
   fi
   start_bg "${WORK}/state/loopback.pid" /usr/bin/python3 "$PROBES" serve 127.0.0.1 "$LOOPBACK_PORT" non-ai-ok
+  # An arm failure no longer ends the run. The row is FAIL with its step
+  # dump, then every remaining non-reboot row still runs best-effort:
+  # each retries its own preconditions and records PASS/FAIL on its own
+  # evidence, with blocked_by=<arm step> when the precondition never came
+  # true. SKIP stays reserved for a missing binary and, in the entry
+  # script, for reboot rows on a Satellite.
   if ! arm_helper; then
     record armed-kernel-not-running FAIL "helper did not arm (step ${ARM_FAIL_STEP:-unknown})
 ${ARM_FAIL_DUMP}
 $(log_tail "${WORK}/logs/helper.err")"
-    skip_pending "arm failed"
-    return 0
+    ARM_BLOCK="${ARM_FAIL_STEP:-unknown}"
+    note "arm failed; the rows below still run best-effort, each retrying its own preconditions"
+  else
+    ARM_BLOCK=""
   fi
-  row_connected
-  row_kill_kernel
-  row_armed
-  row_kill_helper
+  run_row connected row_connected
+  run_row kill-kernel row_kill_kernel
+  run_row armed-kernel-not-running row_armed
+  run_row kill-helper row_kill_helper
   # Leak while the anchor is still armed. Restore flushes it.
-  row_leak
-  row_restore
+  run_row expected-leak-doh-quic row_leak
+  run_row restore-via-release-daemon row_restore
+  # Cleanup is unconditional: it is the EXIT trap in the entry script, and
+  # nothing above returns past a failure.
 }
 
 print_cleanup() {

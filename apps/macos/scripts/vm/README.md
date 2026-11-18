@@ -51,6 +51,23 @@ JSON between `BEGIN-MATRIX-JSON` and `END-MATRIX-JSON`. Copy that block out
 before archiving the thread. Each row is `PASS`, `FAIL`, or `SKIP` plus the
 evidence (dig text, pf counters, kernel log tail).
 
+A failing arm step does not end the run and never SKIPs a later row. The
+`armed-kernel-not-running` row records the failure with its step dump, and
+every remaining non-reboot row still runs best-effort: each retries its own
+preconditions (the socket arm is idempotent, launchd restarts the helper)
+and records `PASS`/`FAIL` on its own evidence. A row whose precondition the
+failed arm step removed records `FAIL` with `blocked_by=<arm step>` in the
+JSON, so one Satellite run surfaces every bug at once. `SKIP` is reserved
+for host-kind reasons (reboot rows on a Satellite) and a missing binary.
+Each row has a time budget (`ROW_BUDGET`, default 120 s; kill-helper
+legitimately needs ~85 s of waits and digs): a row still running past it is
+killed with its children and recorded `FAIL`, so a hang cannot eat the run.
+The cleanup at the end is unconditional — it is the EXIT trap.
+
+`--simulate-arm-fail <step>` (dry-run only; a real run refuses it) plans
+what a run does when the arm dies at that step: every row still planned,
+blocked rows marked `blocked_by=<step>`, nothing SKIPped for the arm.
+
 `--exit-via loopback|alias` (default `loopback`) picks where the kernel's
 AI exit dials the fixture relay — `127.0.0.1:17443` directly, or the
 `192.0.2.10` alias forwarder for comparison with older cores. Both work
