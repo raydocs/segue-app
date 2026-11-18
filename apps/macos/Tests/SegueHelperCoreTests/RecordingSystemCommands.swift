@@ -114,6 +114,10 @@ final class RecordingSystemCommands: SystemCommands {
             let stdout = anchorRules == nil ? "" : "  \(PFAnchorRenderer.anchorName)\n"
             return SystemCommandOutput(status: 0, stdout: stdout, stderr: "")
         }
+        if arguments == ["-a", PFAnchorRenderer.anchorName, "-sr"] {
+            let stdout = anchorRules ?? ""
+            return SystemCommandOutput(status: 0, stdout: stdout, stderr: "")
+        }
         if arguments == ["-a", PFAnchorRenderer.anchorName, "-F", "all"] {
             anchorRules = nil
             return SystemCommandOutput(status: 0, stdout: "", stderr: "")

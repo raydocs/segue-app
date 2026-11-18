@@ -99,7 +99,14 @@ final class RecordingReleaseCommands: SystemCommands {
 
     private func pfctl(_ arguments: [String]) -> SystemCommandOutput {
         if arguments == ["-s", "Anchors"] {
-            let stdout = anchorLoaded ? "  \(PFAnchorRenderer.anchorName)\n" : ""
+            // The hook stays listed after a flush. Restore must not treat that as loaded.
+            let stdout = "  \(PFAnchorRenderer.anchorName)\n"
+            return SystemCommandOutput(status: 0, stdout: stdout, stderr: "")
+        }
+        if arguments == ["-a", PFAnchorRenderer.anchorName, "-sr"] {
+            let stdout = anchorLoaded
+                ? "block drop out quick inet from any to 198.51.100.0/24 label \"segue-ai-0\"\n"
+                : ""
             return SystemCommandOutput(status: 0, stdout: stdout, stderr: "")
         }
         if arguments == ["-a", PFAnchorRenderer.anchorName, "-F", "all"] {

@@ -201,10 +201,13 @@ def established_to(port):
         ).stdout
     except OSError:
         return -1
-    needle = "127.0.0.1.%s" % port
+    # BSD netstat prints 127.0.0.1.18081; some builds use a colon.
+    needles = ("127.0.0.1.%s" % port, "127.0.0.1:%s" % port)
     count = 0
     for line in output.splitlines():
-        if needle in line and "ESTABLISHED" in line:
+        if "ESTABLISHED" not in line:
+            continue
+        if any(needle in line for needle in needles):
             count += 1
     return count
 

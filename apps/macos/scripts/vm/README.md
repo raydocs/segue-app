@@ -104,19 +104,26 @@ plus the reboot the orchestrator performs. Armed and clear are two reboots.
 
 | Row | Pass |
 | --- | --- |
-| `armed-kernel-not-started` | `dig www.ai-fixture.test` is empty NOERROR; `dig example.com` has an answer; TCP to `198.51.100.10` is dropped; TCP to `127.0.0.1` works; the kernel is not running |
-| `connected` | Kernel DNS returns a `198.18.0.0/15` fake-IP; connecting to it opens a TCP session to the fixture SOCKS exit; a non-AI address does not; loopback still works |
-| `kill-kernel` | That utun is gone; the armed name is still empty; example.com and loopback still work; the CIDR is still dropped |
-| `kill-helper` | During launchd's restart the armed name times out or is empty; example.com works before and after. A real answer for the armed name is a leak |
-| `restore-via-release-daemon` | With the helper in `SIGSTOP`, `segue-release-ctl restore` (the same `ReleaseClient` envelope the app sends) clears the anchor rules, removes resolver files whose first line is `# managed by segue.ailock`, puts DNS back, and clears intent. `SKIP` if `segue-release` or `segue-release-ctl` was not built |
+| `armed-kernel-not-started` | System `dig www.ailock-fixture.example.com` is empty NOERROR from `127.0.0.1`, and `dig @127.0.0.1 -p 5354` is empty NOERROR; `dig example.com` has an answer; TCP to `198.51.100.10` is dropped; TCP to `127.0.0.1` works; the kernel is not running |
+| `connected` | Kernel DNS (`dig @127.0.0.1 -p 15353`) returns a `198.18.0.0/15` fake-IP; connecting to it opens a TCP session to the fixture SOCKS exit; a non-AI address does not; loopback still works |
+| `kill-kernel` | After SIGTERM (SIGKILL only if it is still alive): that utun is gone and the pid is dead; the armed name is still empty NOERROR from `127.0.0.1`; example.com and loopback still work; the CIDR is still dropped |
+| `kill-helper` | During launchd's restart the armed name times out or is empty NOERROR from `127.0.0.1`; an upstream NXDOMAIN is a leak. example.com works before and after. After restart the armed name is empty NOERROR from the guard again |
+| `restore-via-release-daemon` | With the helper in `SIGSTOP`, `segue-release-ctl restore` returns `outcome=restored` and `anchor_loaded=false`, removes resolver files whose first line is `# managed by segue.ailock`, puts DNS back, and clears intent. `partial` is FAIL. `SKIP` if `segue-release` or `segue-release-ctl` was not built |
 | `expected-leak-doh-quic` | The anchor still blocks only `198.51.100.0/24`. TCP connect to `203.0.113.10:443` succeeds and UDP round-trips. That address is a second lo0 alias, not in the fixture CIDR — the expected leak to an unlisted IP. Do not "fix" this leak. A broader block is `FAIL` |
 | `reboot-armed` / `reboot-clear` | On `--host-kind satellite`, `SKIP` (a Satellite is destroyed on reboot). On a persistent VM, post-reboot only. Armed: resolver file and fixture anchor are back, and the rules are not `block drop all`. Clear: resolver file absent, no fixture block |
 
-The fixture suffix `ai-fixture.test` and CIDR `198.51.100.0/24` are not written
-into `ai-lock.txt`. The kernel gets them from a bundle signed with
+The fixture suffix `ailock-fixture.example.com` and CIDR `198.51.100.0/24` are not written
+into `ai-lock.txt`. `.test` is a reserved TLD: the Satellite VPC resolver answers it
+itself, so an empty NOERROR there is not the guard. `example.com` is a real zone and
+this label is NXDOMAIN upstream; empty NOERROR from `127.0.0.1` is the guard.
+The kernel gets the suffix and CIDR from a bundle signed with
 `segue-kernel policy-keygen` / `sign-bundle` (a key generated on the VM).
 The helper does not merge a bundle yet, so it is pointed at a generated
 `--ai-lock` file with those two lines only.
+
+A FAIL row also records `launchctl print` for the helper and the release daemon,
+the helper and kernel log tails, `ls -l /var/run/segue*`, `lsof` on the guard
+port, and the first 60 lines of `scutil --dns`.
 
 `segue run -config` has no VLESS inbound (socks, http, tun, tproxy). The
 fixture exit is the simplest server it can run: SOCKS on `127.0.0.1:18081`,

@@ -1,7 +1,7 @@
 # Shared helpers for vm-ailock-matrix.sh. Bash 3.2 (macOS /bin/bash).
 # The entry script sets DRY_RUN, PHASE, EXPECT, HOST_KIND, WORK, JSON, repo revisions.
 
-FIXTURE_SUFFIX=ai-fixture.test
+FIXTURE_SUFFIX=ailock-fixture.example.com
 FIXTURE_CIDR=198.51.100.0/24
 FIXTURE_HOST=198.51.100.10
 FIXTURE_TCP_PORT=8080
@@ -95,6 +95,10 @@ record() {
     return 0
   fi
   SEEN_ROWS="$SEEN_ROWS $name"
+  if [[ "$result" == "FAIL" ]] && ! dry; then
+    evidence="${evidence}
+$(capture_fail_context)"
+  fi
   printf '\nROW %s %s\n%s\n' "$result" "$name" "$evidence"
   printf '%s' "$evidence" | /usr/bin/python3 "$REPORT" add "$JSON" "$name" "$result"
   if [[ "$result" == "FAIL" ]]; then
@@ -157,6 +161,16 @@ resolver_present() {
   [[ -f "$RESOLVER_FILE" ]]
 }
 
+socket_present() {
+  [[ -S /var/run/segue/service.sock ]]
+}
+
+guard_answers() {
+  local out
+  out=$(/usr/bin/dig +time=1 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A 2>&1 || true)
+  dig_empty_noerror "$out"
+}
+
 anchor_has_fixture() {
   /sbin/pfctl -a "$ANCHOR" -sr 2>/dev/null | grep -F "$FIXTURE_CIDR" >/dev/null 2>&1
 }
@@ -183,6 +197,17 @@ dig_empty_noerror() {
   return 0
 }
 
+# System dig of an armed name: empty NOERROR, and the answer came from the
+# helper's loopback guard rather than the VPC resolver.
+dig_held_by_guard() {
+  dig_empty_noerror "$1" || return 1
+  printf '%s\n' "$1" | grep -Eq 'SERVER: 127\.0\.0\.1#'
+}
+
+dig_at_guard() {
+  /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "$1" A 2>&1 || true
+}
+
 dig_has_answer() {
   printf '%s\n' "$1" | grep -Eq 'ANSWER: [1-9]'
 }
@@ -197,6 +222,40 @@ log_tail() {
   else
     printf 'no log %s\n' "$1"
   fi
+}
+
+# Printed on every FAIL row. Dry-run lists the same commands via plan_fail_probes.
+capture_fail_context() {
+  {
+    printf '%s\n' "--- launchctl helper ---"
+    /bin/launchctl print "system/${HELPER_LABEL}" 2>&1 | /usr/bin/head -n 80 || true
+    printf '%s\n' "--- launchctl release ---"
+    /bin/launchctl print "system/${RELEASE_LABEL:-com.segue.release}" 2>&1 | /usr/bin/head -n 80 || true
+    printf '%s\n' "--- helper.err ---"
+    log_tail "${WORK}/logs/helper.err"
+    printf '%s\n' "--- kernel.log ---"
+    log_tail "${WORK}/logs/kernel.log"
+    printf '%s\n' "--- kernel.stdout ---"
+    log_tail "${WORK}/logs/kernel.stdout"
+    printf '%s\n' "--- sockets ---"
+    /bin/ls -l /var/run/segue /var/run/segue/service.sock /var/run/segue-release.sock 2>&1 || true
+    printf '%s\n' "--- guard listener ---"
+    /usr/sbin/lsof -nP -iUDP:"${GUARD_PORT}" 2>&1 | /usr/bin/head -n 40 || true
+    printf '%s\n' "--- scutil dns ---"
+    /usr/sbin/scutil --dns 2>&1 | /usr/bin/head -n 60 || true
+  } 2>&1 || true
+}
+
+plan_fail_probes() {
+  if ! dry; then
+    return 0
+  fi
+  plan /bin/launchctl print "system/${HELPER_LABEL}"
+  plan /bin/launchctl print system/com.segue.release
+  plan /bin/ls -l /var/run/segue /var/run/segue/service.sock /var/run/segue-release.sock
+  plan /usr/sbin/lsof -nP -iUDP:"${GUARD_PORT}"
+  plan /usr/sbin/scutil --dns
+  note "FAIL rows also include the tails of helper.err, kernel.log and kernel.stdout"
 }
 
 toolchain() {
@@ -425,26 +484,34 @@ arm_helper() {
   copy_fixture_list || return 1
   write_intent true user_connect 1 || return 1
   note "same-boot PF: the helper writes the anchor line into /etc/pf.conf but does not reload it. The harness runs pfctl -f /etc/pf.conf so the anchor is referenced, then restarts the helper to refill the anchor. A reboot loads that file itself."
+  note "arm waits until the helper socket exists and dig @127.0.0.1 -p ${GUARD_PORT} is empty NOERROR. A resolver file alone is written before the listener and survives a crash."
   if dry; then
     priv /bin/launchctl kickstart -k "system/${HELPER_LABEL}"
+    plan test -S /var/run/segue/service.sock
     try_socket_arm >/dev/null
     priv /sbin/pfctl -f /etc/pf.conf
     priv /bin/launchctl kickstart -k "system/${HELPER_LABEL}"
+    plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A
     priv /usr/bin/dscacheutil -flushcache
     priv /usr/bin/killall -HUP mDNSResponder
     return 0
   fi
+  # The helper was started before the intent file existed. Restart so it
+  # reads the armed intent, then wait for the listener — not just the file.
+  /bin/launchctl kickstart -k "system/${HELPER_LABEL}" || return 1
+  wait_until 20 socket_present || return 1
   try_socket_arm > "${WORK}/state/socket-arm.txt" || true
   if ! wait_until 20 resolver_present; then
-    /bin/launchctl kickstart -k "system/${HELPER_LABEL}" || return 1
-    wait_until 15 resolver_present || return 1
+    return 1
   fi
   if ! main_has_anchor; then
     /sbin/pfctl -f /etc/pf.conf || return 1
     /bin/launchctl kickstart -k "system/${HELPER_LABEL}" || return 1
-    wait_until 15 resolver_present || return 1
+    wait_until 20 socket_present || return 1
+    wait_until 20 resolver_present || return 1
   fi
   wait_until 15 anchor_has_fixture || return 1
+  wait_until 15 guard_answers || return 1
   /usr/bin/dscacheutil -flushcache >/dev/null 2>&1 || true
   /usr/bin/killall -HUP mDNSResponder >/dev/null 2>&1 || true
 }
@@ -483,18 +550,33 @@ start_bg() {
 }
 
 kill_pidfile() {
-  local file="$1" expect="$2" pid cmd
+  local file="$1" expect="$2" pid cmd comm i
   [[ -f "$file" ]] || return 0
   pid=$(cat "$file" 2>/dev/null || true)
   case "$pid" in
     ""|*[!0-9]*) rm -f "$file"; return 0 ;;
   esac
+  # `command` is truncated to the terminal width and can hide the binary
+  # name. `comm` is the short name (`segue-kernel`), which is what we match.
   cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
-  case "$cmd" in
+  comm=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+  case "$cmd $comm" in
     *"$expect"*)
-      kill "$pid" 2>/dev/null || true
-      sleep 0.3
-      kill -9 "$pid" 2>/dev/null || true
+      # SIGTERM lets segue-kernel run tun.shutdown (drop the utun fd).
+      # SIGKILL at 300ms skipped that and left utun4 up on the Satellite.
+      kill -TERM "$pid" 2>/dev/null || true
+      i=0
+      while [[ "$i" -lt 20 ]]; do
+        if ! ps -p "$pid" >/dev/null 2>&1; then
+          break
+        fi
+        sleep 0.25
+        i=$((i + 1))
+      done
+      if ps -p "$pid" >/dev/null 2>&1; then
+        kill -KILL "$pid" 2>/dev/null || true
+        sleep 0.5
+      fi
       ;;
   esac
   rm -f "$file"
@@ -656,16 +738,18 @@ row_armed() {
   local name=armed-kernel-not-started
   if dry; then
     plan /usr/bin/dig +time=2 +tries=1 "www.${FIXTURE_SUFFIX}" A
+    plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/dig +time=2 +tries=1 example.com A
     plan /usr/bin/python3 "$PROBES" dns 127.0.0.1 "$GUARD_PORT" "www.${FIXTURE_SUFFIX}"
     plan /usr/bin/python3 "$PROBES" tcp 127.0.0.1 "$LOOPBACK_PORT" 2
     cidr_drop_probe || true
     note "kernel is not started for this row"
-    record "$name" DRY-RUN "armed, kernel not started: dig of www.${FIXTURE_SUFFIX} is empty NOERROR; dig example.com is a real answer; TCP to ${FIXTURE_CIDR} is dropped (pf counter, alias removed so it is not passed on lo0); TCP to 127.0.0.1 works"
+    record "$name" DRY-RUN "armed, kernel not started: system dig of www.${FIXTURE_SUFFIX} is empty NOERROR from 127.0.0.1; dig @127.0.0.1 -p ${GUARD_PORT} is empty NOERROR; dig example.com is a real answer; TCP to ${FIXTURE_CIDR} is dropped; TCP to 127.0.0.1 works"
     return 0
   fi
-  local dig_ai dig_ex guard loop rules leak
+  local dig_ai dig_ex guard loop rules leak guard_dig
   dig_ai=$(dig_query "www.${FIXTURE_SUFFIX}")
+  guard_dig=$(dig_at_guard "www.${FIXTURE_SUFFIX}")
   dig_ex=$(dig_query example.com)
   guard=$(/usr/bin/python3 "$PROBES" dns 127.0.0.1 "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" 2>&1 || true)
   loop=$(/usr/bin/python3 "$PROBES" tcp 127.0.0.1 "$LOOPBACK_PORT" 2 2>&1 || true)
@@ -677,9 +761,13 @@ row_armed() {
     dropped=1
   fi
   local ok=1 why=""
-  if ! dig_empty_noerror "$dig_ai"; then
+  if ! dig_held_by_guard "$dig_ai"; then
     ok=0
-    why="${why} armed dig was not empty NOERROR."
+    why="${why} armed dig was not empty NOERROR from 127.0.0.1."
+  fi
+  if ! dig_empty_noerror "$guard_dig"; then
+    ok=0
+    why="${why} dig @127.0.0.1 -p ${GUARD_PORT} was not empty NOERROR."
   fi
   if ! printf '%s\n' "$guard" | grep -q 'rcode=0 ancount=0'; then
     ok=0
@@ -710,6 +798,8 @@ row_armed() {
   evidence="why:${why}
 socket:${socket_reply}
 guard:${guard}
+--- dig @127.0.0.1 guard ---
+${guard_dig}
 loop:${loop}
 leak:${leak}
 ${CIDR_EVIDENCE}
@@ -730,6 +820,7 @@ row_connected() {
   local name=connected
   if dry; then
     start_kernel_stack || true
+    plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/python3 "$PROBES" dns 127.0.0.1 "$KERNEL_DNS_PORT" "www.${FIXTURE_SUFFIX}"
     plan /usr/bin/python3 "$PROBES" egress 198.18.0.1 "$FIXTURE_TCP_PORT" "$SOCKS_PORT" "$UNLISTED_HOST" "$UNLISTED_PORT" "$LOOPBACK_PORT"
     record "$name" DRY-RUN "kernel DNS for www.${FIXTURE_SUFFIX} is a 198.18.0.0/15 fake-IP; a TCP connection to that address opens a session to the fixture SOCKS exit; a non-AI address does not; loopback still connects. System DNS stays on the guard because the helper does not observe this utun."
@@ -775,21 +866,26 @@ row_kill_kernel() {
     priv /bin/kill -TERM '<kernel-pid>'
     plan /sbin/ifconfig -l
     plan /usr/bin/dig +time=2 +tries=1 "www.${FIXTURE_SUFFIX}" A
+    plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/dig +time=2 +tries=1 example.com A
     cidr_drop_probe || true
-    record "$name" DRY-RUN "after SIGTERM to segue-kernel only: its utun is gone; armed name is still empty NOERROR; example.com still answers; fixture CIDR still dropped; non-AI loopback still connects"
+    record "$name" DRY-RUN "after SIGTERM to segue-kernel only, waiting for it to exit before SIGKILL: its utun is gone and the pid is dead; armed name is still empty NOERROR from 127.0.0.1; dig @127.0.0.1 -p ${GUARD_PORT} is empty NOERROR; example.com still answers; fixture CIDR still dropped; non-AI loopback still connects"
     return 0
   fi
   if [[ ! -f "${WORK}/state/kernel.pid" ]]; then
     record "$name" SKIP "kernel was not started"
     return 0
   fi
-  local pid utun dig_ai dig_ex loop dropped=0
+  local pid utun dig_ai dig_ex loop dropped=0 dead=no guard_dig
   pid=$(cat "${WORK}/state/kernel.pid")
   utun=$(cat "${WORK}/state/utun.name" 2>/dev/null || true)
   kill_pidfile "${WORK}/state/kernel.pid" segue-kernel
-  sleep 2
+  if ! ps -p "$pid" >/dev/null 2>&1; then
+    dead=yes
+  fi
+  sleep 1
   dig_ai=$(dig_query "www.${FIXTURE_SUFFIX}")
+  guard_dig=$(dig_at_guard "www.${FIXTURE_SUFFIX}")
   dig_ex=$(dig_query example.com)
   loop=$(/usr/bin/python3 "$PROBES" tcp 127.0.0.1 "$LOOPBACK_PORT" 2 2>&1 || true)
   if cidr_drop_probe; then
@@ -805,13 +901,21 @@ row_kill_kernel() {
     still="unknown"
   fi
   local ok=1 why=""
+  if [[ "$dead" != "yes" ]]; then
+    ok=0
+    why="${why} segue-kernel pid ${pid} still alive."
+  fi
   if [[ "$still" != "no" ]]; then
     ok=0
     why="${why} utun ${utun} still present (${still})."
   fi
-  if ! dig_empty_noerror "$dig_ai"; then
+  if ! dig_held_by_guard "$dig_ai"; then
     ok=0
-    why="${why} armed name was not empty NOERROR."
+    why="${why} armed name was not empty NOERROR from 127.0.0.1."
+  fi
+  if ! dig_empty_noerror "$guard_dig"; then
+    ok=0
+    why="${why} dig @127.0.0.1 -p ${GUARD_PORT} was not empty NOERROR."
   fi
   if ! dig_has_answer "$dig_ex"; then
     ok=0
@@ -826,11 +930,13 @@ row_kill_kernel() {
     why="${why} fixture CIDR was not dropped."
   fi
   local evidence="why:${why}
-pid=${pid} utun=${utun} gone=${still}
+pid=${pid} dead=${dead} utun=${utun} gone=${still}
 loop:${loop}
 ${CIDR_EVIDENCE}
 --- armed dig ---
 ${dig_ai}
+--- dig @127.0.0.1 guard ---
+${guard_dig}
 --- example.com ---
 ${dig_ex}"
   if [[ "$ok" == 1 ]]; then
@@ -845,8 +951,9 @@ row_kill_helper() {
   if dry; then
     priv /bin/kill -9 '<helper-pid>'
     plan /usr/bin/dig +time=2 +tries=1 "www.${FIXTURE_SUFFIX}" A
+    plan /usr/bin/dig +time=2 +tries=1 @127.0.0.1 -p "$GUARD_PORT" "www.${FIXTURE_SUFFIX}" A
     plan /usr/bin/dig +time=2 +tries=1 example.com A
-    record "$name" DRY-RUN "SIGKILL the helper. launchd KeepAlive restarts it. During the gap the armed name times out or is empty NOERROR, and example.com still answers. After the helper is back the armed name is empty NOERROR again. A real answer for the armed name is a leak (FAIL)."
+    record "$name" DRY-RUN "SIGKILL the helper. launchd KeepAlive restarts it. During the gap the armed name times out or is empty NOERROR from 127.0.0.1 (an upstream NXDOMAIN or SOA is a leak). After the helper is back, system dig and dig @127.0.0.1 -p ${GUARD_PORT} are empty NOERROR from the guard. example.com still answers."
     return 0
   fi
   local pid before during during_ex after ex_after
@@ -862,6 +969,9 @@ row_kill_helper() {
   local restarted=0
   if wait_until 20 helper_running; then
     restarted=1
+    # The process is back before the guard is. Do not score the restart
+    # against the gap where the listener is still coming up.
+    wait_until 15 guard_answers || true
   fi
   after=$(dig_query "www.${FIXTURE_SUFFIX}")
   ex_after=$(dig_query example.com)
@@ -869,11 +979,11 @@ row_kill_helper() {
   if dig_has_answer "$during"; then
     ok=0
     why="${why} armed name answered during the gap."
-  elif dig_empty_noerror "$during" || dig_timed_out "$during"; then
+  elif dig_held_by_guard "$during" || dig_timed_out "$during"; then
     :
   else
     ok=0
-    why="${why} armed dig during the gap was neither empty nor a timeout."
+    why="${why} armed dig during the gap was neither empty NOERROR from 127.0.0.1 nor a timeout."
   fi
   if ! dig_has_answer "$before" || ! dig_has_answer "$during_ex" || ! dig_has_answer "$ex_after"; then
     ok=0
@@ -882,9 +992,9 @@ row_kill_helper() {
   if [[ "$restarted" != 1 ]]; then
     ok=0
     why="${why} helper did not restart."
-  elif ! dig_empty_noerror "$after"; then
+  elif ! dig_held_by_guard "$after"; then
     ok=0
-    why="${why} armed name was not empty NOERROR after the helper returned."
+    why="${why} armed name was not empty NOERROR from 127.0.0.1 after the helper returned."
   fi
   local evidence="why:${why}
 killed=${pid} restarted=$(helper_pid)
@@ -987,9 +1097,9 @@ row_restore() {
     priv /sbin/pfctl -a "$ANCHOR" -sr
     plan /bin/cat "$INTENT"
     plan /usr/bin/python3 "$PROBES" dns-match "${WORK}/state/dns.snapshot"
-    note "read-back while the helper stays stopped: anchor rules empty, no resolver file with the segue marker, DNS matches the pre-arm snapshot, intent not armed"
+    note "read-back while the helper stays stopped: outcome=restored, anchor_loaded=false, anchor rules empty, no resolver file with the segue marker, DNS matches the pre-arm snapshot, intent not armed"
     priv /bin/kill -CONT '<helper-pid>'
-    record "$name" DRY-RUN "SIGSTOP the helper, then segue-release-ctl restore (ReleaseClient's restore envelope) on ${RELEASE_SOCK}. PASS when the read-back shows an empty anchor, Segue resolver files gone, DNS restored, and intent cleared."
+    record "$name" DRY-RUN "SIGSTOP the helper, then segue-release-ctl restore (ReleaseClient's restore envelope) on ${RELEASE_SOCK}. PASS only when outcome=restored, anchor_loaded=false, no Segue resolver files remain, DNS matches the pre-arm snapshot, and intent is cleared."
     return 0
   fi
   if [[ ! -x "$built" || ! -x "$built_ctl" ]]; then
@@ -1044,6 +1154,16 @@ services=no-snapshot"
     if printf '%s\n' "$reply" | grep -q '^error='; then
       ok=0
       why="${why} release ctl failed."
+    fi
+    # Protocol success is `restored` (every step proved, machine reads back
+    # clean). `partial` with anchor_loaded=true is a failed restore.
+    if ! printf '%s\n' "$reply" | grep -q '^outcome=restored$'; then
+      ok=0
+      why="${why} outcome is not restored."
+    fi
+    if ! printf '%s\n' "$reply" | grep -q '^anchor_loaded=false$'; then
+      ok=0
+      why="${why} anchor_loaded is not false."
     fi
     if ! printf '%s\n' "$reply" | grep -q '^intent_cleared=true$'; then
       ok=0
@@ -1245,6 +1365,7 @@ ${main}"
 }
 
 run_all() {
+  plan_fail_probes
   if ! prepare_tree; then
     record build FAIL "fetch or build failed; see ${WORK}/logs"
     skip_pending "build failed"

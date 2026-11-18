@@ -57,5 +57,30 @@ final class HelperPathsTests: XCTestCase {
         XCTAssertEqual(paths.configPath, "/tmp/kernel.json")
         XCTAssertEqual(paths.stateDir, "/tmp/state")
         XCTAssertEqual(paths.allowedUIDFile, "/tmp/uids")
+        XCTAssertEqual(paths.guardPort, 5354)
+        XCTAssertEqual(paths.pfConfPath, "/etc/pf.conf")
+        XCTAssertEqual(paths.resolverDirectory, "/etc/resolver")
+        XCTAssertEqual(paths.requirement, "")
+    }
+
+    func testPathsRootThenExplicitFlags() {
+        let paths = HelperPaths.parse([
+            "segue-core-helper",
+            "--paths-root", "/tmp/segue-dev",
+            "--socket", "/tmp/explicit.sock",
+            "--guard-port", "15354",
+            "--requirement", "identifier \"com.example.dev\"",
+        ])
+        XCTAssertEqual(paths.socketPath, "/tmp/explicit.sock")
+        XCTAssertEqual(paths.intentPath, "/tmp/segue-dev/ai-lock.intent")
+        XCTAssertEqual(paths.kernelPath, "/tmp/segue-dev/bin/segue-kernel")
+        XCTAssertEqual(paths.configPath, "/tmp/segue-dev/kernel.json")
+        XCTAssertEqual(paths.stateDir, "/tmp/segue-dev/kernel")
+        XCTAssertEqual(paths.allowedUIDFile, "/tmp/segue-dev/allowed-uid")
+        XCTAssertEqual(paths.aiLockPath, "/tmp/segue-dev/ai-lock.txt")
+        XCTAssertEqual(paths.pfConfPath, "/tmp/segue-dev/pf.conf")
+        XCTAssertEqual(paths.resolverDirectory, "/tmp/segue-dev/resolver")
+        XCTAssertEqual(paths.guardPort, 15354)
+        XCTAssertEqual(paths.requirement, "identifier \"com.example.dev\"")
     }
 }

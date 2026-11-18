@@ -40,6 +40,10 @@ final class ReleaseRestorerTests: XCTestCase {
         XCTAssertTrue(harness.commands.invocations.contains {
             $0.contains("-a segue.ailock -F all")
         })
+        // The hook stays in `pfctl -s Anchors`. Clean means `-sr` has no rules.
+        XCTAssertTrue(harness.commands.invocations.contains {
+            $0.contains("-a segue.ailock -sr")
+        })
     }
 
     func testRestoreIsIdempotent() throws {

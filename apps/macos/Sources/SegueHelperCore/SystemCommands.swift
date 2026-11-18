@@ -53,6 +53,18 @@ public enum SystemText {
         }
     }
 
+    /// `pfctl -a segue.ailock -sr`. The pf.conf hook keeps the name in
+    /// `pfctl -s Anchors` after `-F all`, so a listed name is not a hold.
+    /// ALTQ banners that some pfctl builds mix into the rule listing are not rules.
+    public static func anchorHasRules(_ text: String) -> Bool {
+        text.split(whereSeparator: \.isNewline).contains { raw in
+            let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty || line.hasPrefix("#") { return false }
+            if line.hasPrefix("No ALTQ") || line.hasPrefix("ALTQ related") { return false }
+            return true
+        }
+    }
+
     /// `networksetup -listnetworkserviceorder`. Disabled services (a leading
     /// `*` on the name) are skipped. The hardware device is the stable id;
     /// networksetup itself addresses services by display name.

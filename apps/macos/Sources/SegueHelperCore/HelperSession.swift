@@ -17,14 +17,28 @@ public final class HelperSession {
     private var intent: StoredIntent
     private var layerError: String?
 
-    public init(store: IntentStore, kernel: KernelSupervising, layer: AILayerController) {
+    /// `reconcileOnInit` is false for the real daemon: it binds the socket
+    /// first, then calls `reconcileArmedIntent`. Otherwise a slow (or
+    /// failing) anchor load keeps the socket absent for the whole arm.
+    public init(
+        store: IntentStore,
+        kernel: KernelSupervising,
+        layer: AILayerController,
+        reconcileOnInit: Bool = true
+    ) {
         self.store = store
         self.kernel = kernel
         self.layer = layer
         intent = (try? store.load()) ?? .disarmed
-        if intent.armed {
+        if reconcileOnInit, intent.armed {
             converge { try layer.reconcileOnLaunch() }
         }
+    }
+
+    /// Armed intent re-installs the narrow layer. A clear intent does nothing.
+    public func reconcileArmedIntent() {
+        guard isArmed() else { return }
+        converge { try layer.reconcileOnLaunch() }
     }
 
     public func handle(_ envelope: HelperEnvelope) throws -> HelperEnvelope {
