@@ -931,8 +931,11 @@ write_server_config() {
       "settings": {"auth": "noauth", "udp": false}
     }
   ],
+  "dns": {
+    "hosts": {"www.${FIXTURE_SUFFIX}": "${FIXTURE_HOST}"}
+  },
   "outbounds": [
-    {"tag": "direct", "protocol": "freedom"}
+    {"tag": "direct", "protocol": "freedom", "streamSettings": {"sockopt": {"domainStrategy": "UseIP"}}}
   ]
 }
 EOF
@@ -1082,6 +1085,12 @@ remove_carrier_alias() {
 }
 
 hosts_install() {
+  # No /etc/hosts line: it also changes what the CLIENT's system resolver
+  # returns (run 11 saw 198.51.100.10 for the armed name from dscacheutil).
+  # The fixture server maps the name in its own Xray-style dns.hosts and
+  # its freedom outbound resolves with UseIP. Only strip a stale line.
+  hosts_remove
+  return 0
   local line="${FIXTURE_HOST} www.${FIXTURE_SUFFIX} # segue-vm-matrix"
   if dry; then
     note "hosts line so segue-relay resolves www.${FIXTURE_SUFFIX} to ${FIXTURE_HOST}; dig does not read /etc/hosts, so fake-IP checks stay on the kernel resolver"
