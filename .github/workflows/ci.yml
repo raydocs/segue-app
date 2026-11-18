@@ -49,3 +49,18 @@ jobs:
           swift --version
       - name: Build and test
         run: cd apps/macos && swift build && swift test
+
+  # Same tests with the newest toolchain we ship with (Xcode 27, Swift 6.4) on the
+  # owner's Mac mini. Hosted macOS images stop at Xcode 26.6 / Swift 6.3, which
+  # the job above keeps covering. Never runs code from a fork on this machine.
+  macos-xcode27:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64, segue-mac-xcode27]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: xcodebuild -version && swift --version
+      - name: Build and test
+        run: cd apps/macos && swift build && swift test
+
