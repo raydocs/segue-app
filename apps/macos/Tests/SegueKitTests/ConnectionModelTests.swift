@@ -301,6 +301,48 @@ final class ConnectionModelTests: XCTestCase {
         return (model, helper)
     }
 
+    func testSelectExitAppliesReadbackAndKeepsStateOnFailure() async throws {
+        let initial = try Fixtures.status("status-connected-live-exits")
+        var switched = initial
+        switched.exitChoice = "jp-tokyo"
+        switched.currentExit = "jp-tokyo"
+        let switchedSnapshot = switched
+
+        let fake = FakeControlClient()
+        fake.connectHandler = { initial }
+        fake.selectHandler = { exit in
+            XCTAssertEqual(exit, "jp-tokyo")
+            return switchedSnapshot
+        }
+        let helper = FakeHelper()
+        let up = Self.helperStatus(armed: true, utun: true)
+        helper.armHandler = { _ in up }
+        helper.statusHandler = { up }
+
+        let model = makeModel(client: fake, helper: helper)
+        await model.connect()
+        XCTAssertTrue(model.showsConnected)
+        XCTAssertEqual(model.exitChoice, "auto")
+        XCTAssertEqual(model.currentExit, "us-west")
+        XCTAssertEqual(model.exitDetails.count, 3)
+        XCTAssertEqual(model.exitDetails[1].quality?.srttMs, 68)
+        XCTAssertEqual(model.policyVersion, 41)
+        XCTAssertTrue(model.policyValid)
+        XCTAssertEqual(model.tunInterface, "utun4")
+        XCTAssertNotNil(model.connectedSince)
+
+        await model.selectExit("jp-tokyo")
+        XCTAssertEqual(model.exitChoice, "jp-tokyo")
+        XCTAssertEqual(model.currentExit, "jp-tokyo")
+        XCTAssertNil(model.lastError)
+
+        fake.selectHandler = { _ in throw KernelControlError.transport }
+        await model.selectExit("sg-edge")
+        XCTAssertEqual(model.exitChoice, "jp-tokyo")
+        XCTAssertEqual(model.currentExit, "jp-tokyo")
+        XCTAssertEqual(model.lastError, "Couldn't reach the kernel on this Mac.")
+    }
+
     private func makeModel(
         client: FakeControlClient,
         helper: FakeHelper? = nil,

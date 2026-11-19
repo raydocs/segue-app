@@ -30,6 +30,28 @@ final class KernelStatusDecodingTests: XCTestCase {
         XCTAssertEqual(quiet.statusLine, "The tunnel is not up.")
     }
 
+    func testConnectedLiveExitQualityFixture() throws {
+        let status = try Fixtures.status("status-connected-live-exits")
+        XCTAssertEqual(status.state, .connected)
+        XCTAssertEqual(status.exitChoice, "auto")
+        XCTAssertEqual(status.currentExit, "us-west")
+        XCTAssertEqual(status.exits, ["us-west", "jp-tokyo", "sg-edge"])
+        XCTAssertEqual(status.exitDetails.count, 3)
+        XCTAssertEqual(status.exitDetails[0].name, "us-west")
+        XCTAssertEqual(status.exitDetails[0].quality?.srttMs, 142)
+        XCTAssertEqual(status.exitDetails[0].quality?.loss, 0.0)
+        XCTAssertEqual(status.exitDetails[0].quality?.stalls, 0)
+        XCTAssertEqual(status.exitDetails[1].name, "jp-tokyo")
+        XCTAssertEqual(status.exitDetails[1].quality?.srttMs, 68)
+        XCTAssertNil(status.exitDetails[2].quality?.srttMs)
+        XCTAssertEqual(status.exitDetails[2].quality?.stalls, 1)
+
+        // Round-trip through JSON retains quality objects.
+        let encoded = try JSONEncoder().encode(status)
+        let decoded = try JSONDecoder().decode(KernelStatus.self, from: encoded)
+        XCTAssertEqual(decoded, status)
+    }
+
     func testReconnectingFixture() throws {
         let status = try Fixtures.status("status-reconnecting")
         XCTAssertEqual(status.state, .reconnecting)

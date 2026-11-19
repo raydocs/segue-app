@@ -1,0 +1,45 @@
+{
+  "state": "connected",
+  "posture": "connected",
+  "exit_choice": "auto",
+  "current_exit": "us-west",
+  "exits": [
+    {
+      "name": "us-west",
+      "quality": {
+        "srtt_ms": 142,
+        "loss": 0.0,
+        "stalls": 0
+      }
+    },
+    {
+      "name": "jp-tokyo",
+      "quality": {
+        "srtt_ms": 68,
+        "loss": 0.0,
+        "stalls": 0
+      }
+    },
+    {
+      "name": "sg-edge",
+      "quality": {
+        "srtt_ms": null,
+        "loss": 0.03,
+        "stalls": 1
+      }
+    }
+  ],
+  "revoked": false,
+  "control_refused": [],
+  "policy": {
+    "source": "signed",
+    "valid": true,
+    "version": 41,
+    "expires_at": 1893456000,
+    "high_water": 41
+  },
+  "tun": {
+    "interface": "utun4",
+    "routes": "installed"
+  }
+}

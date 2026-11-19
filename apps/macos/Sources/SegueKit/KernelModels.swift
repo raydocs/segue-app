@@ -86,12 +86,43 @@ public struct TunState: Codable, Equatable, Sendable {
     }
 }
 
+public struct KernelExitQuality: Codable, Equatable, Sendable {
+    public var srttMs: UInt64?
+    public var loss: Double
+    public var stalls: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case srttMs = "srtt_ms"
+        case loss
+        case stalls
+    }
+
+    public init(srttMs: UInt64?, loss: Double, stalls: UInt64) {
+        self.srttMs = srttMs
+        self.loss = loss
+        self.stalls = stalls
+    }
+}
+
+public struct KernelExitInfo: Codable, Equatable, Sendable, Identifiable {
+    public var name: String
+    public var quality: KernelExitQuality?
+
+    public var id: String { name }
+
+    public init(name: String, quality: KernelExitQuality? = nil) {
+        self.name = name
+        self.quality = quality
+    }
+}
+
 public struct KernelStatus: Codable, Equatable, Sendable {
     public var state: KernelState
     public var posture: KernelPosture
     public var exitChoice: String
     public var currentExit: String?
     public var exits: [String]
+    public var exitDetails: [KernelExitInfo]
     public var revoked: Bool
     public var controlRefused: [ControlRefusal]
     public var policy: KernelPolicyStatus
@@ -115,6 +146,7 @@ public struct KernelStatus: Codable, Equatable, Sendable {
         exitChoice: String,
         currentExit: String?,
         exits: [String],
+        exitDetails: [KernelExitInfo]? = nil,
         revoked: Bool,
         controlRefused: [ControlRefusal],
         policy: KernelPolicyStatus,
@@ -124,11 +156,54 @@ public struct KernelStatus: Codable, Equatable, Sendable {
         self.posture = posture
         self.exitChoice = exitChoice
         self.currentExit = currentExit
-        self.exits = exits
+        if let exitDetails {
+            self.exitDetails = exitDetails
+            self.exits = exits.isEmpty ? exitDetails.map(\.name) : exits
+        } else {
+            self.exits = exits
+            self.exitDetails = exits.map { KernelExitInfo(name: $0, quality: nil) }
+        }
         self.revoked = revoked
         self.controlRefused = controlRefused
         self.policy = policy
         self.tun = tun
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        state = try container.decode(KernelState.self, forKey: .state)
+        posture = try container.decode(KernelPosture.self, forKey: .posture)
+        exitChoice = try container.decode(String.self, forKey: .exitChoice)
+        currentExit = try container.decodeIfPresent(String.self, forKey: .currentExit)
+        if let detailed = try? container.decode([KernelExitInfo].self, forKey: .exits) {
+            exitDetails = detailed
+            exits = detailed.map(\.name)
+        } else {
+            let names = try container.decode([String].self, forKey: .exits)
+            exits = names
+            exitDetails = names.map { KernelExitInfo(name: $0, quality: nil) }
+        }
+        revoked = try container.decode(Bool.self, forKey: .revoked)
+        controlRefused = try container.decode([ControlRefusal].self, forKey: .controlRefused)
+        policy = try container.decode(KernelPolicyStatus.self, forKey: .policy)
+        tun = try container.decode(TunState.self, forKey: .tun)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(state, forKey: .state)
+        try container.encode(posture, forKey: .posture)
+        try container.encode(exitChoice, forKey: .exitChoice)
+        try container.encode(currentExit, forKey: .currentExit)
+        if exitDetails.contains(where: { $0.quality != nil }) {
+            try container.encode(exitDetails, forKey: .exits)
+        } else {
+            try container.encode(exits, forKey: .exits)
+        }
+        try container.encode(revoked, forKey: .revoked)
+        try container.encode(controlRefused, forKey: .controlRefused)
+        try container.encode(policy, forKey: .policy)
+        try container.encode(tun, forKey: .tun)
     }
 
     /// The menu shows connected only from this snapshot: kernel `state` is
