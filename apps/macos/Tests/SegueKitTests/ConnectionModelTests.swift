@@ -176,7 +176,7 @@ final class ConnectionModelTests: XCTestCase {
             generation: 1,
             held: false,
             tunInterface: nil,
-            rulesDigest: nil,
+            rulesDigest: "",
             evidence: StatusEvidence(tcpProofMs: nil, dnsReadback: false),
             lastError: nil,
             aiLayer: "off",
