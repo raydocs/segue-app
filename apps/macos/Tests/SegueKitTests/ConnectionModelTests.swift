@@ -161,7 +161,73 @@ final class ConnectionModelTests: XCTestCase {
         let model = makeModel(client: fake, helper: helper)
         await model.refresh()
         XCTAssertFalse(model.showsConnected)
+        XCTAssertTrue(model.isRevoked)
+        XCTAssertFalse(model.isGuarding)
+        XCTAssertEqual(model.helperKernelState, "running")
         XCTAssertEqual(model.statusLine, "This device was revoked.")
+    }
+
+    func testReadyDisarmedHelperWithoutKernelClearsNoHelperReason() async {
+        let fake = FakeControlClient()
+        fake.statusHandler = { throw KernelControlError.tokenFileUnreadable }
+        let helper = FakeHelper()
+        let disarmed = HelperStatus(
+            armed: false,
+            generation: 1,
+            held: false,
+            tunInterface: nil,
+            rulesDigest: "",
+            evidence: StatusEvidence(tcpProofMs: nil, dnsReadback: false),
+            lastError: nil,
+            aiLayer: "off",
+            helper: HelperProcessReport(state: "running"),
+            kernel: KernelReport(state: "stopped", pid: nil, lastExit: nil)
+        )
+        helper.statusHandler = { disarmed }
+        let model = makeModel(client: fake, helper: helper)
+        await model.refresh()
+        XCTAssertEqual(model.helperAvailability, .ready)
+        XCTAssertFalse(model.helperArmed)
+        XCTAssertFalse(model.isGuarding)
+        XCTAssertEqual(model.helperKernelState, "stopped")
+        XCTAssertEqual(model.reasonText, "")
+    }
+
+    func testDegradedHelperAndControlRefusalExposeReadbacks() async throws {
+        let connected = try Fixtures.status("status-connected")
+        let fake = FakeControlClient()
+        fake.statusHandler = { connected }
+        let helper = FakeHelper()
+        let degraded = HelperStatus(
+            armed: true,
+            generation: 5,
+            held: false,
+            tunInterface: "utun4",
+            rulesDigest: "",
+            evidence: StatusEvidence(tcpProofMs: nil, dnsReadback: false),
+            lastError: "resolver_write_failed",
+            aiLayer: AILayerState.degraded,
+            helper: HelperProcessReport(state: "running"),
+            kernel: KernelReport(
+                state: "kernel_failed",
+                pid: nil,
+                lastExit: "exit 4",
+                lastStderr: "utun setup failed"
+            ),
+            anchorLoaded: true,
+            resolverFilesPresent: false,
+            guardListening: false,
+            dnsMode: AILayerState.guardMode,
+            aiListError: "ai list missing"
+        )
+        helper.statusHandler = { degraded }
+        let model = makeModel(client: fake, helper: helper)
+        await model.refresh()
+        XCTAssertTrue(model.hasControlRefusal)
+        XCTAssertEqual(model.helperLastError, "resolver_write_failed")
+        XCTAssertEqual(model.aiListError, "ai list missing")
+        XCTAssertEqual(model.helperKernelState, "kernel_failed")
+        XCTAssertEqual(model.helperKernelLastStderr, "utun setup failed")
     }
 
     func testQuitDoesNotDisarm() async throws {
@@ -299,6 +365,48 @@ final class ConnectionModelTests: XCTestCase {
         let model = makeModel(client: fake, helper: helper)
         await model.connect()
         return (model, helper)
+    }
+
+    func testSelectExitAppliesReadbackAndKeepsStateOnFailure() async throws {
+        let initial = try Fixtures.status("status-connected-live-exits")
+        var switched = initial
+        switched.exitChoice = "jp-tokyo"
+        switched.currentExit = "jp-tokyo"
+        let switchedSnapshot = switched
+
+        let fake = FakeControlClient()
+        fake.connectHandler = { initial }
+        fake.selectHandler = { exit in
+            XCTAssertEqual(exit, "jp-tokyo")
+            return switchedSnapshot
+        }
+        let helper = FakeHelper()
+        let up = Self.helperStatus(armed: true, utun: true)
+        helper.armHandler = { _ in up }
+        helper.statusHandler = { up }
+
+        let model = makeModel(client: fake, helper: helper)
+        await model.connect()
+        XCTAssertTrue(model.showsConnected)
+        XCTAssertEqual(model.exitChoice, "auto")
+        XCTAssertEqual(model.currentExit, "us-west")
+        XCTAssertEqual(model.exitDetails.count, 3)
+        XCTAssertEqual(model.exitDetails[1].quality?.srttMs, 68)
+        XCTAssertEqual(model.policyVersion, 41)
+        XCTAssertTrue(model.policyValid)
+        XCTAssertEqual(model.tunInterface, "utun4")
+        XCTAssertNotNil(model.connectedSince)
+
+        await model.selectExit("jp-tokyo")
+        XCTAssertEqual(model.exitChoice, "jp-tokyo")
+        XCTAssertEqual(model.currentExit, "jp-tokyo")
+        XCTAssertNil(model.lastError)
+
+        fake.selectHandler = { _ in throw KernelControlError.transport }
+        await model.selectExit("sg-edge")
+        XCTAssertEqual(model.exitChoice, "jp-tokyo")
+        XCTAssertEqual(model.currentExit, "jp-tokyo")
+        XCTAssertEqual(model.lastError, "Couldn't reach the kernel on this Mac.")
     }
 
     private func makeModel(

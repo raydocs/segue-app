@@ -63,6 +63,30 @@ public final class ConnectionModel: ObservableObject {
     @Published public private(set) var notice: String?
     @Published public private(set) var helperAvailability: HelperAvailability
     @Published public private(set) var restoreNeedsConfirmation: Bool
+    @Published public private(set) var exitChoice: String
+    @Published public private(set) var currentExit: String?
+    @Published public private(set) var exitDetails: [KernelExitInfo]
+    @Published public private(set) var kernelState: KernelState?
+    @Published public private(set) var kernelPosture: KernelPosture?
+    @Published public private(set) var policyVersion: UInt64?
+    @Published public private(set) var policyValid: Bool
+    @Published public private(set) var helperArmed: Bool
+    @Published public private(set) var helperHeld: Bool
+    @Published public private(set) var aiLayerMode: String?
+    @Published public private(set) var dnsMode: String?
+    @Published public private(set) var tunInterface: String?
+    @Published public private(set) var anchorLoaded: Bool?
+    @Published public private(set) var resolverFilesPresent: Bool?
+    @Published public private(set) var guardListening: Bool?
+    @Published public private(set) var connectedSince: Date?
+    @Published public private(set) var isConnecting: Bool
+    @Published public private(set) var isGuarding: Bool
+    @Published public private(set) var isRevoked: Bool
+    @Published public private(set) var hasControlRefusal: Bool
+    @Published public private(set) var helperKernelState: String?
+    @Published public private(set) var helperKernelLastStderr: String?
+    @Published public private(set) var helperLastError: String?
+    @Published public private(set) var aiListError: String?
 
     public let configFolder: URL
 
@@ -83,6 +107,7 @@ public final class ConnectionModel: ObservableObject {
     private var pollGeneration = 0
     private var pollTask: Task<Void, Never>?
     private var pollingStopped = false
+    private var connectInFlight = false
 
     private struct ReadbackSample: Codable, Equatable {
         var kernel: KernelStatus?
@@ -116,6 +141,30 @@ public final class ConnectionModel: ObservableObject {
         notice = nil
         helperAvailability = .unknown
         restoreNeedsConfirmation = false
+        exitChoice = "auto"
+        currentExit = nil
+        exitDetails = []
+        kernelState = nil
+        kernelPosture = nil
+        policyVersion = nil
+        policyValid = false
+        helperArmed = false
+        helperHeld = false
+        aiLayerMode = nil
+        dnsMode = nil
+        tunInterface = nil
+        anchorLoaded = nil
+        resolverFilesPresent = nil
+        guardListening = nil
+        connectedSince = nil
+        isConnecting = false
+        isGuarding = false
+        isRevoked = false
+        hasControlRefusal = false
+        helperKernelState = nil
+        helperKernelLastStderr = nil
+        helperLastError = nil
+        aiListError = nil
         if startsPolling {
             restartPolling(refreshNow: true)
         }
@@ -125,7 +174,13 @@ public final class ConnectionModel: ObservableObject {
         guard begin() else {
             return
         }
-        defer { isBusy = false }
+        connectInFlight = true
+        recompute()
+        defer {
+            connectInFlight = false
+            isBusy = false
+            recompute()
+        }
         let serial = beginRead()
         do {
             if let helper {
@@ -155,6 +210,29 @@ public final class ConnectionModel: ObservableObject {
     /// Explicit Disconnect. Sends `user_disconnect`. Does not ask twice.
     public func disconnect() async {
         await disarm(.userDisconnect)
+    }
+
+    /// Ask the kernel to switch exits (or `"auto"`). Applies the read-back; a
+    /// failure leaves the previous read-back intact.
+    public func selectExit(_ exit: String) async {
+        guard begin() else {
+            return
+        }
+        defer { isBusy = false }
+        let serial = beginRead()
+        do {
+            let kernel = try await client.selectExit(exit)
+            guard serial == readSerial else {
+                return
+            }
+            apply(kernel: kernel)
+            lastError = nil
+        } catch {
+            guard serial == readSerial else {
+                return
+            }
+            note(error)
+        }
     }
 
     /// Shows the confirm step. Does not disarm.
@@ -502,6 +580,28 @@ public final class ConnectionModel: ObservableObject {
     }
 
     private func recompute() {
+        exitChoice = latestKernel?.exitChoice ?? "auto"
+        currentExit = latestKernel?.currentExit
+        exitDetails = latestKernel?.exitDetails ?? []
+        kernelState = latestKernel?.state
+        kernelPosture = latestKernel?.posture
+        policyVersion = latestKernel?.policy.version
+        policyValid = latestKernel?.policy.valid ?? false
+        helperArmed = latestHelper?.armed == true
+        helperHeld = latestHelper?.held == true
+        aiLayerMode = latestHelper?.aiLayer
+        dnsMode = latestHelper?.dnsMode
+        tunInterface = latestHelper?.tunInterface ?? latestKernel?.tun.interfaceName
+        anchorLoaded = latestHelper?.anchorLoaded
+        resolverFilesPresent = latestHelper?.resolverFilesPresent
+        guardListening = latestHelper?.guardListening
+        isRevoked = latestKernel?.revoked == true
+        hasControlRefusal = !(latestKernel?.controlRefused.isEmpty ?? true)
+        helperKernelState = latestHelper?.kernel?.state
+        helperKernelLastStderr = latestHelper?.kernel?.lastStderr
+        helperLastError = latestHelper?.lastError
+        aiListError = latestHelper?.aiListError
+
         let utunUp = !(latestHelper?.tunInterface ?? "").isEmpty
         let armed = latestHelper?.armed == true
         let kernelConnected = latestKernel?.state == .connected && latestKernel?.revoked != true
@@ -512,30 +612,58 @@ public final class ConnectionModel: ObservableObject {
             statusLine = Self.helperNotInstalledLine
             reasonText = Self.helperInstallInstructions
             showsConnected = false
+            connectedSince = nil
+            isConnecting = false
+            isGuarding = false
             return
         case .versionMismatch:
             statusLine = Self.versionMismatchLine
             reasonText = Self.versionMismatchReason(version: mismatchedVersion)
             showsConnected = false
+            connectedSince = nil
+            isConnecting = false
+            isGuarding = false
             return
         case .unauthorized:
             statusLine = Self.unauthorizedLine
             reasonText = Self.unauthorizedReason
             showsConnected = false
+            connectedSince = nil
+            isConnecting = false
+            isGuarding = false
             return
         case .unknown, .ready:
             break
         }
 
+        if showsConnected {
+            if connectedSince == nil {
+                connectedSince = Date()
+            }
+        } else {
+            connectedSince = nil
+        }
+
+        let connectingNow = !showsConnected && (connectInFlight || latestKernel?.posture == .connecting)
+        isConnecting = connectingNow
+        isGuarding = !showsConnected && !connectingNow && !isRevoked && (
+            armed
+                || aiLayerMode == AILayerState.guardMode
+                || latestKernel?.state == .reconnecting
+        )
+
         guard let kernel = latestKernel else {
             statusLine = Self.noStatusYet
-            reasonText = helper == nil ? "" : "No helper status yet."
+            reasonText = (helper != nil && latestHelper == nil) ? "No helper status yet." : ""
             return
         }
         if kernel.revoked {
             statusLine = kernel.statusLine
             reasonText = "This device was revoked."
             showsConnected = false
+            connectedSince = nil
+            isConnecting = false
+            isGuarding = false
             return
         }
         if showsConnected {
