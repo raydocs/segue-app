@@ -82,7 +82,11 @@ public final class ConnectionModel: ObservableObject {
     @Published public private(set) var isConnecting: Bool
     @Published public private(set) var isGuarding: Bool
     @Published public private(set) var isRevoked: Bool
+    @Published public private(set) var hasControlRefusal: Bool
     @Published public private(set) var helperKernelState: String?
+    @Published public private(set) var helperKernelLastStderr: String?
+    @Published public private(set) var helperLastError: String?
+    @Published public private(set) var aiListError: String?
 
     public let configFolder: URL
 
@@ -156,7 +160,11 @@ public final class ConnectionModel: ObservableObject {
         isConnecting = false
         isGuarding = false
         isRevoked = false
+        hasControlRefusal = false
         helperKernelState = nil
+        helperKernelLastStderr = nil
+        helperLastError = nil
+        aiListError = nil
         if startsPolling {
             restartPolling(refreshNow: true)
         }
@@ -588,7 +596,11 @@ public final class ConnectionModel: ObservableObject {
         resolverFilesPresent = latestHelper?.resolverFilesPresent
         guardListening = latestHelper?.guardListening
         isRevoked = latestKernel?.revoked == true
+        hasControlRefusal = !(latestKernel?.controlRefused.isEmpty ?? true)
         helperKernelState = latestHelper?.kernel?.state
+        helperKernelLastStderr = latestHelper?.kernel?.lastStderr
+        helperLastError = latestHelper?.lastError
+        aiListError = latestHelper?.aiListError
 
         let utunUp = !(latestHelper?.tunInterface ?? "").isEmpty
         let armed = latestHelper?.armed == true

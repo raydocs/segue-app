@@ -255,7 +255,7 @@ struct LuminaMantaHeroView: View {
                     }
                 }
                 .onTapGesture {
-                    if visualState != .off {
+                    if visualState != .off && !effectiveCalm {
                         controller.triggerSwoop()
                     }
                 }

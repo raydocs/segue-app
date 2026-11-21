@@ -560,24 +560,19 @@ enum LuminaMantaEngine {
             let h = Double(rect.height)
             let resting = state == .off
             let guarding = state == .guarding
+            let isError = state == .error
+            let tucked = resting || guarding || isError
             let speed = state == .connecting ? 4.8 : (guarding ? 3.1 : 2.35)
-            let spread: Double = resting ? 0.64 : (guarding ? 0.72 : 1.0)
+            let spread: Double = resting ? 0.64 : ((guarding || isError) ? 0.72 : 1.0)
             let cfg = MantaCameraConfig(
-                cx: w * 0.52,
-                cy: h * 0.48,
+                cx: w * 0.50,
+                cy: h * 0.49,
                 scale: h * 0.36,
                 yaw: 0.48,
-                pitch: resting ? -0.02 : (state == .connecting ? 0.14 : 0.06),
-                roll: resting ? 0.06 : 0.16,
+                pitch: tucked ? -0.02 : (state == .connecting ? 0.14 : 0.06),
+                roll: tucked ? 0.06 : 0.16,
                 elev: 0.42
             )
-
-            // Template images use only the alpha channel; black avoids appearance-dependent resolution.
-            let inkAlpha: CGFloat = resting ? 0.58 : 0.96
-            cg.setFillColor(NSColor.black.withAlphaComponent(inkAlpha).cgColor)
-            cg.setStrokeColor(NSColor.black.withAlphaComponent(inkAlpha).cgColor)
-            cg.setLineCap(.round)
-            cg.setLineJoin(.round)
 
             // Guard mode subtle dashed arc behind the tucked manta.
             if guarding {
@@ -585,9 +580,20 @@ enum LuminaMantaEngine {
                 cg.setStrokeColor(NSColor.black.withAlphaComponent(0.50).cgColor)
                 cg.setLineWidth(1.0)
                 cg.setLineDash(phase: 0, lengths: [3.2, 2.2])
-                cg.strokeEllipse(in: CGRect(x: w * 0.16, y: h * 0.10, width: w * 0.68, height: h * 0.80))
+                cg.strokeEllipse(in: CGRect(x: w * 0.14, y: h * 0.10, width: w * 0.68, height: h * 0.80))
                 cg.restoreGState()
             }
+
+            // Draw the tail + 5x14 mesh at full black inside an isolated transparency layer
+            // so adjacent quads never double-blend seams in the resting semi-transparent state.
+            let inkAlpha: CGFloat = resting ? 0.56 : 0.96
+            cg.saveGState()
+            cg.setAlpha(inkAlpha)
+            cg.beginTransparencyLayer(auxiliaryInfo: nil)
+            cg.setFillColor(NSColor.black.cgColor)
+            cg.setStrokeColor(NSColor.black.cgColor)
+            cg.setLineCap(.round)
+            cg.setLineJoin(.round)
 
             // Tapered 3D whip tail.
             let tailSegs = 8
@@ -597,7 +603,7 @@ enum LuminaMantaEngine {
                 let p0 = project(
                     MantaPoint3D(
                         x: -0.56 - f0 * 0.98,
-                        y: sin(phase * speed - 1.15 - f0 * 3.1) * (0.03 + f0 * 0.12) * (resting ? 0.2 : 1.0),
+                        y: sin(phase * speed - 1.15 - f0 * 3.1) * (0.03 + f0 * 0.12) * (tucked ? 0.2 : 1.0),
                         z: 0
                     ),
                     config: cfg
@@ -605,7 +611,7 @@ enum LuminaMantaEngine {
                 let p1 = project(
                     MantaPoint3D(
                         x: -0.56 - f1 * 0.98,
-                        y: sin(phase * speed - 1.15 - f1 * 3.1) * (0.03 + f1 * 0.12) * (resting ? 0.2 : 1.0),
+                        y: sin(phase * speed - 1.15 - f1 * 3.1) * (0.03 + f1 * 0.12) * (tucked ? 0.2 : 1.0),
                         z: 0
                     ),
                     config: cfg
@@ -648,9 +654,23 @@ enum LuminaMantaEngine {
                     cg.drawPath(using: .fillStroke)
                 }
             }
+            cg.endTransparencyLayer()
+            cg.restoreGState()
 
-            // Tiny crisp status indicator dot in top-right corner when active/guarding/error.
-            if state != .off {
+            // Distinct status indicator in top-right corner:
+            // - `.error`: crisp miniature `!` mark (unmistakable vs connected)
+            // - `.connected` / `.connecting` / `.guarding`: crisp 3pt status dot
+            cg.setFillColor(NSColor.black.withAlphaComponent(0.96).cgColor)
+            cg.setStrokeColor(NSColor.black.withAlphaComponent(0.96).cgColor)
+            if isError {
+                cg.setLineCap(.round)
+                cg.setLineWidth(1.5)
+                cg.beginPath()
+                cg.move(to: CGPoint(x: w - 2.6, y: 1.8))
+                cg.addLine(to: CGPoint(x: w - 2.6, y: 5.2))
+                cg.strokePath()
+                cg.fillEllipse(in: CGRect(x: w - 3.45, y: 6.7, width: 1.7, height: 1.7))
+            } else if state != .off {
                 let dotRect = CGRect(x: w - 4.0, y: 1.5, width: 3.0, height: 3.0)
                 cg.fillEllipse(in: dotRect)
             }

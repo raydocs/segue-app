@@ -86,6 +86,9 @@ enum MantaVisualState: Equatable, Sendable {
         if model.isRevoked {
             return .error
         }
+        if model.aiLayerMode == AILayerState.degraded || model.aiListError != nil {
+            return .error
+        }
         if model.showsConnected {
             return .connected
         }

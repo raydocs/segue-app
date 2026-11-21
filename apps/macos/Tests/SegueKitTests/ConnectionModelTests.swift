@@ -193,6 +193,43 @@ final class ConnectionModelTests: XCTestCase {
         XCTAssertEqual(model.reasonText, "")
     }
 
+    func testDegradedHelperAndControlRefusalExposeReadbacks() async throws {
+        let connected = try Fixtures.status("status-connected")
+        let fake = FakeControlClient()
+        fake.statusHandler = { connected }
+        let helper = FakeHelper()
+        let degraded = HelperStatus(
+            armed: true,
+            generation: 5,
+            held: false,
+            tunInterface: "utun4",
+            rulesDigest: "",
+            evidence: StatusEvidence(tcpProofMs: nil, dnsReadback: false),
+            lastError: "resolver_write_failed",
+            aiLayer: AILayerState.degraded,
+            helper: HelperProcessReport(state: "running"),
+            kernel: KernelReport(
+                state: "kernel_failed",
+                pid: nil,
+                lastExit: "exit 4",
+                lastStderr: "utun setup failed"
+            ),
+            anchorLoaded: true,
+            resolverFilesPresent: false,
+            guardListening: false,
+            dnsMode: AILayerState.guardMode,
+            aiListError: "ai list missing"
+        )
+        helper.statusHandler = { degraded }
+        let model = makeModel(client: fake, helper: helper)
+        await model.refresh()
+        XCTAssertTrue(model.hasControlRefusal)
+        XCTAssertEqual(model.helperLastError, "resolver_write_failed")
+        XCTAssertEqual(model.aiListError, "ai list missing")
+        XCTAssertEqual(model.helperKernelState, "kernel_failed")
+        XCTAssertEqual(model.helperKernelLastStderr, "utun setup failed")
+    }
+
     func testQuitDoesNotDisarm() async throws {
         let parts = try await connectFully()
         let armed = parts.helper.armIntents.count

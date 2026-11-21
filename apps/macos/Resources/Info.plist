@@ -9,7 +9,7 @@
 	<key>CFBundleExecutable</key>
 	<string>Segue</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.segue.app</string>
+	<string>com.raydocs.segue</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
