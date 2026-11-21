@@ -551,7 +551,7 @@ enum LuminaMantaEngine {
     /// (`isTemplate = true`) so it adapts automatically to light/dark menu bars.
     @MainActor
     static func renderMenuBarTemplateImage(state: MantaVisualState, phase: Double) -> NSImage {
-        let size = NSSize(width: 24, height: 17)
+        let size = NSSize(width: 24, height: 18)
         let image = NSImage(size: size, flipped: true) { rect in
             guard let cg = NSGraphicsContext.current?.cgContext else {
                 return false
@@ -563,28 +563,29 @@ enum LuminaMantaEngine {
             let speed = state == .connecting ? 4.8 : (guarding ? 3.1 : 2.35)
             let spread: Double = resting ? 0.64 : (guarding ? 0.72 : 1.0)
             let cfg = MantaCameraConfig(
-                cx: w * 0.53,
-                cy: h * 0.52,
-                scale: h * 0.42,
+                cx: w * 0.52,
+                cy: h * 0.48,
+                scale: h * 0.36,
                 yaw: 0.48,
                 pitch: resting ? -0.02 : (state == .connecting ? 0.14 : 0.06),
                 roll: resting ? 0.06 : 0.16,
                 elev: 0.42
             )
 
+            // Template images use only the alpha channel; black avoids appearance-dependent resolution.
             let inkAlpha: CGFloat = resting ? 0.58 : 0.96
-            cg.setFillColor(NSColor.labelColor.withAlphaComponent(inkAlpha).cgColor)
-            cg.setStrokeColor(NSColor.labelColor.withAlphaComponent(inkAlpha).cgColor)
+            cg.setFillColor(NSColor.black.withAlphaComponent(inkAlpha).cgColor)
+            cg.setStrokeColor(NSColor.black.withAlphaComponent(inkAlpha).cgColor)
             cg.setLineCap(.round)
             cg.setLineJoin(.round)
 
             // Guard mode subtle dashed arc behind the tucked manta.
             if guarding {
                 cg.saveGState()
-                cg.setStrokeColor(NSColor.labelColor.withAlphaComponent(0.50).cgColor)
+                cg.setStrokeColor(NSColor.black.withAlphaComponent(0.50).cgColor)
                 cg.setLineWidth(1.0)
                 cg.setLineDash(phase: 0, lengths: [3.2, 2.2])
-                cg.strokeEllipse(in: CGRect(x: w * 0.14, y: h * 0.08, width: w * 0.72, height: h * 0.84))
+                cg.strokeEllipse(in: CGRect(x: w * 0.16, y: h * 0.10, width: w * 0.68, height: h * 0.80))
                 cg.restoreGState()
             }
 
@@ -595,7 +596,7 @@ enum LuminaMantaEngine {
                 let f1 = Double(k + 1) / Double(tailSegs)
                 let p0 = project(
                     MantaPoint3D(
-                        x: -0.56 - f0 * 1.02,
+                        x: -0.56 - f0 * 0.98,
                         y: sin(phase * speed - 1.15 - f0 * 3.1) * (0.03 + f0 * 0.12) * (resting ? 0.2 : 1.0),
                         z: 0
                     ),
@@ -603,13 +604,13 @@ enum LuminaMantaEngine {
                 )
                 let p1 = project(
                     MantaPoint3D(
-                        x: -0.56 - f1 * 1.02,
+                        x: -0.56 - f1 * 0.98,
                         y: sin(phase * speed - 1.15 - f1 * 3.1) * (0.03 + f1 * 0.12) * (resting ? 0.2 : 1.0),
                         z: 0
                     ),
                     config: cfg
                 )
-                cg.setLineWidth(CGFloat(1.35 * (1.0 - f0 * 0.72)))
+                cg.setLineWidth(CGFloat(1.3 * (1.0 - f0 * 0.72)))
                 cg.beginPath()
                 cg.move(to: CGPoint(x: p0.sx, y: p0.sy))
                 cg.addLine(to: CGPoint(x: p1.sx, y: p1.sy))
@@ -648,9 +649,9 @@ enum LuminaMantaEngine {
                 }
             }
 
-            // Tiny crisp status indicator dot in bottom-right corner when connected/guarding/error.
+            // Tiny crisp status indicator dot in top-right corner when active/guarding/error.
             if state != .off {
-                let dotRect = CGRect(x: w - 4.2, y: h - 4.2, width: 3.2, height: 3.2)
+                let dotRect = CGRect(x: w - 4.0, y: 1.5, width: 3.0, height: 3.0)
                 cg.fillEllipse(in: dotRect)
             }
 

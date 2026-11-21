@@ -76,6 +76,27 @@ final class MenuBarIconStore: ObservableObject {
                 }
             }
             .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self, weak model] _ in
+                Task { @MainActor [weak self, weak model] in
+                    guard let self, let model else { return }
+                    self.sync(to: MantaVisualState.from(model: model))
+                }
+            }
+            .store(in: &cancellables)
+
+        NSWorkspace.shared.notificationCenter
+            .publisher(for: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self, weak model] _ in
+                Task { @MainActor [weak self, weak model] in
+                    guard let self, let model else { return }
+                    self.sync(to: MantaVisualState.from(model: model))
+                }
+            }
+            .store(in: &cancellables)
     }
 
     private func sync(to next: MantaVisualState) {
@@ -88,7 +109,11 @@ final class MenuBarIconStore: ObservableObject {
         if next == .connecting && !calm {
             startConnectingAnimation()
         } else {
+            let wasAnimating = animationTask != nil
             stopAnimation()
+            if wasAnimating {
+                image = LuminaMantaEngine.renderMenuBarTemplateImage(state: next, phase: 1.25)
+            }
         }
     }
 

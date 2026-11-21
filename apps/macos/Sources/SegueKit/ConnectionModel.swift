@@ -81,6 +81,8 @@ public final class ConnectionModel: ObservableObject {
     @Published public private(set) var connectedSince: Date?
     @Published public private(set) var isConnecting: Bool
     @Published public private(set) var isGuarding: Bool
+    @Published public private(set) var isRevoked: Bool
+    @Published public private(set) var helperKernelState: String?
 
     public let configFolder: URL
 
@@ -153,6 +155,8 @@ public final class ConnectionModel: ObservableObject {
         connectedSince = nil
         isConnecting = false
         isGuarding = false
+        isRevoked = false
+        helperKernelState = nil
         if startsPolling {
             restartPolling(refreshNow: true)
         }
@@ -583,6 +587,8 @@ public final class ConnectionModel: ObservableObject {
         anchorLoaded = latestHelper?.anchorLoaded
         resolverFilesPresent = latestHelper?.resolverFilesPresent
         guardListening = latestHelper?.guardListening
+        isRevoked = latestKernel?.revoked == true
+        helperKernelState = latestHelper?.kernel?.state
 
         let utunUp = !(latestHelper?.tunInterface ?? "").isEmpty
         let armed = latestHelper?.armed == true
@@ -628,7 +634,7 @@ public final class ConnectionModel: ObservableObject {
 
         let connectingNow = !showsConnected && (connectInFlight || latestKernel?.posture == .connecting)
         isConnecting = connectingNow
-        isGuarding = !showsConnected && !connectingNow && (
+        isGuarding = !showsConnected && !connectingNow && !isRevoked && (
             armed
                 || aiLayerMode == AILayerState.guardMode
                 || latestKernel?.state == .reconnecting
@@ -636,7 +642,7 @@ public final class ConnectionModel: ObservableObject {
 
         guard let kernel = latestKernel else {
             statusLine = Self.noStatusYet
-            reasonText = helper == nil ? "" : "No helper status yet."
+            reasonText = (helper != nil && latestHelper == nil) ? "No helper status yet." : ""
             return
         }
         if kernel.revoked {
@@ -645,6 +651,7 @@ public final class ConnectionModel: ObservableObject {
             showsConnected = false
             connectedSince = nil
             isConnecting = false
+            isGuarding = false
             return
         }
         if showsConnected {

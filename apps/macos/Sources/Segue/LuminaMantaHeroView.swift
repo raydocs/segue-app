@@ -14,9 +14,10 @@ final class MantaKinematicsBuffer: @unchecked Sendable {
     private var rippleAge: Double = 99
     private var leftTrail: [MantaTrailPoint] = []
     private var rightTrail: [MantaTrailPoint] = []
-    private var startTimestamp: TimeInterval?
+    private var elapsed: Double = 1.25
     private var lastTimestamp: TimeInterval?
     private var preWarmedSize: CGSize = .zero
+    private var lastVisualState: MantaVisualState?
 
     func updateHover(location: CGPoint, in size: CGSize) {
         guard size.width > 1, size.height > 1 else { return }
@@ -53,15 +54,16 @@ final class MantaKinematicsBuffer: @unchecked Sendable {
         defer { lock.unlock() }
 
         let now = date.timeIntervalSinceReferenceDate
-        let start = startTimestamp ?? now
-        if startTimestamp == nil {
-            startTimestamp = start
-        }
-        let dt = min(0.05, max(0.0, now - (lastTimestamp ?? now)))
+        let rawDt = lastTimestamp.map { max(0.0, now - $0) } ?? 0.0
+        let resumedFromPause = rawDt > 0.5
+        let dt = resumedFromPause ? 0.0 : min(0.05, rawDt)
         lastTimestamp = now
-        let elapsed = 1.25 + (now - start)
+        elapsed += dt
 
-        if preWarmedSize != size && size.width > 20 && size.height > 20 {
+        let stateChangedToActive = (lastVisualState != state) && (state == .connected || state == .connecting)
+        lastVisualState = state
+
+        if size.width > 20 && size.height > 20 && (preWarmedSize != size || resumedFromPause || stateChangedToActive) {
             preWarmTrailsLocked(size: size, time: elapsed, state: state, calmMotion: calmMotion)
             preWarmedSize = size
         }
@@ -181,8 +183,13 @@ final class MantaMotionController: ObservableObject {
 
     func triggerSwoop(toast: String? = nil) {
         kinematics.triggerSwoop()
-        guard let toast else { return }
-        toastMessage = toast
+        if let toast {
+            showToast(toast)
+        }
+    }
+
+    func showToast(_ message: String) {
+        toastMessage = message
         toastTask?.cancel()
         toastTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 1_500_000_000)
@@ -191,6 +198,12 @@ final class MantaMotionController: ObservableObject {
                 self?.toastMessage = nil
             }
         }
+    }
+
+    func clearToast() {
+        toastTask?.cancel()
+        toastTask = nil
+        toastMessage = nil
     }
 }
 
@@ -211,7 +224,7 @@ struct LuminaMantaHeroView: View {
     }
 
     private var isPaused: Bool {
-        !isPopoverOpen || (effectiveCalm && visualState == .off)
+        !isPopoverOpen || (effectiveCalm && visualState != .connecting)
     }
 
     var body: some View {

@@ -161,7 +161,36 @@ final class ConnectionModelTests: XCTestCase {
         let model = makeModel(client: fake, helper: helper)
         await model.refresh()
         XCTAssertFalse(model.showsConnected)
+        XCTAssertTrue(model.isRevoked)
+        XCTAssertFalse(model.isGuarding)
+        XCTAssertEqual(model.helperKernelState, "running")
         XCTAssertEqual(model.statusLine, "This device was revoked.")
+    }
+
+    func testReadyDisarmedHelperWithoutKernelClearsNoHelperReason() async {
+        let fake = FakeControlClient()
+        fake.statusHandler = { throw KernelControlError.tokenFileUnreadable }
+        let helper = FakeHelper()
+        let disarmed = HelperStatus(
+            armed: false,
+            generation: 1,
+            held: false,
+            tunInterface: nil,
+            rulesDigest: nil,
+            evidence: StatusEvidence(tcpProofMs: nil, dnsReadback: false),
+            lastError: nil,
+            aiLayer: "off",
+            helper: HelperProcessReport(state: "running"),
+            kernel: KernelReport(state: "stopped", pid: nil, lastExit: nil)
+        )
+        helper.statusHandler = { disarmed }
+        let model = makeModel(client: fake, helper: helper)
+        await model.refresh()
+        XCTAssertEqual(model.helperAvailability, .ready)
+        XCTAssertFalse(model.helperArmed)
+        XCTAssertFalse(model.isGuarding)
+        XCTAssertEqual(model.helperKernelState, "stopped")
+        XCTAssertEqual(model.reasonText, "")
     }
 
     func testQuitDoesNotDisarm() async throws {

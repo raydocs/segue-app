@@ -83,19 +83,47 @@ enum MantaVisualState: Equatable, Sendable {
         case .unknown, .ready:
             break
         }
+        if model.isRevoked {
+            return .error
+        }
         if model.showsConnected {
             return .connected
         }
         if model.isConnecting {
             return .connecting
         }
+        if model.helperKernelState == "kernel_failed" {
+            return .error
+        }
         if model.isGuarding {
             return .guarding
+        }
+        if model.helperAvailability == .ready && !model.helperArmed {
+            if let error = model.lastError, !isExpectedIdleKernelError(error, model: model) {
+                return .error
+            }
+            return .off
         }
         if model.lastError != nil && model.kernelState == nil {
             return .error
         }
         return .off
+    }
+
+    /// True when the helper is ready and disarmed so an unread/stopped kernel
+    /// control socket is expected rather than an actionable user error.
+    @MainActor
+    static func isExpectedIdleKernelError(_ error: String?, model: ConnectionModel) -> Bool {
+        guard let error,
+              model.helperAvailability == .ready,
+              !model.helperArmed,
+              model.kernelState == nil,
+              model.helperKernelState != "running"
+        else {
+            return false
+        }
+        return error == "Couldn't read the kernel control token."
+            || error == "Couldn't reach the kernel on this Mac."
     }
 }
 

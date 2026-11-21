@@ -72,7 +72,9 @@ struct SeguePopoverView: View {
         }
         .onDisappear {
             isMenuOpen = false
+            showingSettings = false
             showingQuitNotice = false
+            model.cancelRestoreNetwork()
             model.setMenuOpen(false)
         }
     }
@@ -277,40 +279,51 @@ struct SeguePopoverView: View {
 
             if exitsExpanded {
                 Rectangle().fill(hairlineColor).frame(height: 1)
-                VStack(spacing: 3) {
-                    exitOptionRow(
-                        id: "auto",
-                        title: autoExitTitle,
-                        tag: "推荐",
-                        detail: "自动择优 · AI 固定出口",
-                        latency: activeExitQuality(for: model.currentExit)?.srttMs,
-                        qualityColor: material.accent,
-                        isSelected: model.exitChoice == "auto"
-                    )
-                    ForEach(model.exitDetails) { exit in
-                        exitOptionRow(
-                            id: exit.name,
-                            title: exit.name,
-                            tag: exit.name == model.currentExit ? "当前" : nil,
-                            detail: exitQualitySubtitle(exit.quality),
-                            latency: exit.quality?.srttMs,
-                            qualityColor: qualityDotColor(exit.quality),
-                            isSelected: model.exitChoice == exit.name
-                        )
+                if model.exitDetails.count > 4 {
+                    ScrollView {
+                        exitOptionsList
                     }
-                    if model.exitDetails.isEmpty {
-                        Text("连接内核后将自动载入可用出口列表")
-                            .font(.system(size: 11))
-                            .foregroundStyle(subtleText)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                    }
+                    .frame(maxHeight: 224)
+                } else {
+                    exitOptionsList
                 }
-                .padding(6)
             }
         }
         .background(cardBackground)
+    }
+
+    private var exitOptionsList: some View {
+        VStack(spacing: 3) {
+            exitOptionRow(
+                id: "auto",
+                title: autoExitTitle,
+                tag: "推荐",
+                detail: "自动择优 · AI 固定出口",
+                latency: activeExitQuality(for: model.currentExit)?.srttMs,
+                qualityColor: canSwitchExits ? material.accent : subtleText,
+                isSelected: model.exitChoice == "auto"
+            )
+            ForEach(model.exitDetails) { exit in
+                exitOptionRow(
+                    id: exit.name,
+                    title: exit.name,
+                    tag: exit.name == model.currentExit ? "当前" : nil,
+                    detail: exitQualitySubtitle(exit.quality),
+                    latency: exit.quality?.srttMs,
+                    qualityColor: canSwitchExits ? qualityDotColor(exit.quality) : subtleText,
+                    isSelected: model.exitChoice == exit.name
+                )
+            }
+            if model.exitDetails.isEmpty {
+                Text("连接内核后将自动载入可用出口列表")
+                    .font(.system(size: 11))
+                    .foregroundStyle(subtleText)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+            }
+        }
+        .padding(6)
     }
 
     private func exitOptionRow(
@@ -323,10 +336,15 @@ struct SeguePopoverView: View {
         isSelected: Bool
     ) -> some View {
         Button {
-            guard !model.isBusy else { return }
+            guard canSwitchExits, id != model.exitChoice else { return }
             motion.triggerSwoop(toast: id == "auto" ? "正在切换至自动优选…" : "正在滑切至 \(id)…")
             Task {
                 await model.selectExit(id)
+                if model.lastError != nil {
+                    motion.clearToast()
+                } else {
+                    motion.showToast(id == "auto" ? "已切换至自动优选" : "已切换至 \(id)")
+                }
             }
         } label: {
             HStack {
@@ -356,7 +374,7 @@ struct SeguePopoverView: View {
                         .padding(.leading, 12)
                 }
                 Spacer()
-                Text(latency.map { "\($0) ms" } ?? "—")
+                Text(canSwitchExits ? (latency.map { "\($0) ms" } ?? "—") : "—")
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(mutedText)
             }
@@ -373,7 +391,8 @@ struct SeguePopoverView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(model.isBusy)
+        .disabled(!canSwitchExits)
+        .opacity(canSwitchExits ? 1.0 : 0.60)
     }
 
     private var diagnosticsCard: some View {
@@ -402,10 +421,26 @@ struct SeguePopoverView: View {
             if diagnosticsExpanded {
                 Rectangle().fill(hairlineColor).frame(height: 1)
                 VStack(spacing: 8) {
-                    healthRow("系统保护进程 (helper)", value: helperHealthText, ok: model.helperAvailability == .ready)
-                    healthRow("AI 护盾 / DNS", value: aiLayerHealthText, ok: model.aiLayerMode == AILayerState.tunnel)
-                    healthRow("签名策略 (Ed25519)", value: policyHealthText, ok: model.policyValid)
-                    healthRow("隧道接口 (utun)", value: model.tunInterface ?? "未建立", ok: model.tunInterface != nil)
+                    healthRow(
+                        "系统保护进程 (helper)",
+                        value: helperHealthText,
+                        tone: model.helperAvailability == .ready ? .ok : .muted
+                    )
+                    healthRow(
+                        "AI 护盾 / DNS",
+                        value: aiLayerHealthText,
+                        tone: aiLayerHealthTone
+                    )
+                    healthRow(
+                        "签名策略 (Ed25519)",
+                        value: policyHealthText,
+                        tone: model.policyValid ? .ok : (model.policyVersion != nil ? .warning : .muted)
+                    )
+                    healthRow(
+                        "隧道接口 (utun)",
+                        value: model.tunInterface ?? "未建立",
+                        tone: model.tunInterface != nil ? .ok : .muted
+                    )
 
                     HStack(spacing: 6) {
                         Button("配置目录") {
@@ -419,7 +454,7 @@ struct SeguePopoverView: View {
                         .buttonStyle(SegueSecondaryButtonStyle(fill: surfaceFill, hairline: hairlineColor))
 
                         Button("网络急救") {
-                            model.requestRestoreNetwork()
+                            requestEmergencyRestore()
                         }
                         .buttonStyle(
                             SegueSecondaryButtonStyle(
@@ -439,22 +474,64 @@ struct SeguePopoverView: View {
         .background(cardBackground)
     }
 
-    private func healthRow(_ label: String, value: String, ok: Bool) -> some View {
-        HStack {
+    private enum HealthTone {
+        case ok
+        case warning
+        case muted
+    }
+
+    private var aiLayerHealthTone: HealthTone {
+        if model.aiLayerMode == AILayerState.tunnel {
+            return .ok
+        }
+        if model.aiLayerMode == AILayerState.guardMode || model.helperArmed {
+            return .warning
+        }
+        return .muted
+    }
+
+    private func healthRow(_ label: String, value: String, tone: HealthTone) -> some View {
+        let color: Color = {
+            switch tone {
+            case .ok:
+                return material.accent
+            case .warning:
+                return Color(red: 0.98, green: 0.75, blue: 0.14)
+            case .muted:
+                return subtleText
+            }
+        }()
+        return HStack {
             Text(label)
                 .font(.system(size: 11.5))
                 .foregroundStyle(mutedText)
             Spacer()
             Text(value)
                 .font(.system(size: 11.5, weight: .medium))
-                .foregroundStyle(ok ? material.accent : subtleText)
+                .foregroundStyle(color)
         }
     }
 
     // MARK: - Alert & Restore Banners
 
+    private var visibleError: String? {
+        guard let error = model.lastError else { return nil }
+        if MantaVisualState.isExpectedIdleKernelError(error, model: model) {
+            return nil
+        }
+        return error
+    }
+
+    private var canOfferDirectEmergencyRestore: Bool {
+        guard !model.restoreNeedsConfirmation else { return false }
+        return helperUnavailable
+            || model.helperKernelState == "kernel_failed"
+            || (visibleError != nil && model.helperArmed)
+            || (model.isRevoked && model.helperArmed)
+    }
+
     private var shouldShowAlertBanner: Bool {
-        helperUnavailable || model.lastError != nil || model.notice != nil || !model.reasonText.isEmpty
+        helperUnavailable || visibleError != nil || model.notice != nil || !model.reasonText.isEmpty
     }
 
     private var alertBanner: some View {
@@ -465,7 +542,7 @@ struct SeguePopoverView: View {
                     .foregroundStyle(material.accent)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if let error = model.lastError {
+            if let error = visibleError {
                 Text(error)
                     .font(.system(size: 11.5))
                     .foregroundStyle(Color(red: 0.98, green: 0.44, blue: 0.52))
@@ -476,12 +553,26 @@ struct SeguePopoverView: View {
                     .foregroundStyle(mutedText)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if canOfferDirectEmergencyRestore {
+                Button("通过急救服务恢复网络") {
+                    requestEmergencyRestore()
+                }
+                .buttonStyle(
+                    SegueSecondaryButtonStyle(
+                        fill: Color(red: 0.96, green: 0.25, blue: 0.37, opacity: 0.16),
+                        hairline: Color(red: 0.96, green: 0.25, blue: 0.37, opacity: 0.34),
+                        foreground: Color(red: 0.98, green: 0.44, blue: 0.52)
+                    )
+                )
+                .disabled(model.isBusy)
+                .padding(.top, 2)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
         .background(
-            (model.lastError != nil || helperUnavailable)
+            (visibleError != nil || helperUnavailable)
                 ? Color(red: 0.96, green: 0.25, blue: 0.37, opacity: 0.10)
                 : surfaceFill
         )
@@ -738,7 +829,17 @@ struct SeguePopoverView: View {
     }
 
     private var switchIsOn: Bool {
-        model.showsConnected || model.isConnecting || model.isGuarding
+        model.showsConnected || model.isConnecting || model.isGuarding || model.helperArmed
+    }
+
+    private var canSwitchExits: Bool {
+        guard !model.isBusy, !helperUnavailable, !model.isRevoked else {
+            return false
+        }
+        guard let kernelState = model.kernelState else {
+            return false
+        }
+        return kernelState == .connected || kernelState == .reconnecting
     }
 
     private var heroChipText: String {
@@ -765,6 +866,12 @@ struct SeguePopoverView: View {
         case .guarding:
             return "隧道重连中"
         case .error:
+            if model.isRevoked {
+                return "设备已吊销"
+            }
+            if model.helperKernelState == "kernel_failed" {
+                return "内核服务异常"
+            }
             switch model.helperAvailability {
             case .notInstalled:
                 return "未安装保护服务"
@@ -792,6 +899,12 @@ struct SeguePopoverView: View {
         case .guarding:
             return "AI 域名已被安全护盾拦住，普通网页照常访问"
         case .error:
+            if model.isRevoked {
+                return "此设备访问权限已被撤销，请解除保护或重新登录"
+            }
+            if model.helperKernelState == "kernel_failed" {
+                return "内核未能正常启动，可先恢复网络并导出诊断包"
+            }
             return model.statusLine
         case .off:
             return "当前全部流量直连，拨动开关唤醒灵鳐"
@@ -979,6 +1092,14 @@ struct SeguePopoverView: View {
         }
     }
 
+    private func requestEmergencyRestore() {
+        withAnimation(.easeInOut(duration: 0.16)) {
+            exitsExpanded = false
+            showingQuitNotice = false
+        }
+        model.requestRestoreNetwork()
+    }
+
     private func openConfigFolder() {
         do {
             try model.ensureConfigFolder()
@@ -1028,9 +1149,14 @@ private struct SessionUptimeText: View {
     let isPaused: Bool
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: isPaused ? 60 : 1)) { timeline in
-            Text(Self.format(interval: max(0, timeline.date.timeIntervalSince(since))))
+        if isPaused {
+            Text(Self.format(interval: max(0, Date().timeIntervalSince(since))))
                 .font(.system(size: 11, design: .monospaced))
+        } else {
+            TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                Text(Self.format(interval: max(0, timeline.date.timeIntervalSince(since))))
+                    .font(.system(size: 11, design: .monospaced))
+            }
         }
     }
 
